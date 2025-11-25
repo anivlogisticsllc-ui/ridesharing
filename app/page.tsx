@@ -27,12 +27,13 @@ export default async function Home() {
               Community Ride Sharing
             </p>
             <h1 className="mt-2 text-3xl md:text-4xl font-semibold text-slate-900">
-              Share rides, save money,<br />travel together.
+              Share rides, save money,<br />
+              travel together.
             </h1>
             <p className="mt-4 text-sm md:text-base text-slate-600">
-              Riders pay a simple, transparent price. Drivers earn extra cash on trips
-              they&apos;re already taking. Membership keeps the platform safe and sustainable
-              for everyone.
+              Riders pay a simple, transparent price. Drivers earn extra cash on
+              trips they&apos;re already taking. Membership keeps the platform
+              safe and sustainable for everyone.
             </p>
 
             <div className="mt-6 flex flex-wrap gap-3">
@@ -50,16 +51,24 @@ export default async function Home() {
                 Pricing model
               </h2>
               <p className="text-sm text-slate-600">
-                Riders pay a <span className="font-semibold text-slate-900">$3.00 booking fee</span>{" "}
-                plus <span className="font-semibold text-slate-900">$2.00 per mile</span> for each trip.
+                Riders pay a{" "}
+                <span className="font-semibold text-slate-900">
+                  $3.00 booking fee
+                </span>{" "}
+                plus{" "}
+                <span className="font-semibold text-slate-900">
+                  $2.00 per mile
+                </span>{" "}
+                for each trip.
               </p>
               <p className="mt-2 text-xs text-slate-500">
-                Example: a 10 mile trip costs $3.00 + (10 × $2.00) = $23.00.
+                Example: a 10 mile trip costs $3.00 + (10 × $2.00) = $23.00
+                total for the ride.
               </p>
             </div>
           </div>
 
-          {/* Illustration card (unchanged from before) */}
+          {/* Illustration card */}
           <div className="md:justify-self-end">
             <div className="relative overflow-hidden rounded-3xl bg-gradient-to-br from-indigo-600 via-sky-500 to-emerald-400 p-[1px] shadow-lg">
               <div className="bg-slate-950/95 rounded-[22px] p-5 h-full">
@@ -69,10 +78,13 @@ export default async function Home() {
                 <div className="space-y-3 text-xs text-slate-200">
                   <div className="flex items-center justify-between">
                     <span>San Francisco → San Jose</span>
-                    <span className="font-semibold text-emerald-300">$43.00</span>
+                    <span className="font-semibold text-emerald-300">
+                      $43.00
+                    </span>
                   </div>
                   <p className="text-slate-400">
-                    20 miles · 1 rider · Includes $3.00 booking + $2.00 / mile.
+                    20 miles · Total ride price: $3.00 booking + $40.00
+                    distance = $43.00.
                   </p>
                   <div className="mt-3 grid grid-cols-3 gap-2 text-[11px]">
                     <div className="rounded-xl bg-slate-900/70 border border-slate-800 p-2">
@@ -90,22 +102,23 @@ export default async function Home() {
                   </div>
                 </div>
                 <div className="mt-4 text-[11px] text-slate-500">
-                  Drivers see their earnings after platform fees in their dashboard.
+                  Drivers see their earnings after platform fees in their
+                  dashboard.
                 </div>
               </div>
             </div>
           </div>
         </section>
 
-        {/* Membership section (unchanged) */}
+        {/* Membership section */}
         <section className="space-y-4">
           <h2 className="text-xl font-semibold text-slate-900">
             Membership plans
           </h2>
           <p className="text-sm text-slate-600 max-w-2xl">
-            The app has two membership types. Riders pay a small monthly fee for access
-            to the marketplace. Drivers pay for tools that help them fill seats and
-            manage their trips.
+            The app has two membership types. Riders pay a small monthly fee
+            for access to the marketplace. Drivers pay for tools that help them
+            fill their rides and manage their trips.
           </p>
 
           <div className="grid gap-4 md:grid-cols-2">
@@ -119,7 +132,7 @@ export default async function Home() {
                   Riders · $2.99 / month
                 </h3>
                 <p className="mt-2 text-sm text-slate-600">
-                  For passengers who want to book seats in shared rides.
+                  For passengers who want to book shared rides.
                 </p>
                 <ul className="mt-3 space-y-1.5 text-sm text-slate-600">
                   <li>• Browse and book rides</li>
@@ -143,10 +156,11 @@ export default async function Home() {
                   Drivers · $9.99 / month
                 </h3>
                 <p className="mt-2 text-sm text-slate-600">
-                  For drivers who want to offer rides and earn from empty seats.
+                  For drivers who want to offer rides and earn from trips
+                  they&apos;re already making.
                 </p>
                 <ul className="mt-3 space-y-1.5 text-sm text-slate-600">
-                  <li>• Post rides with available seats</li>
+                  <li>• Post rides and manage capacity</li>
                   <li>• See all booking requests in one place</li>
                   <li>• In-app messaging with passengers</li>
                   <li>• Earnings breakdown per ride</li>
@@ -166,14 +180,14 @@ export default async function Home() {
           </h2>
           {rides.length === 0 ? (
             <p className="text-sm text-slate-600">
-              No rides are available yet. Drivers will see their upcoming trips here
-              once they start posting rides.
+              No rides are available yet. Drivers will see their upcoming trips
+              here once they start posting rides.
             </p>
           ) : (
             <ul className="space-y-3">
               {rides.map((ride) => {
                 const departure = new Date(ride.departureTime);
-                const pricePerSeat = ride.pricePerSeatCents / 100;
+                const pricePerRide = ride.pricePerRideCents / 100;
                 return (
                   <li
                     key={ride.id}
@@ -184,7 +198,8 @@ export default async function Home() {
                         {ride.originCity} → {ride.destinationCity}
                       </p>
                       <p className="text-xs text-slate-500">
-                        {departure.toLocaleString()} • {ride.distanceMiles} miles
+                        {departure.toLocaleString()} • {ride.distanceMiles}{" "}
+                        miles
                       </p>
                       <p className="mt-1 text-xs text-slate-500">
                         Driver:{" "}
@@ -201,10 +216,10 @@ export default async function Home() {
                     <div className="mt-2 flex items-center gap-3 md:mt-0">
                       <div className="text-right">
                         <p className="text-sm font-semibold text-slate-900">
-                          ${pricePerSeat.toFixed(2)} / seat
+                          ${pricePerRide.toFixed(2)} total
                         </p>
                         <p className="text-xs text-slate-500">
-                          {ride.availableSeats} seats left
+                          Room for {ride.availableSeats} riders
                         </p>
                       </div>
                       <button className="rounded-full bg-indigo-600 px-4 py-2 text-xs font-medium text-white hover:bg-indigo-700">

@@ -2,15 +2,15 @@
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 
-// GET /api/rides  -> list rides
+// GET /api/rides -> list rides
 export async function GET() {
   try {
     const rides = await prisma.ride.findMany({
       orderBy: { departureTime: "asc" },
+      take: 20,
       include: {
         driver: {
           select: {
-            id: true,
             name: true,
             ratingAverage: true,
             ratingCount: true,
@@ -18,7 +18,6 @@ export async function GET() {
           },
         },
       },
-      take: 20,
     });
 
     return NextResponse.json({ ok: true, rides });
@@ -31,7 +30,7 @@ export async function GET() {
   }
 }
 
-// POST /api/rides  -> create a new ride
+// POST /api/rides -> create a new ride
 export async function POST(req: Request) {
   try {
     const body = await req.json();
@@ -40,16 +39,16 @@ export async function POST(req: Request) {
       originCity,
       destinationCity,
       distanceMiles,
-      departureTime, // ISO string from client
+      departureTime, // ISO string
       availableSeats,
     } = body;
 
     if (
       !originCity ||
       !destinationCity ||
-      !distanceMiles ||
+      distanceMiles == null ||
       !departureTime ||
-      !availableSeats
+      availableSeats == null
     ) {
       return NextResponse.json(
         { ok: false, error: "Missing required fields" },
@@ -74,7 +73,7 @@ export async function POST(req: Request) {
       );
     }
 
-    // For now, always use the demo driver (we'll plug real auth in later)
+    // For now, always use the demo driver (auth later)
     const driver = await prisma.user.upsert({
       where: { email: "driver@example.com" },
       update: {},
@@ -89,13 +88,16 @@ export async function POST(req: Request) {
       },
     });
 
-    const pricePerSeatCents = Math.round(distance * 2 * 100); // $2 per mile per seat
+    // Per-ride pricing: $3 booking + $2/mile
+    const baseFareCents = 3 * 100;
+    const distanceFareCents = Math.round(distance * 2 * 100);
+    const totalPriceCents = baseFareCents + distanceFareCents;
 
     const ride = await prisma.ride.create({
       data: {
         driverId: driver.id,
         originCity,
-        originLat: 0, // we’ll wire real geo later
+        originLat: 0,
         originLng: 0,
         destinationCity,
         destinationLat: 0,
@@ -103,7 +105,8 @@ export async function POST(req: Request) {
         departureTime: new Date(departureTime),
         availableSeats: seats,
         distanceMiles: distance,
-        pricePerSeatCents,
+        // NOTE: using pricePerSeatCents column to store total per-ride price
+        pricePerSeatCents: totalPriceCents,
         status: "OPEN",
       },
     });
