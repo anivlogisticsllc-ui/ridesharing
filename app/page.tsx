@@ -1,5 +1,22 @@
 // app/page.tsx
-export default function Home() {
+import { prisma } from "@/lib/prisma";
+
+export default async function Home() {
+  const rides = await prisma.ride.findMany({
+    orderBy: { departureTime: "asc" },
+    take: 10,
+    include: {
+      driver: {
+        select: {
+          name: true,
+          ratingAverage: true,
+          ratingCount: true,
+          isVerifiedDriver: true,
+        },
+      },
+    },
+  });
+
   return (
     <main className="min-h-[calc(100vh-4rem)] bg-slate-50">
       <div className="mx-auto max-w-6xl px-4 py-10 space-y-10">
@@ -33,7 +50,7 @@ export default function Home() {
                 Pricing model
               </h2>
               <p className="text-sm text-slate-600">
-                Riders pay a <span className="font-semibold text-slate-900">$3.00 booking fee</span>{' '}
+                Riders pay a <span className="font-semibold text-slate-900">$3.00 booking fee</span>{" "}
                 plus <span className="font-semibold text-slate-900">$2.00 per mile</span> for each trip.
               </p>
               <p className="mt-2 text-xs text-slate-500">
@@ -42,7 +59,7 @@ export default function Home() {
             </div>
           </div>
 
-          {/* Simple illustration block (placeholder) */}
+          {/* Illustration card (unchanged from before) */}
           <div className="md:justify-self-end">
             <div className="relative overflow-hidden rounded-3xl bg-gradient-to-br from-indigo-600 via-sky-500 to-emerald-400 p-[1px] shadow-lg">
               <div className="bg-slate-950/95 rounded-[22px] p-5 h-full">
@@ -80,7 +97,7 @@ export default function Home() {
           </div>
         </section>
 
-        {/* Membership section */}
+        {/* Membership section (unchanged) */}
         <section className="space-y-4">
           <h2 className="text-xl font-semibold text-slate-900">
             Membership plans
@@ -106,7 +123,7 @@ export default function Home() {
                 </p>
                 <ul className="mt-3 space-y-1.5 text-sm text-slate-600">
                   <li>• Browse and book rides</li>
-                  <li>• See driver ratings & verification status</li>
+                  <li>• See driver ratings &amp; verification status</li>
                   <li>• In-app chat with drivers after booking</li>
                   <li>• Transparent pricing: $3 + $2/mile</li>
                 </ul>
@@ -140,6 +157,65 @@ export default function Home() {
               </button>
             </div>
           </div>
+        </section>
+
+        {/* Live rides list */}
+        <section className="space-y-3">
+          <h2 className="text-xl font-semibold text-slate-900">
+            Available rides
+          </h2>
+          {rides.length === 0 ? (
+            <p className="text-sm text-slate-600">
+              No rides are available yet. Drivers will see their upcoming trips here
+              once they start posting rides.
+            </p>
+          ) : (
+            <ul className="space-y-3">
+              {rides.map((ride) => {
+                const departure = new Date(ride.departureTime);
+                const pricePerSeat = ride.pricePerSeatCents / 100;
+                return (
+                  <li
+                    key={ride.id}
+                    className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm flex flex-col gap-1 md:flex-row md:items-center md:justify-between"
+                  >
+                    <div>
+                      <p className="text-sm font-semibold text-slate-900">
+                        {ride.originCity} → {ride.destinationCity}
+                      </p>
+                      <p className="text-xs text-slate-500">
+                        {departure.toLocaleString()} • {ride.distanceMiles} miles
+                      </p>
+                      <p className="mt-1 text-xs text-slate-500">
+                        Driver:{" "}
+                        <span className="font-medium text-slate-800">
+                          {ride.driver?.name ?? "Unknown driver"}
+                        </span>{" "}
+                        {ride.driver?.isVerifiedDriver && (
+                          <span className="ml-1 inline-flex items-center rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-semibold text-emerald-700">
+                            Verified
+                          </span>
+                        )}
+                      </p>
+                    </div>
+                    <div className="mt-2 flex items-center gap-3 md:mt-0">
+                      <div className="text-right">
+                        <p className="text-sm font-semibold text-slate-900">
+                          ${pricePerSeat.toFixed(2)} / seat
+                        </p>
+                        <p className="text-xs text-slate-500">
+                          {ride.availableSeats} seats left
+                        </p>
+                      </div>
+                      <button className="rounded-full bg-indigo-600 px-4 py-2 text-xs font-medium text-white hover:bg-indigo-700">
+                        View &amp; book
+                      </button>
+                    </div>
+                  </li>
+                );
+              })}
+            </ul>
+          )}
         </section>
       </div>
     </main>
