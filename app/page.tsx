@@ -27,7 +27,8 @@ export default async function Home() {
               Community Ride Sharing
             </p>
             <h1 className="mt-2 text-3xl md:text-4xl font-semibold text-slate-900">
-              Share rides, save money,<br />
+              Share rides, save money,
+              <br />
               travel together.
             </h1>
             <p className="mt-4 text-sm md:text-base text-slate-600">
@@ -187,7 +188,8 @@ export default async function Home() {
             <ul className="space-y-3">
               {rides.map((ride) => {
                 const departure = new Date(ride.departureTime);
-                const pricePerRide = ride.pricePerRideCents / 100;
+                // Using pricePerSeatCents column as total price per ride
+                const pricePerRide = ride.pricePerSeatCents / 100;
                 return (
                   <li
                     key={ride.id}
