@@ -1,0 +1,153 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id               String         @id @default(cuid())
+  email            String         @unique
+  name             String
+  role             UserRole       @default(RIDER)
+  phone            String?
+  passwordHash     String         // auth later
+  photoUrl         String?
+  bio              String?
+  ratingAverage    Float          @default(0)
+  ratingCount      Int            @default(0)
+  isVerifiedDriver Boolean        @default(false)
+  memberSince      DateTime       @default(now())
+  accountStatus    AccountStatus  @default(ACTIVE)
+
+  memberships      Membership[]
+  rides            Ride[]         @relation("DriverRides")
+  bookings         Booking[]      @relation("PassengerBookings")
+  transactions     Transaction[]  @relation("DriverTransactions")
+
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+}
+
+model Membership {
+  id              String           @id @default(cuid())
+  user            User             @relation(fields: [userId], references: [id])
+  userId          String
+  type            MembershipType
+  startDate       DateTime
+  expiryDate      DateTime
+  status          MembershipStatus @default(ACTIVE)
+  amountPaidCents Int
+  paymentProvider String?
+  paymentRef      String?
+
+  createdAt       DateTime         @default(now())
+}
+
+model Ride {
+  id                String        @id @default(cuid())
+  driver            User          @relation("DriverRides", fields: [driverId], references: [id])
+  driverId          String
+
+  originCity        String
+  originLat         Float
+  originLng         Float
+  destinationCity   String
+  destinationLat    Float
+  destinationLng    Float
+
+  departureTime     DateTime
+  availableSeats    Int
+  pricePerSeatCents Int
+  distanceMiles     Float
+
+  vehicleMake       String?
+  vehicleModel      String?
+  vehicleColor      String?
+  licensePlate      String?
+
+  preferencesJson   Json?
+  status            RideStatus     @default(OPEN)
+
+  bookings          Booking[]
+  transactions      Transaction[]
+
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+}
+
+model Booking {
+  id               String         @id @default(cuid())
+  ride             Ride           @relation(fields: [rideId], references: [id])
+  rideId           String
+
+  passenger        User           @relation("PassengerBookings", fields: [passengerId], references: [id])
+  passengerId      String
+
+  seatsBooked      Int
+  totalPriceCents  Int
+  status           BookingStatus  @default(PENDING)
+
+  createdAt        DateTime       @default(now())
+}
+
+model Transaction {
+  id               String             @id @default(cuid())
+  ride             Ride               @relation(fields: [rideId], references: [id])
+  rideId           String
+
+  driver           User               @relation("DriverTransactions", fields: [driverId], references: [id])
+  driverId         String
+
+  grossAmountCents Int
+  serviceFeeCents  Int
+  netAmountCents   Int
+  status           TransactionStatus  @default(PENDING)
+
+  createdAt        DateTime           @default(now())
+}
+
+enum UserRole {
+  RIDER
+  DRIVER
+  BOTH
+}
+
+enum AccountStatus {
+  ACTIVE
+  WARNED
+  SUSPENDED
+}
+
+enum MembershipType {
+  RIDER
+  DRIVER
+}
+
+enum MembershipStatus {
+  ACTIVE
+  EXPIRED
+}
+
+enum RideStatus {
+  OPEN
+  FULL
+  COMPLETED
+  CANCELLED
+}
+
+enum BookingStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+  CANCELLED
+  COMPLETED
+}
+
+enum TransactionStatus {
+  PENDING
+  COMPLETED
+  REFUNDED
+}
