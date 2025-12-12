@@ -1,6 +1,6 @@
 // app/api/bookings/route.ts
 import { NextResponse } from "next/server";
-import { getServerSession } from "next-auth";
+import { getServerSession } from "next-auth/next";
 import { authOptions } from "@/pages/api/auth/[...nextauth]";
 import { prisma } from "@/lib/prisma";
 import { BookingStatus } from "@prisma/client";
@@ -8,8 +8,8 @@ import { BookingStatus } from "@prisma/client";
 // POST /api/bookings -> rider requests a ride
 export async function POST(req: Request) {
   try {
-    const body = (await req.json()) as { rideId?: string };
-    const { rideId } = body;
+    const body = await req.json();
+    const { rideId } = body as { rideId?: string };
 
     if (!rideId) {
       return NextResponse.json(
