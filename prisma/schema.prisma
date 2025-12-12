@@ -205,8 +205,8 @@ model Booking {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  riderName  String
-  riderEmail String
+  riderName  String?
+  riderEmail String?
 
   ride   Ride   @relation(fields: [rideId], references: [id])
   rideId String

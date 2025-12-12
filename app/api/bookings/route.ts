@@ -29,9 +29,8 @@ export async function POST(req: Request) {
     const booking = await prisma.booking.create({
       data: {
         rideId,
-        riderName,
-        riderEmail,
-        status: "PENDING",
+        riderId: userId,          // tie booking to the logged-in rider
+        status: "PENDING", // or BookingStatus.PENDING if you prefer
       },
     });
 

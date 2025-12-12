@@ -1,0 +1,3 @@
+-- AlterTable
+ALTER TABLE "Booking" ALTER COLUMN "riderEmail" DROP NOT NULL,
+ALTER COLUMN "riderName" DROP NOT NULL;
