@@ -1,3 +1,7 @@
+// =======================
+//   Datasource & Client
+// =======================
+
 datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
@@ -7,29 +11,131 @@ generator client {
   provider = "prisma-client-js"
 }
 
+//
+// =======================
+//        MODELS
+// =======================
+//
+
+// --------- USER ---------
+
 model User {
-  id               String         @id @default(cuid())
-  email            String         @unique
+  id               String        @id @default(cuid())
+  publicId         String?       @unique // public-facing ID for profiles
+  email            String        @unique
   name             String
-  role             UserRole       @default(RIDER)
+  role             UserRole      @default(RIDER)
   phone            String?
-  passwordHash     String         // auth later
+  passwordHash     String
+  emailVerified    Boolean       @default(false)
   photoUrl         String?
   bio              String?
-  ratingAverage    Float          @default(0)
-  ratingCount      Int            @default(0)
-  isVerifiedDriver Boolean        @default(false)
-  memberSince      DateTime       @default(now())
-  accountStatus    AccountStatus  @default(ACTIVE)
+  ratingAverage    Float         @default(0)
+  ratingCount      Int           @default(0)
+  isVerifiedDriver Boolean       @default(false)
+  memberSince      DateTime      @default(now())
+  accountStatus    AccountStatus @default(ACTIVE)
 
-  memberships      Membership[]
-  rides            Ride[]         @relation("DriverRides")
-  bookings         Booking[]      @relation("PassengerBookings")
-  transactions     Transaction[]  @relation("DriverTransactions")
+  // Onboarding + membership
+  onboardingCompleted Boolean @default(false)
+  onboardingStep      Int?    // e.g. 1–3 for driver onboarding wizard
 
-  createdAt        DateTime       @default(now())
-  updatedAt        DateTime       @updatedAt
+  membershipPlan   String?   // e.g. "STANDARD"
+  membershipActive Boolean   @default(false)
+  trialEndsAt      DateTime? // when the free month expires
+
+  // Address
+  addressLine1 String?
+  addressLine2 String?
+  city         String?
+  state        String?
+  postalCode   String?
+  country      String? @default("US")
+
+  // Stripe linkage (customer + default payment method / sub)
+  stripeCustomerId       String?
+  stripeDefaultPaymentId String?
+
+  // Relations
+  memberships             Membership[]
+  emailVerificationTokens EmailVerificationToken[]
+  rides                   Ride[]                   @relation("DriverRides")
+  riderRides              Ride[]                   @relation("RiderRides")
+
+  // Rider's bookings (inverse of Booking.rider)
+  bookings Booking[] @relation("RiderBookings")
+
+  transactions  Transaction[]  @relation("DriverTransactions")
+  driverProfile DriverProfile?
+
+  // Chat relations
+  driverConversations Conversation[] @relation("DriverConversations")
+  riderConversations  Conversation[] @relation("RiderConversations")
+  messages            Message[]      @relation("UserMessages")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }
+
+// --------- DRIVER PROFILE ---------
+
+model DriverProfile {
+  id String @id @default(cuid())
+
+  user   User   @relation(fields: [userId], references: [id])
+  userId String @unique
+
+  // Optional “home base”
+  baseCity String?
+  baseLat  Float?
+  baseLng  Float?
+
+  // Identity (driver-facing / regulatory)
+  legalName    String?   // legal full name used for driving
+  dateOfBirth  DateTime? // DOB for KYC / insurance checks
+
+  // Driver license & verification fields
+  driverLicenseNumber   String?
+  driverLicenseState    String?
+  driverLicenseExpiry   DateTime?
+  driverLicenseImageUrl String? // later: S3 URL or similar
+
+  verificationStatus DriverVerificationStatus @default(PENDING)
+  verificationNotes  String? // internal notes, optional
+
+  // Vehicle info
+  vehicleMake   String?
+  vehicleModel  String?
+  vehicleYear   Int?
+  vehicleColor  String?
+  plateNumber   String?
+  plateState    String?
+
+  // List of cities driver is willing to work in
+  serviceCities DriverServiceCity[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+
+// --------- DRIVER SERVICE CITY ---------
+
+model DriverServiceCity {
+  id              String        @id @default(cuid())
+  driverProfile   DriverProfile @relation(fields: [driverProfileId], references: [id])
+  driverProfileId String
+
+  cityName String
+  cityLat  Float
+  cityLng  Float
+
+  createdAt DateTime @default(now())
+
+  @@unique([driverProfileId, cityName])
+}
+
+// --------- MEMBERSHIP ---------
 
 model Membership {
   id              String           @id @default(cuid())
@@ -43,71 +149,141 @@ model Membership {
   paymentProvider String?
   paymentRef      String?
 
-  createdAt       DateTime         @default(now())
+  createdAt DateTime @default(now())
 }
+
+// --------- EMAIL VERIFICATION TOKEN ---------
+
+model EmailVerificationToken {
+  id        String   @id @default(cuid())
+  user      User     @relation(fields: [userId], references: [id])
+  userId    String
+  token     String   @unique
+  expiresAt DateTime
+
+  createdAt DateTime @default(now())
+}
+
+// --------- RIDE ---------
 
 model Ride {
-  id                String        @id @default(cuid())
-  driver            User          @relation("DriverRides", fields: [driverId], references: [id])
-  driverId          String
-
-  originCity        String
-  originLat         Float
-  originLng         Float
-  destinationCity   String
-  destinationLat    Float
-  destinationLng    Float
-
-  departureTime     DateTime
-  availableSeats    Int
-  pricePerSeatCents Int
-  distanceMiles     Float
-
-  vehicleMake       String?
-  vehicleModel      String?
-  vehicleColor      String?
-  licensePlate      String?
-
-  preferencesJson   Json?
-  status            RideStatus     @default(OPEN)
-
-  bookings          Booking[]
-  transactions      Transaction[]
-
-  createdAt         DateTime       @default(now())
-  updatedAt         DateTime       @updatedAt
+  id String @id @default(cuid())
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+  rider   User?   @relation("RiderRides", fields: [riderId], references: [id])
+  riderId String?
+  driver   User?   @relation("DriverRides", fields: [driverId], references: [id])
+  driverId String?
+  originCity      String
+  originLat       Float
+  originLng       Float
+  destinationCity String
+  destinationLat  Float
+  destinationLng  Float
+  status          RideStatus @default(OPEN)
+  tripStartedAt  DateTime?  // when IN_ROUTE begins
+  tripCompletedAt DateTime? // when COMPLETED
+  departureTime   DateTime
+  passengerCount  Int        @default(1)
+  distanceMiles   Float
+  totalPriceCents Int        @default(0)
+  vehicleMake     String?
+  vehicleModel    String?
+  vehicleColor    String?
+  licensePlate    String?
+  preferencesJson Json?
+  bookings        Booking[]
+  transactions    Transaction[]
+  // Chat: conversations for this ride
+  conversations Conversation[]
 }
+
+// --------- BOOKING ---------
 
 model Booking {
-  id               String         @id @default(cuid())
-  ride             Ride           @relation(fields: [rideId], references: [id])
-  rideId           String
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
-  passenger        User           @relation("PassengerBookings", fields: [passengerId], references: [id])
-  passengerId      String
+  riderName  String
+  riderEmail String
 
-  seatsBooked      Int
-  totalPriceCents  Int
-  status           BookingStatus  @default(PENDING)
+  ride   Ride   @relation(fields: [rideId], references: [id])
+  rideId String
 
-  createdAt        DateTime       @default(now())
+  status BookingStatus @default(PENDING)
+
+  // tie to actual user (rider)
+  riderId String?
+  rider   User?   @relation("RiderBookings", fields: [riderId], references: [id])
+
+  // 1-to-1 inverse side of Conversation.booking
+  conversation Conversation?
 }
 
-model Transaction {
-  id               String             @id @default(cuid())
-  ride             Ride               @relation(fields: [rideId], references: [id])
-  rideId           String
+// --------- CONVERSATION ---------
 
-  driver           User               @relation("DriverTransactions", fields: [driverId], references: [id])
-  driverId         String
+model Conversation {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  rideId String
+  ride   Ride   @relation(fields: [rideId], references: [id])
+
+  driverId String
+  driver   User   @relation("DriverConversations", fields: [driverId], references: [id])
+
+  riderId String
+  rider   User   @relation("RiderConversations", fields: [riderId], references: [id])
+
+  // 1-to-1 with Booking: FK lives here
+  bookingId String?  @unique
+  booking   Booking? @relation(fields: [bookingId], references: [id])
+
+  messages Message[]
+}
+
+// --------- MESSAGE ---------
+
+model Message {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id])
+
+  senderId String
+  sender   User   @relation("UserMessages", fields: [senderId], references: [id])
+
+  body String
+}
+
+// --------- TRANSACTION ---------
+
+model Transaction {
+  id String @id @default(cuid())
+
+  ride   Ride   @relation(fields: [rideId], references: [id])
+  rideId String
+
+  driver   User   @relation("DriverTransactions", fields: [driverId], references: [id])
+  driverId String
 
   grossAmountCents Int
   serviceFeeCents  Int
   netAmountCents   Int
-  status           TransactionStatus  @default(PENDING)
+  status           TransactionStatus @default(PENDING)
 
-  createdAt        DateTime           @default(now())
+  createdAt DateTime @default(now())
 }
+
+//
+// =======================
+//         ENUMS
+// =======================
+//
 
 enum UserRole {
   RIDER
@@ -132,10 +308,11 @@ enum MembershipStatus {
 }
 
 enum RideStatus {
-  OPEN
-  FULL
-  COMPLETED
-  CANCELLED
+  OPEN // rider posted a ride, no driver yet
+  ACCEPTED // driver accepted and is on the way to pickup
+  IN_ROUTE // driver has rider in the car, going to destination
+  COMPLETED // finished + receipt sent
+  CANCELLED // cancelled by rider / driver / system
 }
 
 enum BookingStatus {
@@ -150,4 +327,10 @@ enum TransactionStatus {
   PENDING
   COMPLETED
   REFUNDED
+}
+
+enum DriverVerificationStatus {
+  PENDING
+  APPROVED
+  REJECTED
 }

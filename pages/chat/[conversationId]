@@ -1,0 +1,223 @@
+// pages/chat/[conversationId].tsx
+"use client";
+
+import { useEffect, useState } from "react";
+import { useRouter } from "next/router";
+
+type ChatMessage = {
+  id: string;
+  body: string;
+  createdAt: string;
+  sender: {
+    id: string;
+    name: string | null;
+    publicId: string | null;
+  };
+};
+
+export default function ChatPage() {
+  const router = useRouter();
+  const { conversationId } = router.query;
+
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  // basic polling every 5s
+  useEffect(() => {
+    if (!conversationId || typeof conversationId !== "string") return;
+
+    let cancelled = false;
+    let interval: NodeJS.Timeout;
+
+    async function loadMessages() {
+      try {
+        const res = await fetch(`/api/chat/${conversationId}`);
+        if (res.status === 401) {
+          router.replace(
+            `/auth/login?callbackUrl=${encodeURIComponent(
+              `/chat/${conversationId}`
+            )}`
+          );
+          return;
+        }
+        const data = await res.json().catch(() => null);
+
+        if (!res.ok || !data?.ok) {
+          if (!cancelled) {
+            setError(data?.error || "Could not load chat.");
+          }
+          return;
+        }
+
+        if (!cancelled) {
+          setMessages(data.messages);
+          setError(null);
+        }
+      } catch (err) {
+        if (!cancelled) {
+          console.error(err);
+          setError("Network error while loading chat.");
+        }
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+        }
+      }
+    }
+
+    loadMessages();
+    interval = setInterval(loadMessages, 5000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [conversationId, router]);
+
+  async function handleSend(e: React.FormEvent) {
+    e.preventDefault();
+    if (!input.trim() || !conversationId || typeof conversationId !== "string")
+      return;
+
+    const text = input.trim();
+    setInput("");
+
+    try {
+      const res = await fetch(`/api/chat/${conversationId}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ body: text }),
+      });
+
+      const data = await res.json().catch(() => null);
+
+      if (!res.ok || !data?.ok) {
+        setError(data?.error || "Could not send message.");
+        return;
+      }
+
+      setMessages((prev) => [...prev, data.message]);
+      setError(null);
+    } catch (err) {
+      console.error(err);
+      setError("Network error while sending message.");
+    }
+  }
+
+  return (
+    <main
+      style={{
+        minHeight: "100vh",
+        display: "flex",
+        flexDirection: "column",
+        fontFamily: "system-ui, sans-serif",
+      }}
+    >
+      <header
+        style={{
+          padding: "12px 16px",
+          borderBottom: "1px solid #e5e7eb",
+          fontWeight: 600,
+        }}
+      >
+        Ride chat
+      </header>
+
+      <div
+        style={{
+          flex: 1,
+          padding: 16,
+          overflowY: "auto",
+          background: "#f9fafb",
+        }}
+      >
+        {loading ? (
+          <p style={{ fontSize: 14, color: "#6b7280" }}>Loading chat…</p>
+        ) : error ? (
+          <p style={{ fontSize: 14, color: "#b91c1c" }}>{error}</p>
+        ) : messages.length === 0 ? (
+          <p style={{ fontSize: 14, color: "#6b7280" }}>
+            No messages yet. Say hi to get started.
+          </p>
+        ) : (
+          <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
+            {messages.map((m) => (
+              <li
+                key={m.id}
+                style={{
+                  marginBottom: 8,
+                  padding: 8,
+                  borderRadius: 8,
+                  background: "#fff",
+                  border: "1px solid #e5e7eb",
+                }}
+              >
+                <div
+                  style={{
+                    fontSize: 12,
+                    marginBottom: 2,
+                    color: "#4b5563",
+                    display: "flex",
+                    justifyContent: "space-between",
+                  }}
+                >
+                  <span>
+                    {m.sender.publicId
+                      ? m.sender.publicId
+                      : m.sender.name || "User"}
+                  </span>
+                  <span style={{ fontSize: 11, color: "#9ca3af" }}>
+                    {new Date(m.createdAt).toLocaleTimeString()}
+                  </span>
+                </div>
+                <div style={{ fontSize: 14 }}>{m.body}</div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+
+      <form
+        onSubmit={handleSend}
+        style={{
+          padding: 12,
+          borderTop: "1px solid #e5e7eb",
+          display: "flex",
+          gap: 8,
+        }}
+      >
+        <input
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          placeholder="Type a message…"
+          style={{
+            flex: 1,
+            padding: 8,
+            borderRadius: 4,
+            border: "1px solid #d1d5db",
+            fontSize: 14,
+          }}
+        />
+        <button
+          type="submit"
+          disabled={!input.trim()}
+          style={{
+            padding: "8px 14px",
+            borderRadius: 4,
+            border: "1px solid #111827",
+            background: "#111827",
+            color: "#fff",
+            fontSize: 14,
+            fontWeight: 500,
+            cursor: input.trim() ? "pointer" : "default",
+            opacity: input.trim() ? 1 : 0.6,
+          }}
+        >
+          Send
+        </button>
+      </form>
+    </main>
+  );
+}

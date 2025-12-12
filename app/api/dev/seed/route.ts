@@ -50,11 +50,9 @@ export async function GET() {
           destinationLat: 37.3382,
           destinationLng: -121.8863,
           departureTime: new Date(Date.now() + 2 * 60 * 60 * 1000), // in 2 hours
-          availableSeats: 3,
           distanceMiles: 40,
-          // $2 per mile, per seat
-          pricePerSeatCents: 2 * 40 * 100,
           status: "OPEN",
+          // 👆 keep this object strictly to fields that exist on your Ride model
         },
       });
     }
@@ -66,10 +64,10 @@ export async function GET() {
       ride,
     });
   } catch (err) {
-    console.error(err);
+    console.error("GET /api/dev/seed error:", err);
     return NextResponse.json(
       { ok: false, error: "Seeding failed" },
-      { status: 500 }
+      { status: 500 },
     );
   }
 }
