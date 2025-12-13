@@ -22,6 +22,8 @@ function getTransport() {
   });
 }
 
+/* ---------- Email verification ---------- */
+
 export async function sendVerificationEmail(to: string, verifyUrl: string) {
   console.log("[EMAIL] sendVerificationEmail called for:", to);
   console.log("[EMAIL] Using host:", host, "port:", port);
@@ -58,6 +60,49 @@ export async function sendVerificationEmail(to: string, verifyUrl: string) {
     console.log("[EMAIL] Message sent:", info.messageId);
   } catch (err) {
     console.error("[EMAIL] Error sending verification email:", err);
+  }
+}
+
+/* ---------- Password reset email (NEW) ---------- */
+
+export async function sendPasswordResetEmail(to: string, resetUrl: string) {
+  console.log("[EMAIL] sendPasswordResetEmail called for:", to);
+
+  const transporter = getTransport();
+  if (!transporter) {
+    console.log("[EMAIL] Would send password reset email to:", to);
+    console.log("[EMAIL] Link:", resetUrl);
+    return;
+  }
+
+  try {
+    const info = await transporter.sendMail({
+      from: `"Ridesharing App" <${user}>`,
+      to,
+      subject: "Reset your password",
+      html: `
+        <div style="font-family: Arial, sans-serif; line-height: 1.6;">
+          <h2>Reset your password</h2>
+          <p>We received a request to reset the password for your account.</p>
+          <p>
+            <a href="${resetUrl}"
+               style="background: #007bff; color: white; padding: 10px 16px; text-decoration: none;
+                      border-radius: 4px; display: inline-block;">
+              Set a new password
+            </a>
+          </p>
+          <p>If the button doesn't work, copy & paste this URL into your browser:</p>
+          <p>${resetUrl}</p>
+          <p style="font-size: 12px; color: #6b7280;">
+            If you didn't request this, you can safely ignore this email.
+          </p>
+        </div>
+      `,
+    });
+
+    console.log("[EMAIL] Password reset email sent:", info.messageId);
+  } catch (err) {
+    console.error("[EMAIL] Error sending password reset email:", err);
   }
 }
 

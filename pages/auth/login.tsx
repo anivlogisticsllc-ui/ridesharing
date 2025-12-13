@@ -77,9 +77,7 @@ export default function LoginPage() {
       // Onboarded: drivers should land on home with available rides
       const target = callbackUrl || "/";
       await router.push(target);
-      }
-
-     catch (err) {
+    } catch (err) {
       console.error(err);
       setError("Network error. Please try again.");
     } finally {
@@ -162,7 +160,7 @@ export default function LoginPage() {
           <div
             style={{
               position: "relative",
-              marginBottom: 20,
+              marginBottom: 8,
             }}
           >
             <input
@@ -212,6 +210,26 @@ export default function LoginPage() {
                 {showPassword ? "🙈" : "👁️"}
               </span>
             </button>
+          </div>
+
+          {/* Forgot password link */}
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "flex-end",
+              marginBottom: 20,
+            }}
+          >
+            <a
+              href="/auth/forgot-password"
+              style={{
+                fontSize: 13,
+                color: "#2563eb",
+                textDecoration: "none",
+              }}
+            >
+              Forgot your password?
+            </a>
           </div>
 
           <button

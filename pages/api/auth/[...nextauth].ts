@@ -5,13 +5,20 @@ import { prisma } from "../../../lib/prisma";
 import bcrypt from "bcrypt";
 import type { UserRole } from "@prisma/client";
 
+const NEXTAUTH_SECRET = process.env.NEXTAUTH_SECRET;
+
 export const authOptions: NextAuthOptions = {
+  // IMPORTANT: required in production on Vercel
+  secret: NEXTAUTH_SECRET,
+
   session: {
     strategy: "jwt",
   },
+
   pages: {
     signIn: "/auth/login",
   },
+
   providers: [
     CredentialsProvider({
       name: "Credentials",
@@ -88,6 +95,7 @@ export const authOptions: NextAuthOptions = {
       },
     }),
   ],
+
   callbacks: {
     async jwt({ token, user }) {
       if (user) {
