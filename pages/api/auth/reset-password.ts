@@ -17,44 +17,44 @@ export default async function handler(
   };
 
   if (!token || typeof token !== "string") {
-    return res.status(400).json({ error: "Missing token" });
+    return res.status(400).json({ error: "Invalid token" });
   }
 
-  if (!password || typeof password !== "string" || password.length < 8) {
+  if (!password || typeof password !== "string" || password.length < 6) {
     return res
       .status(400)
-      .json({ error: "Password must be at least 8 characters long" });
+      .json({ error: "Password must be at least 6 characters." });
   }
 
-  try {
-    const reset = await prisma.passwordResetToken.findUnique({
-      where: { token },
-      include: { user: true },
-    });
+  // Look up token row
+  const record = await prisma.passwordResetToken.findUnique({
+    where: { token },
+  });
 
-    if (!reset || reset.expires < new Date()) {
-      return res.status(400).json({ error: "Reset link is invalid or expired" });
-    }
-
-    const hash = await bcrypt.hash(password, 10);
-
-    await prisma.$transaction([
-      prisma.user.update({
-        where: { id: reset.userId },
-        data: {
-          passwordHash: hash,
-          // optional: ensure email is marked verified after reset
-          emailVerified: reset.user.emailVerified ?? true,
-        },
-      }),
-      prisma.passwordResetToken.delete({
-        where: { token },
-      }),
-    ]);
-
-    return res.status(200).json({ ok: true });
-  } catch (err) {
-    console.error("[reset-password] error", err);
-    return res.status(500).json({ error: "Internal server error" });
+  // ❗ Use `expiresAt` here, not `expires`
+  if (!record || record.expiresAt < new Date()) {
+    return res.status(400).json({ error: "Token expired or invalid." });
   }
+
+  const hashed = await bcrypt.hash(password, 10);
+
+  // Update password AND verify email
+  await prisma.user.update({
+    where: { id: record.userId },
+    data: {
+      passwordHash: hashed,
+      // If your schema uses Boolean for emailVerified:
+      emailVerified: true,
+      // If instead your schema uses DateTime? for emailVerified,
+      // comment the line above and use this:
+      // emailVerified: new Date(),
+    },
+  });
+
+  // Clean up used token
+  await prisma.passwordResetToken.delete({
+    where: { token },
+  });
+
+  return res.json({ ok: true });
 }
