@@ -238,7 +238,9 @@ export function RiderRequestFormHome() {
 
     // Basic passenger range check
     const passengersNumber =
-      typeof passengerCount === "number" ? passengerCount : Number(passengerCount || 1);
+      typeof passengerCount === "number"
+        ? passengerCount
+        : Number(passengerCount || 1);
     if (!passengersNumber || passengersNumber < 1 || passengersNumber > 6) {
       setError("Passenger count must be between 1 and 6.");
       return;
@@ -651,6 +653,7 @@ function AddressSearchBox(props: {
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
+  const [activeIndex, setActiveIndex] = useState<number | null>(null);
 
   async function fetchSuggestions(value: string) {
     const trimmed = value.trim();
@@ -659,6 +662,7 @@ function AddressSearchBox(props: {
     if (trimmed.length < 3) {
       setSuggestions([]);
       setOpen(false);
+      setActiveIndex(null);
       return;
     }
 
@@ -675,19 +679,59 @@ function AddressSearchBox(props: {
         setLocalError("No suggestions found.");
         setSuggestions([]);
         setOpen(false);
+        setActiveIndex(null);
         return;
       }
 
       const list = data.suggestions || [];
       setSuggestions(list);
       setOpen(list.length > 0);
+      setActiveIndex(list.length > 0 ? 0 : null);
     } catch (err) {
       console.error("[AddressSearchBox] error", err);
       setLocalError("Failed to load suggestions.");
       setSuggestions([]);
       setOpen(false);
+      setActiveIndex(null);
     } finally {
       setLoading(false);
+    }
+  }
+
+  function applySuggestion(index: number) {
+    const s = suggestions[index];
+    if (!s) return;
+    onSelect(s);
+    setQuery(s.label);
+    setOpen(false);
+    setActiveIndex(null);
+  }
+
+  function handleKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
+    if (!suggestions.length) return;
+
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      setOpen(true);
+      setActiveIndex((prev) => {
+        if (prev === null) return 0;
+        return Math.min(prev + 1, suggestions.length - 1);
+      });
+    } else if (e.key === "ArrowUp") {
+      e.preventDefault();
+      setOpen(true);
+      setActiveIndex((prev) => {
+        if (prev === null) return suggestions.length - 1;
+        return Math.max(prev - 1, 0);
+      });
+    } else if (e.key === "Enter") {
+      if (activeIndex !== null) {
+        e.preventDefault();
+        applySuggestion(activeIndex);
+      }
+    } else if (e.key === "Escape") {
+      setOpen(false);
+      setActiveIndex(null);
     }
   }
 
@@ -701,6 +745,7 @@ function AddressSearchBox(props: {
           setQuery(value);
           void fetchSuggestions(value);
         }}
+        onKeyDown={handleKeyDown}
         placeholder={placeholder || "Search address"}
         className="w-full rounded-lg border border-slate-300 px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
       />
@@ -719,15 +764,18 @@ function AddressSearchBox(props: {
 
       {open && suggestions.length > 0 && (
         <ul className="absolute z-20 mt-1 max-h-52 w-full overflow-auto rounded-lg border border-slate-200 bg-white text-sm shadow-lg">
-          {suggestions.map((s) => (
+          {suggestions.map((s, index) => (
             <li
               key={s.id}
-              className="cursor-pointer px-2 py-1.5 hover:bg-slate-100"
-              onClick={() => {
-                onSelect(s);
-                setQuery(s.label);
-                setOpen(false);
+              className={`cursor-pointer px-2 py-1.5 hover:bg-slate-100 ${
+                index === activeIndex ? "bg-indigo-50" : ""
+              }`}
+              onMouseDown={(e) => {
+                // onMouseDown to avoid input blur before click fires
+                e.preventDefault();
+                applySuggestion(index);
               }}
+              onMouseEnter={() => setActiveIndex(index)}
             >
               {s.label}
             </li>
