@@ -1,4 +1,3 @@
-// app/driver/dashboard/page.tsx
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
@@ -7,7 +6,7 @@ import { useRouter } from "next/navigation";
 
 type DashboardRide = {
   id: string;
-  departureTime: string; // ISO string (UTC in DB, formatted in browser)
+  departureTime: string; // ISO
   status: string;
   totalPriceCents: number;
   distanceMiles: number;
@@ -30,7 +29,7 @@ type RangeKey =
 
 type NonCustomRange = Exclude<RangeKey, "CUSTOM">;
 
-/* ---------- Date helpers (always local time in browser) ---------- */
+/* ---------- Helpers ---------- */
 
 function isSameDay(a: Date, b: Date) {
   return (
@@ -55,14 +54,16 @@ function filterByPresetRange(
   if (range === "YESTERDAY") {
     const yesterday = new Date(now);
     yesterday.setDate(now.getDate() - 1);
-    return rides.filter((r) => isSameDay(new Date(r.departureTime), yesterday));
+    return rides.filter((r) =>
+      isSameDay(new Date(r.departureTime), yesterday)
+    );
   }
 
   if (range === "THIS_WEEK") {
-    // Monday–Sunday of the current week (local)
+    // Monday–Sunday of the current week, in local time
     const startOfWeek = new Date(now);
     const day = startOfWeek.getDay(); // 0 (Sun) - 6 (Sat)
-    const diffToMonday = (day + 6) % 7;
+    const diffToMonday = (day + 6) % 7; // days since Monday
     startOfWeek.setHours(0, 0, 0, 0);
     startOfWeek.setDate(startOfWeek.getDate() - diffToMonday);
 
@@ -77,7 +78,7 @@ function filterByPresetRange(
 
   if (range === "THIS_MONTH") {
     const year = now.getFullYear();
-    const month = now.getMonth();
+    const month = now.getMonth(); // 0–11
 
     const startOfMonth = new Date(year, month, 1, 0, 0, 0, 0);
     const startOfNextMonth = new Date(year, month + 1, 1, 0, 0, 0, 0);
@@ -112,15 +113,11 @@ function filterByCustomRange(
   const start = new Date(startDateStr);
   const end = new Date(endDateStr);
 
-  // Normalize to full calendar days in local time
+  // Normalize to full-day inclusive range in local time
   start.setHours(0, 0, 0, 0);
   end.setHours(23, 59, 59, 999);
 
-  if (
-    Number.isNaN(start.getTime()) ||
-    Number.isNaN(end.getTime()) ||
-    start > end
-  ) {
+  if (isNaN(start.getTime()) || isNaN(end.getTime()) || start > end) {
     return [];
   }
 
@@ -130,17 +127,23 @@ function filterByCustomRange(
   });
 }
 
-function formatLocalDateTime(iso: string) {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "Invalid date";
+/**
+ * Always returns an object so TS is happy and we always render something.
+ * Uses the user's local time zone via `toLocale*`.
+ */
+function formatLocalDateTime(iso: string): { datePart: string; timePart: string } {
+  const dt = new Date(iso);
+  if (isNaN(dt.getTime())) {
+    return { datePart: "Invalid date", timePart: "" };
+  }
 
-  const datePart = d.toLocaleDateString(undefined, {
+  const datePart = dt.toLocaleDateString(undefined, {
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
   });
 
-  const timePart = d.toLocaleTimeString(undefined, {
+  const timePart = dt.toLocaleTimeString(undefined, {
     hour: "2-digit",
     minute: "2-digit",
   });
@@ -194,7 +197,6 @@ export default function DriverDashboardPage() {
           throw new Error((data as any)?.error || "Failed to load stats.");
         }
 
-        // Expect departureTime to be ISO (e.g. ride.departureTime.toISOString())
         setRides(data.rides);
       } catch (err: any) {
         console.error(err);
@@ -215,7 +217,7 @@ export default function DriverDashboardPage() {
         customEnd || null
       );
     }
-    return filterByPresetRange(rides, range);
+    return filterByPresetRange(rides, range as NonCustomRange);
   }, [rides, range, customStart, customEnd]);
 
   const totals = useMemo(() => {
@@ -437,9 +439,11 @@ export default function DriverDashboardPage() {
                           >
                             <td className="px-4 py-2 align-middle text-slate-700">
                               {datePart}{" "}
-                              <span className="text-[11px] text-slate-400">
-                                {timePart}
-                              </span>
+                              {timePart && (
+                                <span className="text-[11px] text-slate-400">
+                                  {timePart}
+                                </span>
+                              )}
                             </td>
                             <td className="px-4 py-2 align-middle text-slate-700">
                               {r.originCity} → {r.destinationCity}
