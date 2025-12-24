@@ -11,6 +11,7 @@ datasource db {
 model User {
   id                      String                   @id @default(cuid())
   email                   String                   @unique
+  stripeCustomerId        String?                  @unique
 
   // Make nullable to match real-world signup flows + your UI assumptions
   name                    String?
@@ -361,27 +362,51 @@ model PaymentMethod {
 
 model RidePayment {
   id          String            @id @default(cuid())
+
+  // Relations
   rideId      String
+  ride        Ride              @relation(fields: [rideId], references: [id], onDelete: Cascade)
+
   riderId     String
-  amountCents Int
-  currency    String            @default("USD")
-  status      RidePaymentStatus @default(PENDING)
-  provider    String            @default("STRIPE")
-  providerRef String?           @unique
+  rider       User              @relation(fields: [riderId], references: [id], onDelete: Cascade)
 
   paymentMethodId String?
-  paymentMethod   PaymentMethod? @relation("RidePaymentPaymentMethod", fields: [paymentMethodId], references: [id])
+  paymentMethod   PaymentMethod? @relation("RidePaymentPaymentMethod", fields: [paymentMethodId], references: [id], onDelete: SetNull)
+
+  refunds     Refund[]
+
+  // Amounts
+  amountCents Int
+  currency    String            @default("usd") // Stripe uses lowercase ISO codes
+
+  // Provider / Stripe references
+  provider    String            @default("STRIPE")
+
+  // The important Stripe object for authorize/capture flow
+  stripePaymentIntentId String? @unique
+  stripeChargeId        String? @unique
+  stripeCustomerId      String?
+
+  // Prevent duplicates on retries
+  idempotencyKey String? @unique
+
+  // State
+  status      RidePaymentStatus @default(PENDING)
+
+  // Audit timestamps (super helpful for ops/debugging)
+  authorizedAt DateTime?
+  capturedAt   DateTime?
+  canceledAt   DateTime?
+  failedAt     DateTime?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  ride    Ride     @relation(fields: [rideId], references: [id])
-  rider   User     @relation(fields: [riderId], references: [id])
-  refunds Refund[]
-
   @@index([riderId])
   @@index([rideId])
   @@index([paymentMethodId])
+  @@index([status])
+  @@index([stripePaymentIntentId])
 }
 
 model Refund {
