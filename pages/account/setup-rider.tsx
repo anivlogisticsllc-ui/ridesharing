@@ -1,28 +1,55 @@
 // pages/account/setup-rider.tsx
-
-import { useState, FormEvent } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { useRouter } from "next/router";
 import { useSession } from "next-auth/react";
 
+type Role = "RIDER" | "DRIVER";
+
+function asRole(v: any): Role | null {
+  return v === "RIDER" || v === "DRIVER" ? v : null;
+}
+
 export default function RiderSetupPage() {
   const router = useRouter();
-  const { data: session } = useSession();
+  const { data: session, status } = useSession();
 
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const displayName =
-    (session?.user?.name && session.user.name.trim()) ||
-    (session?.user?.email
-      ? session.user.email.split("@")[0]
-      : "");
+  const role = asRole((session?.user as any)?.role);
+
+  const displayName = useMemo(() => {
+    const name = (session?.user as any)?.name as string | undefined;
+    const email = session?.user?.email;
+    return (name && name.trim()) || (email ? email.split("@")[0] : "");
+  }, [session]);
+
+  // Guard: must be signed in + must be RIDER
+  useEffect(() => {
+    if (status === "loading") return;
+
+    if (!session) {
+      router.replace("/auth/login?callbackUrl=/account/setup-rider");
+      return;
+    }
+
+    if (!role) {
+      router.replace("/account");
+      return;
+    }
+
+    if (role !== "RIDER") {
+      router.replace("/account/setup-driver");
+    }
+  }, [session, status, role, router]);
 
   async function handleSubmit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
+    if (isSubmitting) return;
+
     setError(null);
 
-    const form = e.currentTarget;
-    const formData = new FormData(form);
+    const formData = new FormData(e.currentTarget);
 
     const addressLine1 = String(formData.get("addressLine1") || "").trim();
     const city = String(formData.get("city") || "").trim();
@@ -42,7 +69,6 @@ export default function RiderSetupPage() {
       state,
       postalCode,
       country,
-      // riders don't send license fields; backend treats them as optional
     };
 
     setIsSubmitting(true);
@@ -54,28 +80,44 @@ export default function RiderSetupPage() {
         body: JSON.stringify(payload),
       });
 
+      const data = await res.json().catch(() => null);
+
       if (!res.ok) {
-        let msg = "Something went wrong while saving your profile.";
-        try {
-          const data = await res.json();
-          if (data?.error && typeof data.error === "string") {
-            msg = data.error;
-          }
-        } catch {
-          /* ignore */
-        }
+        const msg =
+          (data?.error && typeof data.error === "string" && data.error) ||
+          "Something went wrong while saving your profile.";
         setError(msg);
         setIsSubmitting(false);
         return;
       }
 
-      const data = await res.json();
-      const redirectTo = data?.redirectTo || "/billing/membership";
+      const redirectTo =
+        (data?.redirectTo && typeof data.redirectTo === "string" && data.redirectTo) ||
+        "/billing/membership";
+
       router.push(redirectTo);
     } catch {
       setError("Network error. Please try again.");
       setIsSubmitting(false);
     }
+  }
+
+  if (status === "loading" || !session || role !== "RIDER") {
+    return (
+      <main
+        style={{
+          minHeight: "100vh",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          fontFamily: "system-ui, sans-serif",
+          color: "#6b7280",
+          fontSize: 14,
+        }}
+      >
+        Loading…
+      </main>
+    );
   }
 
   return (
@@ -99,19 +141,11 @@ export default function RiderSetupPage() {
           boxShadow: "0 2px 6px rgba(0,0,0,0.06)",
         }}
       >
-        <h1
-          style={{
-            fontSize: 24,
-            fontWeight: 600,
-            marginBottom: 8,
-          }}
-        >
+        <h1 style={{ fontSize: 24, fontWeight: 600, marginBottom: 8 }}>
           Rider account setup
         </h1>
         <p style={{ fontSize: 14, marginBottom: 16 }}>
-          To use the platform, we need your basic address information. Your
-          name from registration is shown below and can be updated later in
-          your profile.
+          To use the platform, we need your basic address information. Your name from registration is shown below and can be updated later.
         </p>
 
         {error && (
@@ -120,7 +154,6 @@ export default function RiderSetupPage() {
           </div>
         )}
 
-        {/* Profile summary (read-only name) */}
         {displayName && (
           <section
             style={{
@@ -131,56 +164,25 @@ export default function RiderSetupPage() {
               background: "#fafafa",
             }}
           >
-            <h2
-              style={{
-                fontSize: 14,
-                fontWeight: 600,
-                marginBottom: 6,
-                color: "#333",
-              }}
-            >
+            <h2 style={{ fontSize: 14, fontWeight: 600, marginBottom: 6, color: "#333" }}>
               Profile
             </h2>
-            <div
-              style={{
-                display: "flex",
-                justifyContent: "space-between",
-                fontSize: 14,
-              }}
-            >
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 14 }}>
               <span style={{ color: "#666" }}>Name</span>
               <span style={{ fontWeight: 600 }}>{displayName}</span>
             </div>
-            <p
-              style={{
-                marginTop: 4,
-                fontSize: 11,
-                color: "#777",
-              }}
-            >
-              This name comes from your account registration. You&apos;ll be
-              able to edit it later in your profile.
+            <p style={{ marginTop: 4, fontSize: 11, color: "#777" }}>
+              This name comes from your account registration.
             </p>
           </section>
         )}
 
-        {/* Address */}
-        <h2
-          style={{
-            fontSize: 16,
-            fontWeight: 600,
-            marginBottom: 8,
-            marginTop: 8,
-          }}
-        >
+        <h2 style={{ fontSize: 16, fontWeight: 600, marginBottom: 8, marginTop: 8 }}>
           Address
         </h2>
 
         <div style={{ marginBottom: 10 }}>
-          <label
-            htmlFor="addressLine1"
-            style={{ display: "block", fontSize: 13, marginBottom: 4 }}
-          >
+          <label htmlFor="addressLine1" style={{ display: "block", fontSize: 13, marginBottom: 4 }}>
             Address line 1 *
           </label>
           <input
@@ -188,48 +190,25 @@ export default function RiderSetupPage() {
             name="addressLine1"
             type="text"
             required
-            style={{
-              width: "100%",
-              padding: 6,
-              borderRadius: 4,
-              border: "1px solid #ccc",
-            }}
+            style={{ width: "100%", padding: 6, borderRadius: 4, border: "1px solid #ccc" }}
           />
         </div>
 
         <div style={{ marginBottom: 10 }}>
-          <label
-            htmlFor="addressLine2"
-            style={{ display: "block", fontSize: 13, marginBottom: 4 }}
-          >
+          <label htmlFor="addressLine2" style={{ display: "block", fontSize: 13, marginBottom: 4 }}>
             Address line 2 (optional)
           </label>
           <input
             id="addressLine2"
             name="addressLine2"
             type="text"
-            style={{
-              width: "100%",
-              padding: 6,
-              borderRadius: 4,
-              border: "1px solid #ccc",
-            }}
+            style={{ width: "100%", padding: 6, borderRadius: 4, border: "1px solid #ccc" }}
           />
         </div>
 
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: "1fr 120px",
-            gap: 8,
-            marginBottom: 10,
-          }}
-        >
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 120px", gap: 8, marginBottom: 10 }}>
           <div>
-            <label
-              htmlFor="city"
-              style={{ display: "block", fontSize: 13, marginBottom: 4 }}
-            >
+            <label htmlFor="city" style={{ display: "block", fontSize: 13, marginBottom: 4 }}>
               City *
             </label>
             <input
@@ -237,20 +216,11 @@ export default function RiderSetupPage() {
               name="city"
               type="text"
               required
-              style={{
-                width: "100%",
-                padding: 6,
-                borderRadius: 4,
-                border: "1px solid #ccc",
-              }}
+              style={{ width: "100%", padding: 6, borderRadius: 4, border: "1px solid #ccc" }}
             />
           </div>
-
           <div>
-            <label
-              htmlFor="state"
-              style={{ display: "block", fontSize: 13, marginBottom: 4 }}
-            >
+            <label htmlFor="state" style={{ display: "block", fontSize: 13, marginBottom: 4 }}>
               State *
             </label>
             <input
@@ -258,29 +228,14 @@ export default function RiderSetupPage() {
               name="state"
               type="text"
               required
-              style={{
-                width: "100%",
-                padding: 6,
-                borderRadius: 4,
-                border: "1px solid #ccc",
-              }}
+              style={{ width: "100%", padding: 6, borderRadius: 4, border: "1px solid #ccc" }}
             />
           </div>
         </div>
 
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: "1fr 1fr",
-            gap: 8,
-            marginBottom: 16,
-          }}
-        >
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 16 }}>
           <div>
-            <label
-              htmlFor="postalCode"
-              style={{ display: "block", fontSize: 13, marginBottom: 4 }}
-            >
+            <label htmlFor="postalCode" style={{ display: "block", fontSize: 13, marginBottom: 4 }}>
               ZIP / Postal code *
             </label>
             <input
@@ -288,20 +243,11 @@ export default function RiderSetupPage() {
               name="postalCode"
               type="text"
               required
-              style={{
-                width: "100%",
-                padding: 6,
-                borderRadius: 4,
-                border: "1px solid #ccc",
-              }}
+              style={{ width: "100%", padding: 6, borderRadius: 4, border: "1px solid #ccc" }}
             />
           </div>
-
           <div>
-            <label
-              htmlFor="country"
-              style={{ display: "block", fontSize: 13, marginBottom: 4 }}
-            >
+            <label htmlFor="country" style={{ display: "block", fontSize: 13, marginBottom: 4 }}>
               Country
             </label>
             <input
@@ -309,12 +255,7 @@ export default function RiderSetupPage() {
               name="country"
               type="text"
               defaultValue="US"
-              style={{
-                width: "100%",
-                padding: 6,
-                borderRadius: 4,
-                border: "1px solid #ccc",
-              }}
+              style={{ width: "100%", padding: 6, borderRadius: 4, border: "1px solid #ccc" }}
             />
           </div>
         </div>

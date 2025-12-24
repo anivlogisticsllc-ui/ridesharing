@@ -1,27 +1,37 @@
 // app/membership/page.tsx
+import Link from "next/link";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/pages/api/auth/[...nextauth]";
 
+type Role = "RIDER" | "DRIVER";
+
+function getRole(session: any): Role | null {
+  const r = session?.user?.role;
+  return r === "RIDER" || r === "DRIVER" ? r : null;
+}
+
 export default async function MembershipPage() {
   const session = await getServerSession(authOptions);
-  const role = (session?.user as any)?.role as
-    | "RIDER"
-    | "DRIVER"
-    | "BOTH"
-    | undefined;
+  const role = getRole(session);
 
-  const isRider = role === "RIDER" || role === "BOTH" || !role;
-  const isDriver = role === "DRIVER" || role === "BOTH" || !role;
+  const isLoggedIn = Boolean(session);
 
-  const showBoth = !session || role === "BOTH";
+  // Show both cards if not logged 
+  const showRider = !isLoggedIn || role === "RIDER";
+  const showDriver = !isLoggedIn || role === "DRIVER";
+
+  const ctaHref = isLoggedIn
+    ? "/billing/membership"
+    : "/auth/login?callbackUrl=/membership";
+
+  const riderCta = isLoggedIn ? "View membership status" : "Choose rider plan";
+  const driverCta = isLoggedIn ? "View membership status" : "Choose driver plan";
 
   return (
     <main className="min-h-[calc(100vh-4rem)] bg-slate-50">
       <div className="mx-auto max-w-4xl px-4 py-10 space-y-6">
         <header>
-          <h1 className="text-2xl font-semibold text-slate-900">
-            Membership
-          </h1>
+          <h1 className="text-2xl font-semibold text-slate-900">Membership</h1>
           <p className="mt-2 text-sm text-slate-600">
             Choose the plan that matches how you use the platform.
           </p>
@@ -29,7 +39,7 @@ export default async function MembershipPage() {
 
         <div className="grid gap-4 md:grid-cols-2">
           {/* Rider plan */}
-          {((showBoth && isRider) || (session && role === "RIDER")) && (
+          {showRider && (
             <div className="rounded-2xl border border-slate-100 bg-white p-5 shadow-sm flex flex-col justify-between">
               <div>
                 <span className="inline-flex items-center rounded-full bg-indigo-50 px-2 py-0.5 text-[11px] font-medium text-indigo-700">
@@ -48,14 +58,18 @@ export default async function MembershipPage() {
                   <li>• Transparent pricing: $3 + $2/mile</li>
                 </ul>
               </div>
-              <button className="mt-4 w-full rounded-full border border-indigo-200 bg-indigo-50 px-4 py-2 text-sm font-medium text-indigo-700 hover:bg-indigo-100">
-                {session ? "Manage rider membership" : "Choose rider plan"}
-              </button>
+
+              <Link
+                href={ctaHref}
+                className="mt-4 w-full text-center rounded-full border border-indigo-200 bg-indigo-50 px-4 py-2 text-sm font-medium text-indigo-700 hover:bg-indigo-100"
+              >
+                {riderCta}
+              </Link>
             </div>
           )}
 
           {/* Driver plan */}
-          {((showBoth && isDriver) || (session && role === "DRIVER")) && (
+          {showDriver && (
             <div className="rounded-2xl border border-slate-100 bg-white p-5 shadow-sm flex flex-col justify-between">
               <div>
                 <span className="inline-flex items-center rounded-full bg-amber-50 px-2 py-0.5 text-[11px] font-medium text-amber-800">
@@ -75,12 +89,23 @@ export default async function MembershipPage() {
                   <li>• Earnings breakdown per ride</li>
                 </ul>
               </div>
-              <button className="mt-4 w-full rounded-full bg-indigo-600 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-indigo-700">
-                {session ? "Manage driver membership" : "Choose driver plan"}
-              </button>
+
+              <Link
+                href={ctaHref}
+                className="mt-4 w-full text-center rounded-full bg-indigo-600 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-indigo-700"
+              >
+                {driverCta}
+              </Link>
             </div>
           )}
         </div>
+
+        {isLoggedIn && (
+          <p className="text-xs text-slate-500">
+            Devil’s advocate: don’t show “manage rider vs driver membership” yet if both buttons go to the same status page.
+            Keep the CTA honest until Stripe is wired.
+          </p>
+        )}
       </div>
     </main>
   );

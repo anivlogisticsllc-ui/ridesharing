@@ -16,7 +16,7 @@ export default async function handler(
   }
 
   const role = (session.user as any).role as UserRole | undefined;
-  if (role !== "DRIVER" && role !== "BOTH") {
+  if (role !== "DRIVER") {
     return res.status(403).json({ ok: false, error: "Not a driver" });
   }
 

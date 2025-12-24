@@ -1,16 +1,19 @@
 // pages/auth/register.tsx
-import { useState, useEffect } from "react";
+import { useState, useEffect, type FormEvent } from "react";
 import { useRouter } from "next/router";
+import { PasswordField } from "@/components/PasswordField";
 
 type RegisterError = string | null;
 
 export default function RegisterPage() {
   const router = useRouter();
+
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [phone, setPhone] = useState("");
   const [password, setPassword] = useState("");
-  const [showPassword, setShowPassword] = useState(false);
+  const [confirmPassword, setConfirmPassword] = useState("");
+
   const [error, setError] = useState<RegisterError>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
@@ -20,16 +23,18 @@ export default function RegisterPage() {
   // Initialize plan from ?role=RIDER / ?role=DRIVER in the URL
   useEffect(() => {
     if (!router.isReady) return;
-    const qRole = typeof router.query.role === "string" ? router.query.role : "";
+
+    const qRole =
+      typeof router.query.role === "string" ? router.query.role : "";
+
     if (qRole.toUpperCase() === "DRIVER") {
       setPlan("driver");
     } else if (qRole.toUpperCase() === "RIDER") {
       setPlan("rider");
     }
-    // if query has something else, we just keep default "rider"
   }, [router.isReady, router.query.role]);
 
-  async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
+  async function handleSubmit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
     setError(null);
 
@@ -38,7 +43,18 @@ export default function RegisterPage() {
       return;
     }
 
+    if (password.length < 8) {
+      setError("Password must be at least 8 characters long.");
+      return;
+    }
+
+    if (password !== confirmPassword) {
+      setError("Password and confirmation do not match.");
+      return;
+    }
+
     setIsSubmitting(true);
+
     try {
       const res = await fetch("/api/register", {
         method: "POST",
@@ -48,20 +64,22 @@ export default function RegisterPage() {
           email: email.trim(),
           phone: phone.trim() || undefined,
           password,
-          plan, // ✅ this goes to your API and becomes the role
+          plan, // becomes the role in the API
         }),
       });
 
       if (!res.ok) {
         let msg = "Could not create account.";
+
         try {
           const data = await res.json();
           if (data?.error && typeof data.error === "string") {
             msg = data.error;
           }
         } catch {
-          // ignore
+          // ignore JSON parse error
         }
+
         setError(msg);
         setIsSubmitting(false);
         return;
@@ -238,52 +256,28 @@ export default function RegisterPage() {
           />
         </div>
 
-        {/* Password + eye icon */}
-        <div style={{ marginBottom: 20 }}>
-          <label
-            htmlFor="password"
-            style={{ display: "block", fontSize: 13, marginBottom: 4 }}
-          >
-            Password
-          </label>
-          <div style={{ position: "relative" }}>
-            <input
-              id="password"
-              type={showPassword ? "text" : "password"}
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              required
-              style={{
-                width: "100%",
-                padding: "8px 36px 8px 8px",
-                borderRadius: 4,
-                border: "1px solid #ccc",
-                fontSize: 14,
-                boxSizing: "border-box",
-              }}
-            />
-            <button
-              type="button"
-              onClick={() => setShowPassword((v) => !v)}
-              aria-label={showPassword ? "Hide password" : "Show password"}
-              style={{
-                position: "absolute",
-                right: 8,
-                top: "50%",
-                transform: "translateY(-50%)",
-                border: "none",
-                background: "transparent",
-                cursor: "pointer",
-                padding: 0,
-                fontSize: 14,
-              }}
-            >
-              {showPassword ? "Hide" : "Show"}
-            </button>
-          </div>
+        {/* Password + confirm password */}
+        <div style={{ marginBottom: 12 }}>
+          <PasswordField
+            label="Password"
+            name="password"
+            autoComplete="new-password"
+            showStrength
+            onChange={(e) => setPassword(e.target.value)}
+          />
           <p style={{ fontSize: 11, color: "#777", marginTop: 4 }}>
-            At least 8 characters.
+            At least 8 characters, ideally with a mix of letters, numbers, and
+            symbols.
           </p>
+        </div>
+
+        <div style={{ marginBottom: 20 }}>
+          <PasswordField
+            label="Confirm password"
+            name="confirmPassword"
+            autoComplete="new-password"
+            onChange={(e) => setConfirmPassword(e.target.value)}
+          />
         </div>
 
         {/* Submit */}

@@ -99,6 +99,7 @@ export const authOptions: NextAuthOptions = {
   callbacks: {
     async jwt({ token, user }) {
       if (user) {
+        (token as any).userId = (user as any).id;
         (token as any).role = (user as any).role;
         (token as any).accountStatus = (user as any).accountStatus;
       }
@@ -108,19 +109,26 @@ export const authOptions: NextAuthOptions = {
     async session({ session, token }) {
       if (session.user) {
         const u = session.user as any;
-
-        // id comes from token.sub
-        u.id = token.sub as string | undefined;
-        u.role = (token as any).role as UserRole | undefined;
+        u.id = (token as any).userId ?? token.sub;
+        u.role = (token as any).role;
         u.accountStatus = (token as any).accountStatus;
       }
       return session;
     },
 
-    async redirect({ baseUrl }) {
-      // always go back to site root after auth
+    async redirect({ url, baseUrl }) {
+      // allow relative callbackUrl
+      if (url.startsWith("/")) return `${baseUrl}${url}`;
+
+      // allow same-origin absolute callbackUrl
+      try {
+        const u = new URL(url);
+        if (u.origin === baseUrl) return url;
+      } catch {}
+
       return baseUrl;
-    },
+    }
+
   },
 };
 

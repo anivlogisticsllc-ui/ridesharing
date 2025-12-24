@@ -6,7 +6,7 @@ export default async function DriverDashboard() {
   const session = await getServerSession(authOptions);
 
   // Protect the page: only drivers can access
-  if (!session || !["DRIVER", "BOTH"].includes((session.user as any)?.role)) {
+  if (!session || !["DRIVER"].includes((session.user as any)?.role)) {
     redirect("/");
   }
 

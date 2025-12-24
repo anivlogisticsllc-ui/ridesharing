@@ -1,29 +1,54 @@
 // app/driver/rides/[id]/page.tsx
-
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { prisma } from "@/lib/prisma";
+import { BookingStatus, RideStatus } from "@prisma/client";
 
-type RideDetailPageProps = {
-  // In App Router + Turbopack, params is a Promise
-  params: Promise<{ id: string }>;
-};
+type Props = { params: Promise<{ id: string }> };
 
-export default async function RideDetailPage({ params }: RideDetailPageProps) {
-  // Unwrap the params Promise
+export default async function RideDetailPage({ params }: Props) {
   const { id } = await params;
+  if (!id) notFound();
 
   const ride = await prisma.ride.findUnique({
     where: { id },
     include: {
       rider: true,
       driver: true,
+      conversations: {
+        take: 1,
+        orderBy: { createdAt: "desc" },
+        select: { id: true },
+      },
     },
   });
 
-  if (!ride) {
-    notFound();
-  }
+  if (!ride) notFound();
+
+  // Find booking explicitly (don’t rely on ride.bookings shape)
+  const booking = await prisma.booking.findFirst({
+    where: {
+      rideId: id,
+      status: { in: [BookingStatus.ACCEPTED, BookingStatus.COMPLETED] },
+    },
+    orderBy: { createdAt: "asc" },
+    select: { id: true },
+  });
+
+  const conversationId = ride.conversations?.[0]?.id ?? null;
+
+  const isCompletedOrCancelled =
+    ride.status === RideStatus.COMPLETED || ride.status === RideStatus.CANCELLED;
+
+  const chatHref = conversationId
+    ? `/chat/${conversationId}?role=driver${isCompletedOrCancelled ? "&readonly=1" : ""}`
+    : null;
+
+  // IMPORTANT: receipt page expects bookingId (but our receipt page also supports rideId now)
+  const receiptHref =
+    ride.status === RideStatus.COMPLETED
+      ? `/receipt/${booking?.id ?? ride.id}`
+      : null;
 
   const startedAt = ride.tripStartedAt ?? ride.departureTime;
   const completedAt = ride.tripCompletedAt ?? ride.updatedAt;
@@ -35,22 +60,22 @@ export default async function RideDetailPage({ params }: RideDetailPageProps) {
 
   const durationMinutes = durationMs > 0 ? durationMs / 1000 / 60 : 0;
 
-  const formatDuration = (minutes: number) => {
+  function formatDuration(minutes: number) {
     if (minutes <= 0) return "n/a";
     const totalMinutes = Math.round(minutes);
     const hours = Math.floor(totalMinutes / 60);
     const mins = totalMinutes % 60;
     if (hours === 0) return `${mins} min`;
     return `${hours}h ${mins}m`;
-  };
+  }
 
   const distanceMiles = ride.distanceMiles ?? 0;
-  const totalPriceCents = ride.totalPriceCents ?? 0;
-  const totalPriceDollars = (totalPriceCents / 100).toFixed(2);
+  const totalPriceOfferCents = ride.totalPriceCents ?? 0;
+  const totalPriceDollars = (totalPriceOfferCents / 100).toFixed(2);
 
   return (
     <main className="min-h-[calc(100vh-4rem)] bg-slate-50">
-      <div className="mx-auto max-w-3xl px-4 py-8 space-y-6">
+      <div className="mx-auto max-w-3xl space-y-6 px-4 py-8">
         <Link
           href="/driver/dashboard"
           className="inline-flex items-center text-sm text-slate-600 hover:text-slate-900"
@@ -59,40 +84,60 @@ export default async function RideDetailPage({ params }: RideDetailPageProps) {
           Back to dashboard
         </Link>
 
-        {/* Header */}
         <header className="space-y-2">
-          <h1 className="text-2xl font-semibold text-slate-900">
-            Ride details
-          </h1>
+          <h1 className="text-2xl font-semibold text-slate-900">Ride details</h1>
           <p className="text-sm text-slate-600">
             {ride.originCity} → {ride.destinationCity}
           </p>
           <p className="text-xs text-slate-500">
             Ride ID: <span className="font-mono">{ride.id}</span>
           </p>
+
+          <div className="flex flex-wrap gap-2 pt-2">
+            {chatHref ? (
+              <Link
+                href={chatHref}
+                className="inline-flex items-center rounded-full border border-slate-200 bg-white px-4 py-2 text-xs font-medium text-slate-900 hover:bg-slate-50"
+              >
+                View chat {isCompletedOrCancelled ? "(read-only)" : ""}
+              </Link>
+            ) : (
+              <span className="inline-flex items-center rounded-full border border-slate-200 bg-white px-4 py-2 text-xs text-slate-500">
+                No chat available
+              </span>
+            )}
+
+            {receiptHref ? (
+              <Link
+                href={receiptHref}
+                className="inline-flex items-center rounded-full bg-indigo-600 px-4 py-2 text-xs font-medium text-white hover:bg-indigo-700"
+              >
+                View receipt
+              </Link>
+            ) : (
+              <span className="inline-flex items-center rounded-full border border-slate-200 bg-white px-4 py-2 text-xs text-slate-500">
+                Receipt not available
+              </span>
+            )}
+          </div>
         </header>
 
-        {/* Trip summary */}
         <section className="space-y-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
               <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
                 Trip status
               </p>
-              <p className="text-sm font-semibold text-slate-900">
-                {ride.status}
-              </p>
+              <p className="text-sm font-semibold text-slate-900">{ride.status}</p>
             </div>
 
             <div className="text-right">
               <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
                 Total fare
               </p>
-              <p className="text-lg font-semibold text-slate-900">
-                ${totalPriceDollars}
-              </p>
+              <p className="text-lg font-semibold text-slate-900">${totalPriceDollars}</p>
               <p className="text-[11px] text-slate-500">
-                Stored as {totalPriceCents} cents
+                Stored as {totalPriceOfferCents} cents
               </p>
             </div>
           </div>
@@ -111,9 +156,7 @@ export default async function RideDetailPage({ params }: RideDetailPageProps) {
               <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
                 Duration
               </p>
-              <p className="mt-1 font-semibold">
-                {formatDuration(durationMinutes)}
-              </p>
+              <p className="mt-1 font-semibold">{formatDuration(durationMinutes)}</p>
             </div>
 
             <div>
@@ -125,7 +168,6 @@ export default async function RideDetailPage({ params }: RideDetailPageProps) {
           </div>
         </section>
 
-        {/* Timing */}
         <section className="space-y-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm text-sm text-slate-700">
           <h2 className="text-xs font-semibold uppercase tracking-wide text-slate-500">
             Timing
@@ -133,15 +175,11 @@ export default async function RideDetailPage({ params }: RideDetailPageProps) {
           <div className="grid gap-3 sm:grid-cols-2">
             <div>
               <p className="text-xs text-slate-500">Scheduled departure</p>
-              <p className="mt-1 font-medium">
-                {ride.departureTime.toLocaleString()}
-              </p>
+              <p className="mt-1 font-medium">{ride.departureTime.toLocaleString()}</p>
             </div>
             <div>
               <p className="text-xs text-slate-500">Trip started</p>
-              <p className="mt-1 font-medium">
-                {startedAt ? startedAt.toLocaleString() : "n/a"}
-              </p>
+              <p className="mt-1 font-medium">{startedAt ? startedAt.toLocaleString() : "n/a"}</p>
             </div>
             <div>
               <p className="text-xs text-slate-500">Trip completed</p>
@@ -149,61 +187,6 @@ export default async function RideDetailPage({ params }: RideDetailPageProps) {
                 {completedAt ? completedAt.toLocaleString() : "n/a"}
               </p>
             </div>
-          </div>
-        </section>
-
-        {/* Route & vehicle */}
-        <section className="space-y-4 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm text-sm text-slate-700">
-          <h2 className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-            Route & vehicle
-          </h2>
-
-          <div className="grid gap-4 sm:grid-cols-2">
-            <div>
-              <p className="text-xs text-slate-500">Pickup</p>
-              <p className="mt-1 font-medium">{ride.originCity}</p>
-              <p className="text-[11px] text-slate-500">
-                ({ride.originLat.toFixed(4)}, {ride.originLng.toFixed(4)})
-              </p>
-            </div>
-            <div>
-              <p className="text-xs text-slate-500">Dropoff</p>
-              <p className="mt-1 font-medium">{ride.destinationCity}</p>
-              <p className="text-[11px] text-slate-500">
-                ({ride.destinationLat.toFixed(4)},{" "}
-                {ride.destinationLng.toFixed(4)})
-              </p>
-            </div>
-          </div>
-
-          <div className="grid gap-4 sm:grid-cols-2">
-            <div>
-              <p className="text-xs text-slate-500">Vehicle</p>
-              <p className="mt-1 font-medium">
-                {ride.vehicleMake && ride.vehicleModel
-                  ? `${ride.vehicleMake} ${ride.vehicleModel}`
-                  : "Not specified"}
-              </p>
-              <p className="text-[11px] text-slate-500">
-                {ride.vehicleColor || ""}{" "}
-                {ride.licensePlate ? `• Plate: ${ride.licensePlate}` : ""}
-              </p>
-            </div>
-
-            <div>
-              <p className="text-xs text-slate-500">Driver</p>
-              <p className="mt-1 font-medium">
-                {ride.driver?.name || "You"}
-              </p>
-              <p className="text-[11px] text-slate-500">
-                Rider: {ride.rider?.name || "Unknown"}
-              </p>
-            </div>
-          </div>
-
-          <div className="mt-4 rounded-xl border border-dashed border-slate-300 bg-slate-50 p-3 text-xs text-slate-500">
-            Map / path visualization can go here later. For now this page shows
-            stored distance, price, and timing from the database.
           </div>
         </section>
       </div>

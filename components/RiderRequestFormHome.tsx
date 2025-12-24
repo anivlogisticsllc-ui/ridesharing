@@ -71,6 +71,10 @@ export function RiderRequestFormHome() {
   const { data: session, status } = useSession();
   const router = useRouter();
 
+  // Visible address search box values (FIX: controlled so we can clear them)
+  const [originQuery, setOriginQuery] = useState("");
+  const [destQuery, setDestQuery] = useState("");
+
   // Origin address
   const [originStreetNumber, setOriginStreetNumber] = useState("");
   const [originStreetName, setOriginStreetName] = useState("");
@@ -85,12 +89,10 @@ export function RiderRequestFormHome() {
   const [destStateVal, setDestStateVal] = useState("");
   const [destZip, setDestZip] = useState("");
 
-  const [departureMode, setDepartureMode] =
-    useState<DepartureMode>("ASAP");
+  const [departureMode, setDepartureMode] = useState<DepartureMode>("ASAP");
   const [departureTime, setDepartureTime] = useState("");
   const [distanceMiles, setDistanceMiles] = useState<number | "">("");
-  const [passengerCount, setPassengerCount] =
-    useState<number | "">(1);
+  const [passengerCount, setPassengerCount] = useState<number | "">(1);
 
   const [submitting, setSubmitting] = useState(false);
   const [estimating, setEstimating] = useState(false);
@@ -173,6 +175,30 @@ export function RiderRequestFormHome() {
     }
   }
 
+  function resetForm() {
+    // Clear visible address labels (THIS is the missing piece)
+    setOriginQuery("");
+    setDestQuery("");
+
+    // Clear structured fields
+    setOriginStreetNumber("");
+    setOriginStreetName("");
+    setOriginCity("");
+    setOriginStateVal("");
+    setOriginZip("");
+
+    setDestStreetNumber("");
+    setDestStreetName("");
+    setDestCity("");
+    setDestStateVal("");
+    setDestZip("");
+
+    setDepartureMode("ASAP");
+    setDepartureTime("");
+    setDistanceMiles("");
+    setPassengerCount(1);
+  }
+
   async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
     setError(null);
@@ -199,7 +225,6 @@ export function RiderRequestFormHome() {
       return;
     }
 
-    // Basic ZIP validation (client-side only; still validate server-side in /api/rides)
     if (!/^\d{5}$/.test(originZip.trim()) || !/^\d{5}$/.test(destZip.trim())) {
       setError("ZIP codes must be 5 digits.");
       return;
@@ -217,7 +242,6 @@ export function RiderRequestFormHome() {
         ? null
         : Number(distanceMiles);
 
-    // If user left distance blank, try to auto-estimate it
     if (distanceToSend == null) {
       const result = await estimateDistanceOnce({ showUserError: true });
       if (!result) return;
@@ -236,7 +260,6 @@ export function RiderRequestFormHome() {
       return;
     }
 
-    // Basic passenger range check
     const passengersNumber =
       typeof passengerCount === "number"
         ? passengerCount
@@ -282,27 +305,8 @@ export function RiderRequestFormHome() {
         throw new Error(data.error || "Failed to post ride request");
       }
 
-      setMessage(
-        "Ride request posted. You can see it in your Rider portal."
-      );
-
-      // Reset form
-      setOriginStreetNumber("");
-      setOriginStreetName("");
-      setOriginCity("");
-      setOriginStateVal("");
-      setOriginZip("");
-
-      setDestStreetNumber("");
-      setDestStreetName("");
-      setDestCity("");
-      setDestStateVal("");
-      setDestZip("");
-
-      setDepartureMode("ASAP");
-      setDepartureTime("");
-      setDistanceMiles("");
-      setPassengerCount(1);
+      setMessage("Ride request posted. You can see it in your Rider portal.");
+      resetForm();
     } catch (err: any) {
       console.error(err);
       setError(err.message || "Something went wrong");
@@ -313,32 +317,27 @@ export function RiderRequestFormHome() {
 
   if (status === "loading" || !session) {
     return (
-      <p className="py-4 text-sm text-slate-500">
-        Loading your rider account…
-      </p>
+      <p className="py-4 text-sm text-slate-500">Loading your rider account…</p>
     );
   }
 
   return (
     <section className="space-y-3">
-      <h2 className="text-lg font-semibold text-slate-900">
-        Request a ride
-      </h2>
+      <h2 className="text-lg font-semibold text-slate-900">Request a ride</h2>
 
       <form
         onSubmit={handleSubmit}
-        className="space-y-3 rounded-2xl bg-white border border-slate-200 p-5 shadow-sm"
+        className="space-y-3 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm"
       >
-        {/* From / To structured address fields + autocomplete */}
         <div className="grid gap-4 md:grid-cols-2">
           {/* FROM */}
           <div className="space-y-2">
-            <p className="text-sm font-medium text-slate-800">
-              From (address)
-            </p>
+            <p className="text-sm font-medium text-slate-800">From (address)</p>
 
             <AddressSearchBox
               placeholder="Search starting address"
+              value={originQuery}
+              onChangeValue={setOriginQuery}
               onSelect={(s) => {
                 setOriginStreetNumber(s.streetNumber);
                 setOriginStreetName(s.streetName);
@@ -350,9 +349,7 @@ export function RiderRequestFormHome() {
 
             <div className="grid grid-cols-[minmax(0,0.5fr)_minmax(0,1.5fr)] gap-2">
               <div>
-                <label className="block text-xs text-slate-600 mb-1">
-                  No.
-                </label>
+                <label className="mb-1 block text-xs text-slate-600">No.</label>
                 <input
                   type="text"
                   inputMode="numeric"
@@ -363,7 +360,7 @@ export function RiderRequestFormHome() {
                 />
               </div>
               <div>
-                <label className="block text-xs text-slate-600 mb-1">
+                <label className="mb-1 block text-xs text-slate-600">
                   Street
                 </label>
                 <input
@@ -378,9 +375,7 @@ export function RiderRequestFormHome() {
 
             <div className="grid grid-cols-[minmax(0,1.4fr)_minmax(0,0.6fr)] gap-2">
               <div>
-                <label className="block text-xs text-slate-600 mb-1">
-                  City
-                </label>
+                <label className="mb-1 block text-xs text-slate-600">City</label>
                 <input
                   type="text"
                   value={originCity}
@@ -391,7 +386,7 @@ export function RiderRequestFormHome() {
               </div>
               <div className="grid grid-cols-2 gap-2">
                 <div>
-                  <label className="block text-xs text-slate-600 mb-1">
+                  <label className="mb-1 block text-xs text-slate-600">
                     State
                   </label>
                   <input
@@ -407,7 +402,7 @@ export function RiderRequestFormHome() {
                   />
                 </div>
                 <div>
-                  <label className="block text-xs text-slate-600 mb-1">
+                  <label className="mb-1 block text-xs text-slate-600">
                     ZIP
                   </label>
                   <input
@@ -427,12 +422,12 @@ export function RiderRequestFormHome() {
 
           {/* TO */}
           <div className="space-y-2">
-            <p className="text-sm font-medium text-slate-800">
-              To (address)
-            </p>
+            <p className="text-sm font-medium text-slate-800">To (address)</p>
 
             <AddressSearchBox
               placeholder="Search destination address"
+              value={destQuery}
+              onChangeValue={setDestQuery}
               onSelect={(s) => {
                 setDestStreetNumber(s.streetNumber);
                 setDestStreetName(s.streetName);
@@ -444,9 +439,7 @@ export function RiderRequestFormHome() {
 
             <div className="grid grid-cols-[minmax(0,0.5fr)_minmax(0,1.5fr)] gap-2">
               <div>
-                <label className="block text-xs text-slate-600 mb-1">
-                  No.
-                </label>
+                <label className="mb-1 block text-xs text-slate-600">No.</label>
                 <input
                   type="text"
                   inputMode="numeric"
@@ -457,7 +450,7 @@ export function RiderRequestFormHome() {
                 />
               </div>
               <div>
-                <label className="block text-xs text-slate-600 mb-1">
+                <label className="mb-1 block text-xs text-slate-600">
                   Street
                 </label>
                 <input
@@ -472,9 +465,7 @@ export function RiderRequestFormHome() {
 
             <div className="grid grid-cols-[minmax(0,1.4fr)_minmax(0,0.6fr)] gap-2">
               <div>
-                <label className="block text-xs text-slate-600 mb-1">
-                  City
-                </label>
+                <label className="mb-1 block text-xs text-slate-600">City</label>
                 <input
                   type="text"
                   value={destCity}
@@ -485,7 +476,7 @@ export function RiderRequestFormHome() {
               </div>
               <div className="grid grid-cols-2 gap-2">
                 <div>
-                  <label className="block text-xs text-slate-600 mb-1">
+                  <label className="mb-1 block text-xs text-slate-600">
                     State
                   </label>
                   <input
@@ -501,7 +492,7 @@ export function RiderRequestFormHome() {
                   />
                 </div>
                 <div>
-                  <label className="block text-xs text-slate-600 mb-1">
+                  <label className="mb-1 block text-xs text-slate-600">
                     ZIP
                   </label>
                   <input
@@ -563,7 +554,7 @@ export function RiderRequestFormHome() {
         {/* Distance + passengers */}
         <div className="grid gap-3 md:grid-cols-2">
           <div>
-            <label className="block text-sm font-medium text-slate-800 mb-1">
+            <label className="mb-1 block text-sm font-medium text-slate-800">
               Distance (miles)
             </label>
             <input
@@ -582,13 +573,9 @@ export function RiderRequestFormHome() {
               type="button"
               onClick={() => {
                 setError(null);
-                estimateDistanceOnce({ showUserError: true }).then(
-                  (result) => {
-                    if (result) {
-                      setDistanceMiles(Number(result.miles.toFixed(1)));
-                    }
-                  }
-                );
+                estimateDistanceOnce({ showUserError: true }).then((result) => {
+                  if (result) setDistanceMiles(Number(result.miles.toFixed(1)));
+                });
               }}
               disabled={estimating}
               className="mt-1 text-xs text-indigo-700 hover:underline disabled:opacity-60"
@@ -598,7 +585,7 @@ export function RiderRequestFormHome() {
           </div>
 
           <div>
-            <label className="block text-sm font-medium text-slate-800 mb-1">
+            <label className="mb-1 block text-sm font-medium text-slate-800">
               Number of passengers
             </label>
             <input
@@ -618,12 +605,12 @@ export function RiderRequestFormHome() {
         </div>
 
         {message && (
-          <div className="rounded-md bg-emerald-50 border border-emerald-200 px-3 py-2 text-xs text-emerald-800">
+          <div className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-800">
             {message}
           </div>
         )}
         {error && (
-          <div className="rounded-md bg-rose-50 border border-rose-200 px-3 py-2 text-xs text-rose-800">
+          <div className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-800">
             {error}
           </div>
         )}
@@ -644,19 +631,20 @@ export function RiderRequestFormHome() {
 
 function AddressSearchBox(props: {
   placeholder?: string;
+  value: string;
+  onChangeValue: (value: string) => void;
   onSelect: (suggestion: AddressSuggestion) => void;
 }) {
-  const { placeholder, onSelect } = props;
+  const { placeholder, value, onChangeValue, onSelect } = props;
 
-  const [query, setQuery] = useState("");
   const [suggestions, setSuggestions] = useState<AddressSuggestion[]>([]);
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
   const [activeIndex, setActiveIndex] = useState<number>(-1);
 
-  async function fetchSuggestions(value: string) {
-    const trimmed = value.trim();
+  async function fetchSuggestions(nextValue: string) {
+    const trimmed = nextValue.trim();
     setLocalError(null);
 
     if (trimmed.length < 3) {
@@ -701,17 +689,19 @@ function AddressSearchBox(props: {
   function applySuggestion(index: number) {
     const s = suggestions[index];
     if (!s) return;
+
     onSelect(s);
-    setQuery(s.label);
+
+    // Set visible label in the input
+    onChangeValue(s.label);
+
     setOpen(false);
     setActiveIndex(-1);
   }
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
-    // If list is empty, let key behave normally
     if (!suggestions.length) {
-      // Small boost: ArrowDown can open list if query is long enough
-      if (e.key === "ArrowDown" && query.trim().length >= 3) {
+      if (e.key === "ArrowDown" && value.trim().length >= 3) {
         e.preventDefault();
         setOpen(true);
         setActiveIndex(0);
@@ -749,11 +739,11 @@ function AddressSearchBox(props: {
     <div className="relative">
       <input
         type="text"
-        value={query}
+        value={value}
         onChange={(e) => {
-          const value = e.target.value;
-          setQuery(value);
-          void fetchSuggestions(value);
+          const next = e.target.value;
+          onChangeValue(next);
+          void fetchSuggestions(next);
         }}
         onKeyDown={handleKeyDown}
         placeholder={placeholder || "Search address"}
@@ -768,9 +758,7 @@ function AddressSearchBox(props: {
       )}
 
       {localError && (
-        <div className="mt-1 text-[11px] text-rose-500">
-          {localError}
-        </div>
+        <div className="mt-1 text-[11px] text-rose-500">{localError}</div>
       )}
 
       {open && suggestions.length > 0 && (
@@ -784,7 +772,6 @@ function AddressSearchBox(props: {
                   : "text-slate-700 hover:bg-slate-50"
               }`}
               onMouseDown={(e) => {
-                // prevent blur before click fires
                 e.preventDefault();
                 applySuggestion(index);
               }}

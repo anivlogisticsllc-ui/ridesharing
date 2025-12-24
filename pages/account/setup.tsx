@@ -11,7 +11,6 @@ export default function AccountSetupRouter() {
     const role = (session?.user as any)?.role as
       | "RIDER"
       | "DRIVER"
-      | "BOTH"
       | undefined;
 
     if (!role) {
@@ -19,7 +18,7 @@ export default function AccountSetupRouter() {
       return;
     }
 
-    if (role === "DRIVER" || role === "BOTH") {
+    if (role === "DRIVER") {
       router.replace("/account/setup-driver");
     } else {
       router.replace("/account/setup-rider");

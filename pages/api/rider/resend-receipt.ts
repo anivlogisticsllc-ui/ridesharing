@@ -31,7 +31,7 @@ export default async function handler(
         email?: string | null;
         image?: string | null;
       } & {
-        role?: "RIDER" | "DRIVER" | "BOTH";
+        role?: "RIDER" | "DRIVER";
       })
     | undefined;
 

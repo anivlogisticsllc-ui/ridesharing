@@ -3,7 +3,7 @@ import type { Metadata } from "next";
 import { Inter } from "next/font/google";
 import "./globals.css";
 
-import { Providers } from "./providers";
+import Providers from "./providers";
 import { Header } from "@/components/Header";
 import { HideIfEmbedded } from "@/components/HideIfEmbedded";
 
@@ -16,23 +16,17 @@ export const metadata: Metadata = {
 
 export default function RootLayout({
   children,
-}: {
-  children: React.ReactNode;
-}) {
+}: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="en">
       <body className={inter.className}>
         <Providers>
           <div className="min-h-screen bg-slate-50 text-slate-900">
-
-            {/* Hide header when inside iframe (chat overlay) */}
             <HideIfEmbedded>
               <Header />
             </HideIfEmbedded>
 
-            <main className="mx-auto max-w-6xl px-4 py-8">
-              {children}
-            </main>
+            <main className="mx-auto max-w-6xl px-4 py-8">{children}</main>
           </div>
         </Providers>
       </body>

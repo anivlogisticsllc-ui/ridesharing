@@ -58,6 +58,16 @@ function formatMoney(cents: number) {
   return (cents / 100).toFixed(2);
 }
 
+function isChatReadOnly(b: Booking): boolean {
+  // You can tweak this rule, but this is the typical one:
+  // - completed/cancelled/expired chats are read-only
+  // - in-route / upcoming are writable
+  const completed =
+    b.status === "COMPLETED" || b.rideStatus === "COMPLETED";
+  const cancelledLike = b.status === "CANCELLED" || b.status === "EXPIRED";
+  return completed || cancelledLike;
+}
+
 /* ============================================
  *           MAIN RIDER PORTAL PAGE
  * ==========================================*/
@@ -73,10 +83,14 @@ export default function RiderPortalPage() {
   const [actionBusyId, setActionBusyId] = useState<string | null>(null);
   const [receiptBusyId, setReceiptBusyId] = useState<string | null>(null);
 
-  const [expandedBookingId, setExpandedBookingId] =
-    useState<string | null>(null);
-  const [activeConversationId, setActiveConversationId] =
-    useState<string | null>(null);
+  const [expandedBookingId, setExpandedBookingId] = useState<string | null>(
+    null
+  );
+
+  const [activeChat, setActiveChat] = useState<{
+    conversationId: string;
+    readOnly: boolean;
+  } | null>(null);
 
   const [chatNotifications, setChatNotifications] = useState<
     Record<string, number>
@@ -141,11 +155,8 @@ export default function RiderPortalPage() {
       }
     }
 
-    // initial load
     load();
-
-    // light polling so driver-side changes appear automatically
-    const intervalId = setInterval(load, 10_000); // every 10 seconds
+    const intervalId = setInterval(load, 10_000);
 
     return () => {
       cancelled = true;
@@ -243,7 +254,6 @@ export default function RiderPortalPage() {
 
     const completedRaw = bookings.filter(isCompletedBooking);
 
-    // Sort active and upcoming by departure time ASC
     active.sort((a, b) => {
       const da = safeDate(a.departureTime)?.getTime() ?? 0;
       const db = safeDate(b.departureTime)?.getTime() ?? 0;
@@ -256,7 +266,6 @@ export default function RiderPortalPage() {
       return da - db;
     });
 
-    // Completed sorted by tripCompletedAt DESC, fallback to departure DESC
     completedRaw.sort((a, b) => {
       const da =
         safeDate(a.tripCompletedAt || a.departureTime)?.getTime() ?? 0;
@@ -316,7 +325,6 @@ export default function RiderPortalPage() {
       return true;
     }
 
-    // ALL
     return true;
   }
 
@@ -351,11 +359,6 @@ export default function RiderPortalPage() {
 
   /* ---------- Actions ---------- */
 
-  /**
-   * bookingOrRideId:
-   *   - real booking id for normal bookings
-   *   - "ride-<rideId>" for ride-only "request pending" entries
-   */
   async function handleAction(
     bookingOrRideId: string,
     action: "cancel" | "complete"
@@ -380,8 +383,8 @@ export default function RiderPortalPage() {
         try {
           const data = await res.json();
           if (data?.error) msg = data.error;
-        } catch (e) {
-          console.error("Non-JSON error from action endpoint:", e);
+        } catch {
+          // ignore
         }
         setError(msg);
         return;
@@ -393,13 +396,11 @@ export default function RiderPortalPage() {
         return;
       }
 
-      // Synthetic "ride-<id>" => remove that entry
       if (action === "cancel" && bookingOrRideId.startsWith("ride-")) {
         setBookings((prev) => prev.filter((b) => b.id !== bookingOrRideId));
         return;
       }
 
-      // Real booking id: update in-place
       setBookings((prev) =>
         prev.map((b) =>
           b.bookingId === bookingOrRideId
@@ -456,7 +457,6 @@ export default function RiderPortalPage() {
     }
   }
 
-  // Export CSV for completed rides (current filter)
   function handleExportCompletedCsv() {
     if (!filteredCompleted.length) return;
 
@@ -513,11 +513,9 @@ export default function RiderPortalPage() {
         maxWidth: 1100,
         margin: "0 auto",
         padding: "24px 16px 40px",
-        fontFamily:
-          "system-ui, -apple-system, BlinkMacSystemFont, sans-serif",
+        fontFamily: "system-ui, -apple-system, BlinkMacSystemFont, sans-serif",
       }}
     >
-      {/* Top header */}
       <header
         style={{
           display: "flex",
@@ -529,23 +527,10 @@ export default function RiderPortalPage() {
         }}
       >
         <div>
-          <h1
-            style={{
-              fontSize: 30,
-              fontWeight: 650,
-              marginBottom: 6,
-            }}
-          >
+          <h1 style={{ fontSize: 30, fontWeight: 650, marginBottom: 6 }}>
             Rider portal
           </h1>
-          <p
-            style={{
-              margin: 0,
-              color: "#555",
-              maxWidth: 520,
-              fontSize: 14,
-            }}
-          >
+          <p style={{ margin: 0, color: "#555", maxWidth: 520, fontSize: 14 }}>
             Track your upcoming and completed rides, chat with drivers, and
             manage your trips.
           </p>
@@ -571,7 +556,6 @@ export default function RiderPortalPage() {
         </a>
       </header>
 
-      {/* Summary cards */}
       <section
         style={{
           display: "grid",
@@ -587,7 +571,6 @@ export default function RiderPortalPage() {
         <SummaryCard label="Total bookings" value={total} />
       </section>
 
-      {/* Toast for receipt actions */}
       {toastMessage && (
         <p
           style={{
@@ -608,7 +591,6 @@ export default function RiderPortalPage() {
 
       {!loading && !error && (
         <>
-          {/* Tabs */}
           <div
             style={{
               display: "flex",
@@ -657,7 +639,6 @@ export default function RiderPortalPage() {
             </button>
           </div>
 
-          {/* UPCOMING TAB */}
           {activeTab === "UPCOMING" && (
             <section>
               <SectionHeader
@@ -701,32 +682,23 @@ export default function RiderPortalPage() {
                 <>
                   {activeRides.length > 0 && (
                     <>
-                      <h3
-                        style={{
-                          margin: "8px 0 4px",
-                          fontSize: 14,
-                          fontWeight: 600,
-                        }}
-                      >
+                      <h3 style={{ margin: "8px 0 4px", fontSize: 14, fontWeight: 600 }}>
                         Active ride
                       </h3>
+
                       <RideList
                         bookings={activeRides}
                         allowChat
                         showActions
                         onCancel={(id) => handleAction(id, "cancel")}
-                        onComplete={(bookingId) =>
-                          handleAction(bookingId, "complete")
-                        }
+                        onComplete={(bookingId) => handleAction(bookingId, "complete")}
                         actionBusyId={actionBusyId}
                         expandedBookingId={expandedBookingId}
                         onToggleExpand={(id) =>
-                          setExpandedBookingId((curr) =>
-                            curr === id ? null : id
-                          )
+                          setExpandedBookingId((curr) => (curr === id ? null : id))
                         }
-                        onOpenChat={(conversationId) => {
-                          setActiveConversationId(conversationId);
+                        onOpenChat={(conversationId, readOnly) => {
+                          setActiveChat({ conversationId, readOnly });
                           setChatNotifications((prev) => ({
                             ...prev,
                             [conversationId]: 0,
@@ -736,38 +708,30 @@ export default function RiderPortalPage() {
                         onResendReceipt={handleResendReceipt}
                         receiptBusyId={receiptBusyId}
                       />
+
                       <div style={{ height: 16 }} />
                     </>
                   )}
 
                   {upcoming.length > 0 && (
                     <>
-                      <h3
-                        style={{
-                          margin: "8px 0 4px",
-                          fontSize: 14,
-                          fontWeight: 600,
-                        }}
-                      >
+                      <h3 style={{ margin: "8px 0 4px", fontSize: 14, fontWeight: 600 }}>
                         Upcoming rides
                       </h3>
+
                       <RideList
                         bookings={upcoming}
                         allowChat
                         showActions
                         onCancel={(id) => handleAction(id, "cancel")}
-                        onComplete={(bookingId) =>
-                          handleAction(bookingId, "complete")
-                        }
+                        onComplete={(bookingId) => handleAction(bookingId, "complete")}
                         actionBusyId={actionBusyId}
                         expandedBookingId={expandedBookingId}
                         onToggleExpand={(id) =>
-                          setExpandedBookingId((curr) =>
-                            curr === id ? null : id
-                          )
+                          setExpandedBookingId((curr) => (curr === id ? null : id))
                         }
-                        onOpenChat={(conversationId) => {
-                          setActiveConversationId(conversationId);
+                        onOpenChat={(conversationId, readOnly) => {
+                          setActiveChat({ conversationId, readOnly });
                           setChatNotifications((prev) => ({
                             ...prev,
                             [conversationId]: 0,
@@ -784,7 +748,6 @@ export default function RiderPortalPage() {
             </section>
           )}
 
-          {/* COMPLETED TAB */}
           {activeTab === "COMPLETED" && (
             <section>
               <SectionHeader
@@ -792,7 +755,6 @@ export default function RiderPortalPage() {
                 subtitle="Your ride history and receipts."
               />
 
-              {/* Stats + filters bar (sticky) */}
               <div
                 style={{
                   position: "sticky",
@@ -803,7 +765,6 @@ export default function RiderPortalPage() {
                   marginBottom: 8,
                 }}
               >
-                {/* Stats */}
                 <div
                   style={{
                     display: "flex",
@@ -813,29 +774,15 @@ export default function RiderPortalPage() {
                     fontSize: 12,
                   }}
                 >
-                  <MiniStat
-                    label="Rides shown"
-                    value={String(totalCompletedShown)}
-                  />
-                  <MiniStat
-                    label="Total miles"
-                    value={totalMiles ? totalMiles.toFixed(2) : "0.00"}
-                  />
+                  <MiniStat label="Rides shown" value={String(totalCompletedShown)} />
+                  <MiniStat label="Total miles" value={totalMiles ? totalMiles.toFixed(2) : "0.00"} />
                   <MiniStat
                     label="Total spent"
-                    value={
-                      totalFareCents
-                        ? `$${formatMoney(totalFareCents)}`
-                        : "$0.00"
-                    }
+                    value={totalFareCents ? `$${formatMoney(totalFareCents)}` : "$0.00"}
                   />
-                  <MiniStat
-                    label="Avg. miles / ride"
-                    value={avgMiles ? avgMiles.toFixed(2) : "0.00"}
-                  />
+                  <MiniStat label="Avg. miles / ride" value={avgMiles ? avgMiles.toFixed(2) : "0.00"} />
                 </div>
 
-                {/* Filters */}
                 <div
                   style={{
                     display: "flex",
@@ -866,14 +813,7 @@ export default function RiderPortalPage() {
                   />
 
                   {completedFilter === "CUSTOM" && (
-                    <div
-                      style={{
-                        display: "flex",
-                        flexWrap: "wrap",
-                        gap: 6,
-                        fontSize: 11,
-                      }}
-                    >
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, fontSize: 11 }}>
                       <label>
                         <span style={{ marginRight: 4 }}>From</span>
                         <input
@@ -930,15 +870,9 @@ export default function RiderPortalPage() {
                       border: "1px solid #d1d5db",
                       padding: "6px 10px",
                       fontSize: 12,
-                      background: filteredCompleted.length
-                        ? "#ffffff"
-                        : "#f3f4f6",
-                      color: filteredCompleted.length
-                        ? "#111827"
-                        : "#9ca3af",
-                      cursor: filteredCompleted.length
-                        ? "pointer"
-                        : "not-allowed",
+                      background: filteredCompleted.length ? "#ffffff" : "#f3f4f6",
+                      color: filteredCompleted.length ? "#111827" : "#9ca3af",
+                      cursor: filteredCompleted.length ? "pointer" : "not-allowed",
                     }}
                   >
                     Export CSV
@@ -960,8 +894,8 @@ export default function RiderPortalPage() {
                   onToggleExpand={(id) =>
                     setExpandedBookingId((curr) => (curr === id ? null : id))
                   }
-                  onOpenChat={(conversationId) => {
-                    setActiveConversationId(conversationId);
+                  onOpenChat={(conversationId, readOnly) => {
+                    setActiveChat({ conversationId, readOnly });
                     setChatNotifications((prev) => ({
                       ...prev,
                       [conversationId]: 0,
@@ -977,10 +911,11 @@ export default function RiderPortalPage() {
         </>
       )}
 
-      {activeConversationId && (
+      {activeChat && (
         <ChatOverlay
-          conversationId={activeConversationId}
-          onClose={() => setActiveConversationId(null)}
+          conversationId={activeChat.conversationId}
+          readOnly={activeChat.readOnly}
+          onClose={() => setActiveChat(null)}
         />
       )}
     </main>
@@ -1006,13 +941,7 @@ function SummaryCard(props: { label: string; value: number }) {
         justifyContent: "center",
       }}
     >
-      <div
-        style={{
-          fontSize: 12,
-          textTransform: "uppercase",
-          color: "#6b7280",
-        }}
-      >
+      <div style={{ fontSize: 12, textTransform: "uppercase", color: "#6b7280" }}>
         {label}
       </div>
       <div style={{ fontSize: 20, fontWeight: 600 }}>{value}</div>
@@ -1024,35 +953,13 @@ function SectionHeader(props: { title: string; subtitle?: string }) {
   const { title, subtitle } = props;
   return (
     <div style={{ marginBottom: 8 }}>
-      <h2
-        style={{
-          margin: 0,
-          fontSize: 20,
-          fontWeight: 650,
-        }}
-      >
-        {title}
-      </h2>
-      {subtitle && (
-        <p
-          style={{
-            margin: 0,
-            fontSize: 13,
-            color: "#6b7280",
-          }}
-        >
-          {subtitle}
-        </p>
-      )}
+      <h2 style={{ margin: 0, fontSize: 20, fontWeight: 650 }}>{title}</h2>
+      {subtitle && <p style={{ margin: 0, fontSize: 13, color: "#6b7280" }}>{subtitle}</p>}
     </div>
   );
 }
 
-function EmptyState(props: {
-  message: string;
-  actionLabel?: string;
-  actionHref?: string;
-}) {
+function EmptyState(props: { message: string; actionLabel?: string; actionHref?: string }) {
   const { message, actionLabel, actionHref } = props;
   return (
     <div
@@ -1107,11 +1014,7 @@ function MiniStat(props: { label: string; value: string }) {
   );
 }
 
-function FilterPill(props: {
-  label: string;
-  active: boolean;
-  onClick: () => void;
-}) {
+function FilterPill(props: { label: string; active: boolean; onClick: () => void }) {
   const { label, active, onClick } = props;
   return (
     <button
@@ -1143,13 +1046,13 @@ function RideList(props: {
   showActions?: boolean;
   onCancel?: (idForApi: string) => void;
   onComplete?: (bookingId: string) => void;
-  actionBusyId?: string | null; // id used for API call
-  expandedBookingId?: string | null; // list id
+  actionBusyId?: string | null;
+  expandedBookingId?: string | null;
   onToggleExpand?: (id: string) => void;
-  onOpenChat?: (conversationId: string) => void;
+  onOpenChat?: (conversationId: string, readOnly: boolean) => void;
   chatNotifications?: Record<string, number>;
   onResendReceipt?: (bookingId: string) => void;
-  receiptBusyId?: string | null; // bookingId
+  receiptBusyId?: string | null;
 }) {
   const {
     bookings,
@@ -1174,13 +1077,10 @@ function RideList(props: {
         const dt = safeDate(b.departureTime) ?? new Date(b.departureTime);
         const isExpanded = expandedBookingId === b.id;
         const isInRoute = b.rideStatus === "IN_ROUTE";
-        const isCompleted = b.status === "COMPLETED";
+        const isCompleted = b.status === "COMPLETED" || b.rideStatus === "COMPLETED";
         const isCancelled = b.status === "CANCELLED";
         const hasRealBooking = !!b.bookingId;
 
-        // For cancel:
-        // - if ride-only: we use b.id (e.g. "ride-<rideId>")
-        // - if normal booking: we use b.bookingId
         const cancelKey = b.isRideOnly || !b.bookingId ? b.id : b.bookingId;
         const busy = actionBusyId != null && actionBusyId === cancelKey;
 
@@ -1191,9 +1091,7 @@ function RideList(props: {
             : 0;
 
         const receiptBusy =
-          receiptBusyId != null &&
-          hasRealBooking &&
-          receiptBusyId === b.bookingId;
+          receiptBusyId != null && hasRealBooking && receiptBusyId === b.bookingId;
 
         const dollars =
           typeof b.totalPriceCents === "number"
@@ -1204,6 +1102,9 @@ function RideList(props: {
           typeof b.distanceMiles === "number" && b.distanceMiles > 0
             ? `${b.distanceMiles.toFixed(2)} miles`
             : null;
+
+        // ✅ This is the missing piece you asked about:
+        const readOnly = isChatReadOnly(b);
 
         const handlePrintReceipt = () => {
           if (!b.rideId) return;
@@ -1222,13 +1123,7 @@ function RideList(props: {
               opacity: isCancelled ? 0.85 : 1,
             }}
           >
-            <div
-              style={{
-                display: "flex",
-                justifyContent: "space-between",
-                gap: 12,
-              }}
-            >
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
               <div style={{ minWidth: 0 }}>
                 <div
                   style={{
@@ -1241,10 +1136,12 @@ function RideList(props: {
                 >
                   {b.originCity} → {b.destinationCity}
                 </div>
+
                 <div style={{ fontSize: 13, color: "#4b5563" }}>
                   Departure: {dt.toLocaleString()}
                   {distanceLabel && ` • ${distanceLabel}`}
                 </div>
+
                 <div style={{ fontSize: 12, color: "#6b7280" }}>
                   Booking: {b.status} · Ride: {b.rideStatus}
                   {b.isRideOnly && " (request pending)"}
@@ -1312,19 +1209,15 @@ function RideList(props: {
                 {allowChat && (
                   <button
                     type="button"
-                    onClick={() =>
-                      canChat &&
-                      onOpenChat &&
-                      b.conversationId &&
-                      onOpenChat(b.conversationId)
-                    }
+                    onClick={() => {
+                      if (!canChat || !onOpenChat || !b.conversationId) return;
+                      onOpenChat(b.conversationId, readOnly);
+                    }}
                     disabled={!canChat}
                     style={{
                       padding: "6px 12px",
                       borderRadius: 999,
-                      border: canChat
-                        ? "1px solid #d1d5db"
-                        : "1px solid #e5e7eb",
+                      border: canChat ? "1px solid #d1d5db" : "1px solid #e5e7eb",
                       background: canChat ? "#ffffff" : "#f9fafb",
                       fontSize: 13,
                       color: canChat ? "#111827" : "#9ca3af",
@@ -1347,20 +1240,15 @@ function RideList(props: {
                     {canChat
                       ? unread > 0
                         ? `View chat (${unread} new)`
-                        : "View chat"
+                        : readOnly
+                          ? "View chat (read-only)"
+                          : "View chat"
                       : "Chat not started"}
                   </button>
                 )}
 
                 {showActions && !isCancelled && (
-                  <div
-                    style={{
-                      display: "flex",
-                      gap: 6,
-                      flexWrap: "wrap",
-                      justifyContent: "flex-end",
-                    }}
-                  >
+                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }}>
                     <button
                       type="button"
                       onClick={() => onCancel && onCancel(cancelKey)}
@@ -1380,9 +1268,7 @@ function RideList(props: {
 
                     <button
                       type="button"
-                      onClick={() =>
-                        onComplete && hasRealBooking && onComplete(b.bookingId!)
-                      }
+                      onClick={() => onComplete && hasRealBooking && onComplete(b.bookingId!)}
                       disabled={!hasRealBooking || busy}
                       style={{
                         padding: "4px 10px",
@@ -1390,8 +1276,7 @@ function RideList(props: {
                         border: "1px solid #bbf7d0",
                         background: hasRealBooking ? "#ecfdf5" : "#f9fafb",
                         fontSize: 12,
-                        cursor:
-                          !hasRealBooking || busy ? "not-allowed" : "pointer",
+                        cursor: !hasRealBooking || busy ? "not-allowed" : "pointer",
                         whiteSpace: "nowrap",
                       }}
                     >
@@ -1417,14 +1302,10 @@ function RideList(props: {
                   {isExpanded ? "Hide details" : "View ride details"}
                 </button>
 
-                {(b.status === "COMPLETED" || b.rideStatus === "IN_ROUTE") && (
+                {(isCompleted || isInRoute) && (
                   <button
                     type="button"
-                    onClick={() =>
-                      router.push(
-                        `/rider/trips/${encodeURIComponent(b.rideId)}`
-                      )
-                    }
+                    onClick={() => router.push(`/rider/trips/${encodeURIComponent(b.rideId)}`)}
                     style={{
                       marginTop: 4,
                       padding: "4px 10px",
@@ -1456,8 +1337,7 @@ function RideList(props: {
                   <strong>Ride ID:</strong> {b.rideId}
                 </div>
                 <div>
-                  <strong>Booking ID:</strong>{" "}
-                  {b.bookingId ?? "Not booked yet"}
+                  <strong>Booking ID:</strong> {b.bookingId ?? "Not booked yet"}
                 </div>
                 {b.driverPublicId && (
                   <div>
@@ -1481,18 +1361,10 @@ function RideList(props: {
                       background: "#f9fafb",
                     }}
                   >
-                    <div
-                      style={{
-                        display: "flex",
-                        flexWrap: "wrap",
-                        gap: 8,
-                        fontSize: 12,
-                      }}
-                    >
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 8, fontSize: 12 }}>
                       {b.distanceMiles != null && (
                         <span>
-                          <strong>Distance:</strong>{" "}
-                          {b.distanceMiles.toFixed(2)} mi
+                          <strong>Distance:</strong> {b.distanceMiles.toFixed(2)} mi
                         </span>
                       )}
                       {dollars && (
@@ -1507,26 +1379,17 @@ function RideList(props: {
                       )}
                       {b.tripStartedAt && (
                         <span>
-                          <strong>Trip started:</strong>{" "}
-                          {new Date(b.tripStartedAt).toLocaleString()}
+                          <strong>Trip started:</strong> {new Date(b.tripStartedAt).toLocaleString()}
                         </span>
                       )}
                       {b.tripCompletedAt && (
                         <span>
-                          <strong>Trip completed:</strong>{" "}
-                          {new Date(b.tripCompletedAt).toLocaleString()}
+                          <strong>Trip completed:</strong> {new Date(b.tripCompletedAt).toLocaleString()}
                         </span>
                       )}
                     </div>
 
-                    <div
-                      style={{
-                        display: "flex",
-                        gap: 8,
-                        flexWrap: "wrap",
-                        marginTop: 8,
-                      }}
-                    >
+                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 8 }}>
                       <button
                         type="button"
                         onClick={handlePrintReceipt}
@@ -1545,25 +1408,16 @@ function RideList(props: {
                       {onResendReceipt && hasRealBooking && (
                         <button
                           type="button"
-                          onClick={() =>
-                            onResendReceipt &&
-                            b.bookingId &&
-                            onResendReceipt(b.bookingId)
-                          }
+                          onClick={() => b.bookingId && onResendReceipt(b.bookingId)}
                           disabled={!hasRealBooking || receiptBusy}
                           style={{
                             padding: "6px 12px",
                             borderRadius: 999,
                             border: "1px solid #0f766e",
-                            background: hasRealBooking
-                              ? "#0d9488"
-                              : "#9ca3af",
+                            background: hasRealBooking ? "#0d9488" : "#9ca3af",
                             color: "#ffffff",
                             fontSize: 12,
-                            cursor:
-                              !hasRealBooking || receiptBusy
-                                ? "not-allowed"
-                                : "pointer",
+                            cursor: !hasRealBooking || receiptBusy ? "not-allowed" : "pointer",
                           }}
                         >
                           {receiptBusy ? "Sending..." : "Resend receipt"}
@@ -1593,23 +1447,27 @@ function InRouteTimer(props: { startedAt: string }) {
   const start = safeDate(startedAt) ?? new Date(startedAt);
   const diffMs = Math.max(0, now.getTime() - start.getTime());
   const totalSeconds = Math.floor(diffMs / 1000);
-  const minutes = Math.floor(totalSeconds / 60)
-    .toString()
-    .padStart(2, "0");
+  const minutes = Math.floor(totalSeconds / 60).toString().padStart(2, "0");
   const seconds = (totalSeconds % 60).toString().padStart(2, "0");
 
   return (
     <span style={{ fontSize: 12, color: "#4b5563" }}>
-      Trip time so far:{" "}
-      <span style={{ fontWeight: 600 }}>
-        {minutes}:{seconds}
-      </span>
+      Trip time so far: <span style={{ fontWeight: 600 }}>{minutes}:{seconds}</span>
     </span>
   );
 }
 
-function ChatOverlay(props: { conversationId: string; onClose: () => void }) {
-  const { conversationId, onClose } = props;
+function ChatOverlay(props: {
+  conversationId: string;
+  readOnly: boolean;
+  onClose: () => void;
+}) {
+  const { conversationId, readOnly, onClose } = props;
+
+  const params = new URLSearchParams();
+  if (readOnly) params.set("readonly", "1");
+  const qs = params.toString();
+  const src = qs ? `/chat/${conversationId}?${qs}` : `/chat/${conversationId}`;
 
   return (
     <div
@@ -1646,7 +1504,9 @@ function ChatOverlay(props: { conversationId: string; onClose: () => void }) {
             fontSize: 14,
           }}
         >
-          <span style={{ fontWeight: 600 }}>Chat with driver</span>
+          <span style={{ fontWeight: 600 }}>
+            Chat with driver {readOnly ? "(read-only)" : ""}
+          </span>
           <button
             type="button"
             onClick={onClose}
@@ -1664,12 +1524,8 @@ function ChatOverlay(props: { conversationId: string; onClose: () => void }) {
         </div>
 
         <iframe
-          src={`/chat/${conversationId}`}
-          style={{
-            border: "none",
-            width: "100%",
-            height: "100%",
-          }}
+          src={src}
+          style={{ border: "none", width: "100%", height: "100%" }}
           title="Chat"
         />
       </div>

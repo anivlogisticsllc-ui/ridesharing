@@ -27,7 +27,7 @@ export default async function handler(
         email?: string | null;
         image?: string | null;
       } & {
-        role?: "RIDER" | "DRIVER" | "BOTH";
+        role?: "RIDER" | "DRIVER";
       })
     | undefined;
 
@@ -37,9 +37,9 @@ export default async function handler(
       .json({ ok: false, error: "Not authenticated" });
   }
 
-  // Only drivers / BOTH
+  // Only drivers 
   const role = user.role;
-  if (role !== "DRIVER" && role !== "BOTH") {
+  if (role !== "DRIVER") {
     return res
       .status(403)
       .json({ ok: false, error: "Not a driver" });

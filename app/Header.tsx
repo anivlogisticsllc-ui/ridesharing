@@ -8,11 +8,10 @@ export function Header() {
   const userRole = (session?.user as any)?.role as
     | "RIDER"
     | "DRIVER"
-    | "BOTH"
     | undefined;
 
-  const isRider = userRole === "RIDER" || userRole === "BOTH";
-  const isDriver = userRole === "DRIVER" || userRole === "BOTH";
+  const isRider = userRole === "RIDER";
+  const isDriver = userRole === "DRIVER";
 
   return (
     <header className="border-b border-slate-200 bg-white">

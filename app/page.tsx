@@ -11,7 +11,6 @@ export default async function Home() {
   const role = (session?.user as any)?.role as
     | "RIDER"
     | "DRIVER"
-    | "BOTH"
     | undefined;
 
   // 🚩 NEW: only rides that are OPEN *and* have no ACCEPTED bookings
@@ -39,7 +38,7 @@ export default async function Home() {
   });
 
   const showAvailableRidesSection =
-    !session || role === "DRIVER" || role === "BOTH";
+    !session || role === "DRIVER";
 
   // …keep the rest of your JSX exactly as you have it now
   return (
@@ -154,7 +153,7 @@ export default async function Home() {
         </section>
 
         {/* Rider “Request a ride” – only for logged-in riders */}
-        {session && (role === "RIDER" || role === "BOTH") && (
+        {session && (role === "RIDER") && (
           <RiderRequestFormHome />
         )}
 

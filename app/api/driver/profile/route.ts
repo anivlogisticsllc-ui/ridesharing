@@ -1,9 +1,9 @@
+// app/api/driver/profile/route.ts
 import { NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/pages/api/auth/[...nextauth]";
 import { prisma } from "@/lib/prisma";
-
-/* ---------- Types ---------- */
+import type { UserRole } from "@prisma/client";
 
 type ProfileUpdateBody = {
   onboardingCompleted?: boolean;
@@ -24,201 +24,206 @@ type ProfileUpdateBody = {
   plateState?: string;
 };
 
-/* ---------- Helpers ---------- */
-
-function parseDate(value: string | undefined): Date | null | undefined {
-  if (value == null || value === "") return undefined;
+function parseDate(value: string | undefined): Date | undefined {
+  if (!value) return undefined;
   const d = new Date(value);
   if (Number.isNaN(d.getTime())) return undefined;
   return d;
 }
 
-/* ---------- GET: return current user's driver profile + onboarding ---------- */
+function normalizeYear(value: ProfileUpdateBody["vehicleYear"]): number | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null || value === "") return null;
+  const n = Number(value);
+  return Number.isNaN(n) ? null : n;
+}
+
+function isDriverRole(role: UserRole | undefined) {
+  return role === "DRIVER" || role === "BOTH";
+}
 
 export async function GET() {
   try {
     const session = await getServerSession(authOptions);
-    const userId = (session?.user as any)?.id as string | undefined;
+    const userId = session?.user?.id as string | undefined;
+    const role = (session?.user?.role as UserRole | undefined) ?? undefined;
 
     if (!userId) {
-      return NextResponse.json(
-        { ok: false, error: "Not authenticated" },
-        { status: 401 }
-      );
+      return NextResponse.json({ ok: false, error: "Not authenticated" }, { status: 401 });
+    }
+    if (!isDriverRole(role)) {
+      return NextResponse.json({ ok: false, error: "Not a driver" }, { status: 403 });
     }
 
     const user = await prisma.user.findUnique({
       where: { id: userId },
       select: {
-        id: true,
-        email: true,
-        name: true,
         role: true,
-        membershipActive: true,
-        membershipPlan: true,
-        trialEndsAt: true,
         onboardingCompleted: true,
         onboardingStep: true,
-        driverProfile: {
-          select: {
-            id: true,
-            baseCity: true,
-            baseLat: true,
-            baseLng: true,
-
-            legalName: true,
-            dateOfBirth: true,
-
-            driverLicenseNumber: true,
-            driverLicenseState: true,
-            driverLicenseExpiry: true,
-            driverLicenseImageUrl: true,
-
-            verificationStatus: true,
-            verificationNotes: true,
-
-            vehicleMake: true,
-            vehicleModel: true,
-            vehicleYear: true,
-            vehicleColor: true,
-            plateNumber: true,
-            plateState: true,
-
-            createdAt: true,
-            updatedAt: true,
-          },
-        },
       },
     });
 
     if (!user) {
+      return NextResponse.json({ ok: false, error: "User not found" }, { status: 404 });
+    }
+
+    const dp = await prisma.driverProfile.findUnique({
+      where: { userId },
+      select: {
+        legalName: true,
+        dateOfBirth: true,
+
+        driverLicenseNumber: true,
+        driverLicenseState: true,
+        driverLicenseExpiry: true,
+        driverLicenseImageUrl: true,
+
+        vehicleMake: true,
+        vehicleModel: true,
+        vehicleYear: true,
+        vehicleColor: true,
+        plateNumber: true,
+        plateState: true,
+
+        verificationStatus: true,
+        verificationNotes: true,
+
+        baseCity: true,
+        baseLat: true,
+        baseLng: true,
+
+        createdAt: true,
+        updatedAt: true,
+      },
+    });
+
+    // If you want to auto-create empty profile rows for drivers, do it here.
+    if (!dp) {
       return NextResponse.json(
-        { ok: false, error: "User not found" },
-        { status: 404 }
+        {
+          ok: true,
+          user: {
+            role: user.role,
+            onboardingCompleted: user.onboardingCompleted,
+            onboardingStep: user.onboardingStep,
+          },
+          driverProfile: null,
+        },
+        { status: 200 }
       );
     }
 
-    return NextResponse.json({ ok: true, user });
+    return NextResponse.json(
+      {
+        ok: true,
+        user: {
+          role: user.role,
+          onboardingCompleted: user.onboardingCompleted,
+          onboardingStep: user.onboardingStep,
+        },
+        driverProfile: {
+          verificationStatus: String(dp.verificationStatus),
+          verificationNotes: dp.verificationNotes ?? null,
+
+          legalName: dp.legalName ?? null,
+          dateOfBirth: dp.dateOfBirth ? dp.dateOfBirth.toISOString() : null,
+
+          driverLicenseNumber: dp.driverLicenseNumber ?? null,
+          driverLicenseState: dp.driverLicenseState ?? null,
+          driverLicenseExpiry: dp.driverLicenseExpiry ? dp.driverLicenseExpiry.toISOString() : null,
+          driverLicenseImageUrl: dp.driverLicenseImageUrl ?? null,
+
+          vehicleMake: dp.vehicleMake ?? null,
+          vehicleModel: dp.vehicleModel ?? null,
+          vehicleYear: dp.vehicleYear ?? null,
+          vehicleColor: dp.vehicleColor ?? null,
+          plateNumber: dp.plateNumber ?? null,
+          plateState: dp.plateState ?? null,
+
+          baseCity: dp.baseCity ?? null,
+          baseLat: dp.baseLat ?? null,
+          baseLng: dp.baseLng ?? null,
+
+          createdAt: dp.createdAt.toISOString(),
+          updatedAt: dp.updatedAt.toISOString(),
+        },
+      },
+      { status: 200 }
+    );
   } catch (err) {
     console.error("GET /api/driver/profile error:", err);
-    return NextResponse.json(
-      { ok: false, error: "Internal server error" },
-      { status: 500 }
-    );
+    return NextResponse.json({ ok: false, error: "Internal server error" }, { status: 500 });
   }
 }
-
-/* ---------- PUT: update onboarding + identity + vehicle ---------- */
 
 export async function PUT(req: Request) {
   try {
     const session = await getServerSession(authOptions);
-    const userId = (session?.user as any)?.id as string | undefined;
+    const userId = session?.user?.id as string | undefined;
+    const role = (session?.user?.role as UserRole | undefined) ?? undefined;
 
     if (!userId) {
-      return NextResponse.json(
-        { ok: false, error: "Not authenticated" },
-        { status: 401 }
-      );
+      return NextResponse.json({ ok: false, error: "Not authenticated" }, { status: 401 });
+    }
+    if (!isDriverRole(role)) {
+      return NextResponse.json({ ok: false, error: "Not a driver" }, { status: 403 });
     }
 
     const body = (await req.json()) as ProfileUpdateBody;
 
-    const {
-      onboardingCompleted,
-      onboardingStep,
-
-      legalName,
-      dateOfBirth,
-
-      driverLicenseNumber,
-      driverLicenseState,
-      driverLicenseExpiry,
-
-      vehicleMake,
-      vehicleModel,
-      vehicleYear,
-      vehicleColor,
-      plateNumber,
-      plateState,
-    } = body;
-
-    // --- Update User (onboarding flags) ---
+    // Update onboarding flags on User
     const userData: Record<string, unknown> = {};
-
-    if (typeof onboardingCompleted === "boolean") {
-      userData.onboardingCompleted = onboardingCompleted;
-    }
-    if (
-      typeof onboardingStep === "number" &&
-      Number.isFinite(onboardingStep)
-    ) {
-      userData.onboardingStep = onboardingStep;
-    }
+    if (typeof body.onboardingCompleted === "boolean") userData.onboardingCompleted = body.onboardingCompleted;
+    if (typeof body.onboardingStep === "number" && Number.isFinite(body.onboardingStep)) userData.onboardingStep = body.onboardingStep;
 
     if (Object.keys(userData).length > 0) {
-      await prisma.user.update({
-        where: { id: userId },
-        data: userData,
-      });
+      await prisma.user.update({ where: { id: userId }, data: userData });
     }
 
-    // --- Upsert DriverProfile ---
-    const parsedDob = parseDate(dateOfBirth);
-    const parsedExpiry = parseDate(driverLicenseExpiry);
-
-    let parsedVehicleYear: number | null | undefined = undefined;
-    if (vehicleYear !== undefined) {
-      if (vehicleYear === null || vehicleYear === "") {
-        parsedVehicleYear = null;
-      } else {
-        const n = Number(vehicleYear);
-        parsedVehicleYear = Number.isNaN(n) ? null : n;
-      }
-    }
+    const parsedDob = parseDate(body.dateOfBirth);
+    const parsedExpiry = parseDate(body.driverLicenseExpiry);
+    const parsedYear = normalizeYear(body.vehicleYear);
 
     await prisma.driverProfile.upsert({
       where: { userId },
       create: {
         userId,
 
-        legalName: legalName ?? null,
+        legalName: body.legalName ?? null,
         dateOfBirth: parsedDob ?? null,
 
-        driverLicenseNumber: driverLicenseNumber ?? null,
-        driverLicenseState: driverLicenseState ?? null,
+        driverLicenseNumber: body.driverLicenseNumber ?? null,
+        driverLicenseState: body.driverLicenseState ?? null,
         driverLicenseExpiry: parsedExpiry ?? null,
 
-        vehicleMake: vehicleMake ?? null,
-        vehicleModel: vehicleModel ?? null,
-        vehicleYear: parsedVehicleYear ?? null,
-        vehicleColor: vehicleColor ?? null,
-        plateNumber: plateNumber ?? null,
-        plateState: plateState ?? null,
+        vehicleMake: body.vehicleMake ?? null,
+        vehicleModel: body.vehicleModel ?? null,
+        vehicleYear: parsedYear ?? null,
+        vehicleColor: body.vehicleColor ?? null,
+        plateNumber: body.plateNumber ?? null,
+        plateState: body.plateState ?? null,
       },
       update: {
-        legalName: legalName ?? undefined,
+        legalName: body.legalName ?? undefined,
         dateOfBirth: parsedDob ?? undefined,
 
-        driverLicenseNumber: driverLicenseNumber ?? undefined,
-        driverLicenseState: driverLicenseState ?? undefined,
+        driverLicenseNumber: body.driverLicenseNumber ?? undefined,
+        driverLicenseState: body.driverLicenseState ?? undefined,
         driverLicenseExpiry: parsedExpiry ?? undefined,
 
-        vehicleMake: vehicleMake ?? undefined,
-        vehicleModel: vehicleModel ?? undefined,
-        vehicleYear: parsedVehicleYear,
-        vehicleColor: vehicleColor ?? undefined,
-        plateNumber: plateNumber ?? undefined,
-        plateState: plateState ?? undefined,
+        vehicleMake: body.vehicleMake ?? undefined,
+        vehicleModel: body.vehicleModel ?? undefined,
+        vehicleYear: parsedYear, // keep as-is when undefined
+        vehicleColor: body.vehicleColor ?? undefined,
+        plateNumber: body.plateNumber ?? undefined,
+        plateState: body.plateState ?? undefined,
       },
     });
 
-    return NextResponse.json({ ok: true });
+    return NextResponse.json({ ok: true }, { status: 200 });
   } catch (err) {
     console.error("PUT /api/driver/profile error:", err);
-    return NextResponse.json(
-      { ok: false, error: "Internal server error" },
-      { status: 500 }
-    );
+    return NextResponse.json({ ok: false, error: "Internal server error" }, { status: 500 });
   }
 }

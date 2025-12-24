@@ -5,7 +5,7 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { useSession } from "next-auth/react";
 
-type Role = "RIDER" | "DRIVER" | "BOTH" | undefined;
+type Role = "RIDER" | "DRIVER" | undefined;
 
 type BookRideResponse =
   | {
@@ -25,10 +25,6 @@ export function BookRideButton({ rideId }: { rideId: string }) {
   const [loading, setLoading] = useState(false);
   const [success, setSuccess] = useState(false);
   const [error, setError] = useState<string | null>(null);
-
-  // When set, we show the chat overlay
-  const [activeConversationId, setActiveConversationId] =
-    useState<string | null>(null);
 
   async function handleClick() {
     setError(null);
@@ -78,12 +74,16 @@ export function BookRideButton({ rideId }: { rideId: string }) {
 
       setSuccess(true);
 
-      // Open chat overlay for this ride if we have a conversation
+      // Redirect driver to portal and let portal open the chat
       if (data.conversationId) {
-        setActiveConversationId(data.conversationId);
+        router.push(
+          `/driver/portal?conversationId=${encodeURIComponent(
+            data.conversationId
+          )}&autoOpenChat=1`
+        );
       } else {
-        // No chat created (should be rare) – fall back to home or portal
-        router.push("/");
+        // No chat created (should be rare) – fall back to portal
+        router.push("/driver/portal");
       }
     } catch (e: any) {
       console.error(e);
@@ -109,86 +109,6 @@ export function BookRideButton({ rideId }: { rideId: string }) {
           {error}
         </span>
       )}
-
-      {activeConversationId && (
-        <ChatOverlay
-          conversationId={activeConversationId}
-          onClose={() => setActiveConversationId(null)}
-        />
-      )}
-    </div>
-  );
-}
-
-/**
- * Fullscreen overlay that embeds the /chat/[conversationId] page.
- * layout.tsx already hides the main header when ?embedded=1 is present.
- */
-function ChatOverlay(props: { conversationId: string; onClose: () => void }) {
-  const { conversationId, onClose } = props;
-
-  return (
-    <div
-      style={{
-        position: "fixed",
-        inset: 0,
-        background: "rgba(15, 23, 42, 0.55)",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        zIndex: 50,
-      }}
-    >
-      <div
-        style={{
-          width: "min(900px, 100%)",
-          height: "min(650px, 100%)",
-          background: "#fff",
-          borderRadius: 16,
-          boxShadow:
-            "0 20px 35px rgba(15,23,42,0.35), 0 0 0 1px rgba(148,163,184,0.15)",
-          display: "flex",
-          flexDirection: "column",
-          overflow: "hidden",
-        }}
-      >
-        <div
-          style={{
-            padding: "10px 14px",
-            borderBottom: "1px solid #e5e7eb",
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center",
-            fontSize: 14,
-          }}
-        >
-          <span style={{ fontWeight: 600 }}>Chat with rider</span>
-          <button
-            type="button"
-            onClick={onClose}
-            style={{
-              border: "none",
-              background: "transparent",
-              cursor: "pointer",
-              fontSize: 18,
-              lineHeight: 1,
-            }}
-            aria-label="Close chat"
-          >
-            ×
-          </button>
-        </div>
-
-        <iframe
-          src={`/chat/${conversationId}?embedded=1`}
-          style={{
-            border: "none",
-            width: "100%",
-            height: "100%",
-          }}
-          title="Ride chat"
-        />
-      </div>
     </div>
   );
 }

@@ -24,34 +24,29 @@ export default async function handler(
     | undefined;
 
   if (!user?.id) {
-    return res
-      .status(401)
-      .json({ ok: false, error: "Not authenticated" });
+    return res.status(401).json({ ok: false, error: "Not authenticated" });
   }
 
   const userId = user.id;
   const { conversationId } = req.query;
 
   if (!conversationId || typeof conversationId !== "string") {
-    return res
-      .status(400)
-      .json({ ok: false, error: "Invalid conversation id" });
+    return res.status(400).json({ ok: false, error: "Invalid conversation id" });
   }
 
-  // Ensure this user belongs to the conversation
+  // Ensure this user belongs to the conversation (+ pull ride status for POST blocking)
   const convo = await prisma.conversation.findUnique({
     where: { id: conversationId },
     select: {
       id: true,
       driverId: true,
       riderId: true,
+      ride: { select: { status: true } },
     },
   });
 
   if (!convo || (convo.driverId !== userId && convo.riderId !== userId)) {
-    return res
-      .status(404)
-      .json({ ok: false, error: "Conversation not found" });
+    return res.status(404).json({ ok: false, error: "Conversation not found" });
   }
 
   if (req.method === "GET") {
@@ -73,12 +68,19 @@ export default async function handler(
   }
 
   if (req.method === "POST") {
+    // Server-side read-only enforcement
+    const rideStatus = convo.ride?.status;
+    if (rideStatus === "COMPLETED" || rideStatus === "CANCELLED") {
+      return res.status(403).json({
+        ok: false,
+        error: "This chat is read-only because the trip is completed/cancelled.",
+      });
+    }
+
     const { body } = req.body as { body?: string };
 
     if (!body || !body.trim()) {
-      return res
-        .status(400)
-        .json({ ok: false, error: "Message body is empty" });
+      return res.status(400).json({ ok: false, error: "Message body is empty" });
     }
 
     const message = await prisma.message.create({

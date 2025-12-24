@@ -1,9 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
-import { useRouter, useParams } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
+import { useEffect, useMemo, useState } from "react";
 
-type TripStatus = "OPEN" | "IN_ROUTE" | "COMPLETED" | "CANCELLED" | string;
 type BookingStatus =
   | "PENDING"
   | "CONFIRMED"
@@ -11,58 +10,68 @@ type BookingStatus =
   | "CANCELLED"
   | "EXPIRED";
 
-type Trip = {
-  rideId: string;
-  originAddress: string;
-  destinationAddress: string;
-  departureTime: string;
+type Booking = {
+  id: string;
+  bookingId: string | null;
 
-  bookingStatus: BookingStatus;
-  rideStatus: TripStatus;
+  status: BookingStatus;
+  rideId: string;
+  originCity: string;
+  destinationCity: string;
+  departureTime: string;
+  rideStatus: string;
+  driverName: string | null;
+  driverPublicId: string | null;
+  conversationId: string | null;
+  isRideOnly?: boolean;
 
   distanceMiles?: number | null;
   totalPriceCents?: number | null;
-
-  driverName?: string | null;
-  driverPublicId?: string | null;
-
-  // Timeline
-  requestedAt?: string | null;
+  passengerCount?: number | null;
   tripStartedAt?: string | null;
   tripCompletedAt?: string | null;
-
-  // Chat
-  conversationId?: string | null;
 };
 
 type ApiResponse =
-  | { ok: true; trip: Trip }
+  | { ok: true; bookings: Booking[] }
   | { ok: false; error: string };
 
-export default function RiderTripDetailsPage() {
+function safeDate(value: string | null | undefined): Date | null {
+  if (!value) return null;
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function formatMoney(cents: number) {
+  return (cents / 100).toFixed(2);
+}
+
+function isChatReadOnly(b: Booking): boolean {
+  const completed = b.status === "COMPLETED" || b.rideStatus === "COMPLETED";
+  const cancelledLike = b.status === "CANCELLED" || b.status === "EXPIRED";
+  return completed || cancelledLike;
+}
+
+export default function RiderTripPage() {
   const router = useRouter();
 
-  // Read rideId from the URL using useParams (more reliable in client pages)
-  const params = useParams<{ rideId?: string | string[] }>();
+  // ✅ Build-safe: params can be null-ish in TS typing; guard before use.
+  const params = useParams();
+  const rawRideId = params?.rideId;
   const rideId =
-    typeof params?.rideId === "string"
-      ? params.rideId
-      : Array.isArray(params?.rideId)
-      ? params.rideId[0]
-      : "";
+    typeof rawRideId === "string" ? decodeURIComponent(rawRideId) : null;
 
-  const [trip, setTrip] = useState<Trip | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [activeConversationId, setActiveConversationId] =
-    useState<string | null>(null);
+  const [booking, setBooking] = useState<Booking | null>(null);
+
+  const [activeChat, setActiveChat] = useState<{
+    conversationId: string;
+    readOnly: boolean;
+  } | null>(null);
 
   useEffect(() => {
-    if (!rideId) {
-      setError("Missing ride id in URL.");
-      setLoading(false);
-      return;
-    }
+    if (!rideId) return;
 
     let cancelled = false;
 
@@ -71,38 +80,24 @@ export default function RiderTripDetailsPage() {
         setLoading(true);
         setError(null);
 
-        const res = await fetch(
-          `/api/rider/trips/${encodeURIComponent(rideId)}`
-        );
-
+        const res = await fetch("/api/rider/bookings");
         if (!res.ok) {
-          const text = await res.text();
-          if (!cancelled) {
-            setError(`Failed to load trip. Status ${res.status}: ${text}`);
-          }
-          return;
+          const text = await res.text().catch(() => "");
+          throw new Error(text || `HTTP ${res.status}`);
         }
 
         const data: ApiResponse = await res.json();
-        if (!("ok" in data) || !data.ok) {
-          if (!cancelled) {
-            setError(data?.error || "Failed to load trip.");
-          }
-          return;
-        }
+        if (!data.ok) throw new Error(data.error || "Failed to load bookings");
 
-        if (!cancelled) {
-          setTrip(data.trip);
-        }
-      } catch (err) {
-        console.error("Error fetching trip:", err);
-        if (!cancelled) {
-          setError("Unexpected error while loading trip.");
-        }
+        const match = data.bookings.find((b) => b.rideId === rideId) || null;
+
+        if (!cancelled) setBooking(match);
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : "Failed to load trip";
+        console.error(e);
+        if (!cancelled) setError(msg);
       } finally {
-        if (!cancelled) {
-          setLoading(false);
-        }
+        if (!cancelled) setLoading(false);
       }
     }
 
@@ -112,420 +107,259 @@ export default function RiderTripDetailsPage() {
     };
   }, [rideId]);
 
-  function formatDateTime(value?: string | null) {
-    if (!value) return "—";
-    const d = new Date(value);
-    if (Number.isNaN(d.getTime())) return value;
-    return d.toLocaleString();
+  const readOnly = useMemo(() => {
+    return booking ? isChatReadOnly(booking) : true;
+  }, [booking]);
+
+  // If we don't have rideId, bail early (also prevents build-time complaints)
+  if (!rideId) {
+    return (
+      <main
+        style={{
+          maxWidth: 900,
+          margin: "0 auto",
+          padding: 24,
+          fontFamily: "system-ui, sans-serif",
+        }}
+      >
+        <button
+          type="button"
+          onClick={() => router.back()}
+          style={{
+            padding: "6px 12px",
+            borderRadius: 999,
+            border: "1px solid #d1d5db",
+            background: "#fff",
+            cursor: "pointer",
+            marginBottom: 12,
+          }}
+        >
+          Back
+        </button>
+        <p style={{ color: "red" }}>Missing rideId.</p>
+      </main>
+    );
   }
 
-  function formatMoney(cents?: number | null) {
-    if (cents == null) return "—";
-    return `$${(cents / 100).toFixed(2)}`;
+  if (loading) {
+    return (
+      <main
+        style={{
+          maxWidth: 900,
+          margin: "0 auto",
+          padding: 24,
+          fontFamily: "system-ui, sans-serif",
+        }}
+      >
+        <p>Loading trip...</p>
+      </main>
+    );
   }
 
-  const canChat =
-    !!trip &&
-    !!trip.conversationId &&
-    trip.conversationId.trim().length > 0;
+  if (error) {
+    return (
+      <main
+        style={{
+          maxWidth: 900,
+          margin: "0 auto",
+          padding: 24,
+          fontFamily: "system-ui, sans-serif",
+        }}
+      >
+        <button
+          type="button"
+          onClick={() => router.back()}
+          style={{
+            padding: "6px 12px",
+            borderRadius: 999,
+            border: "1px solid #d1d5db",
+            background: "#fff",
+            cursor: "pointer",
+            marginBottom: 12,
+          }}
+        >
+          Back
+        </button>
+        <p style={{ color: "red" }}>{error}</p>
+      </main>
+    );
+  }
+
+  if (!booking) {
+    return (
+      <main
+        style={{
+          maxWidth: 900,
+          margin: "0 auto",
+          padding: 24,
+          fontFamily: "system-ui, sans-serif",
+        }}
+      >
+        <button
+          type="button"
+          onClick={() => router.back()}
+          style={{
+            padding: "6px 12px",
+            borderRadius: 999,
+            border: "1px solid #d1d5db",
+            background: "#fff",
+            cursor: "pointer",
+            marginBottom: 12,
+          }}
+        >
+          Back
+        </button>
+        <p>Trip not found (rideId: {rideId}).</p>
+      </main>
+    );
+  }
+
+  const dt = safeDate(booking.departureTime) ?? new Date(booking.departureTime);
 
   return (
     <main
       style={{
         maxWidth: 900,
         margin: "0 auto",
-        padding: "24px 16px 40px",
-        fontFamily:
-          "system-ui, -apple-system, BlinkMacSystemFont, sans-serif",
+        padding: 24,
+        fontFamily: "system-ui, sans-serif",
       }}
     >
-      {/* Back link */}
-      <button
-        type="button"
-        onClick={() => router.push("/rider/portal")}
+      <div
         style={{
-          border: "none",
-          background: "transparent",
-          color: "#4b5563",
-          fontSize: 14,
-          cursor: "pointer",
-          marginBottom: 12,
+          display: "flex",
+          justifyContent: "space-between",
+          gap: 12,
+          marginBottom: 16,
         }}
       >
-        ← Back to rider portal
-      </button>
-
-      {/* Header */}
-      <header style={{ marginBottom: 20 }}>
-        <h1
+        <button
+          type="button"
+          onClick={() => router.back()}
           style={{
-            fontSize: 28,
-            fontWeight: 650,
-            marginBottom: 4,
+            padding: "6px 12px",
+            borderRadius: 999,
+            border: "1px solid #d1d5db",
+            background: "#fff",
+            cursor: "pointer",
           }}
         >
-          Trip details
-        </h1>
-        <p
-          style={{
-            margin: 0,
-            fontSize: 13,
-            color: "#6b7280",
-          }}
-        >
-          Ride ID:{" "}
-          <span style={{ fontFamily: "monospace" }}>
-            {rideId || "—"}
-          </span>
-        </p>
-      </header>
+          Back
+        </button>
 
-      {loading && <p>Loading trip…</p>}
-
-      {!loading && error && (
-        <p style={{ color: "#dc2626", fontSize: 14 }}>{error}</p>
-      )}
-
-      {!loading && !error && trip && (
-        <>
-          {/* Top card: route, statuses, distance/fare + chat */}
-          <section
+        {booking.conversationId && (
+          <button
+            type="button"
+            onClick={() =>
+              setActiveChat({
+                conversationId: booking.conversationId!,
+                readOnly,
+              })
+            }
             style={{
-              borderRadius: 12,
-              border: "1px solid #e5e7eb",
-              padding: 16,
-              background: "#ffffff",
-              marginBottom: 16,
+              padding: "6px 12px",
+              borderRadius: 999,
+              border: "1px solid #d1d5db",
+              background: "#fff",
+              cursor: "pointer",
+              whiteSpace: "nowrap",
             }}
           >
-            <div
-              style={{
-                marginBottom: 10,
-                fontSize: 15,
-                fontWeight: 600,
-                color: "#111827",
-              }}
-            >
-              {trip.originAddress} → {trip.destinationAddress}
+            Open chat {readOnly ? "(read-only)" : ""}
+          </button>
+        )}
+      </div>
+
+      <h1 style={{ margin: "0 0 6px", fontSize: 22, fontWeight: 700 }}>
+        {booking.originCity} → {booking.destinationCity}
+      </h1>
+
+      <p style={{ margin: 0, color: "#4b5563" }}>
+        Departure: {dt.toLocaleString()}
+      </p>
+
+      <div
+        style={{
+          marginTop: 14,
+          border: "1px solid #e5e7eb",
+          borderRadius: 12,
+          padding: 14,
+          background: "#fff",
+        }}
+      >
+        <div style={{ fontSize: 13, color: "#374151", display: "grid", gap: 6 }}>
+          <div>
+            <strong>Ride ID:</strong> {booking.rideId}
+          </div>
+          <div>
+            <strong>Booking ID:</strong> {booking.bookingId ?? "Not booked yet"}
+          </div>
+          <div>
+            <strong>Status:</strong> {booking.status} / {booking.rideStatus}
+          </div>
+
+          {booking.driverName && (
+            <div>
+              <strong>Driver:</strong> {booking.driverName}
             </div>
+          )}
 
-            <div
-              style={{
-                fontSize: 13,
-                color: "#4b5563",
-                marginBottom: 12,
-              }}
-            >
-              Departure: {formatDateTime(trip.departureTime)}
+          {booking.distanceMiles != null && (
+            <div>
+              <strong>Distance:</strong> {booking.distanceMiles.toFixed(2)} mi
             </div>
+          )}
 
-            {/* Status chips */}
-            <div
-              style={{
-                display: "flex",
-                flexWrap: "wrap",
-                gap: 8,
-                marginBottom: 12,
-              }}
-            >
-              <Chip label="Booking" value={trip.bookingStatus} tone="green" />
-              <Chip
-                label="Ride"
-                value={trip.rideStatus}
-                tone={
-                  trip.rideStatus === "IN_ROUTE"
-                    ? "amber"
-                    : trip.rideStatus === "COMPLETED"
-                    ? "green"
-                    : trip.rideStatus === "CANCELLED"
-                    ? "red"
-                    : "gray"
-                }
-              />
+          {booking.totalPriceCents != null && (
+            <div>
+              <strong>Fare:</strong> ${formatMoney(booking.totalPriceCents)}
             </div>
+          )}
 
-            {/* Distance / fare */}
-            <div
-              style={{
-                display: "flex",
-                flexWrap: "wrap",
-                gap: 16,
-                fontSize: 14,
-                marginBottom: 12,
-              }}
-            >
-              <div>
-                <strong>Distance:</strong>{" "}
-                {trip.distanceMiles != null
-                  ? `${trip.distanceMiles.toFixed(2)} miles`
-                  : "—"}
-              </div>
-              <div>
-                <strong>Total fare:</strong>{" "}
-                {formatMoney(trip.totalPriceCents)}
-              </div>
+          {booking.passengerCount != null && (
+            <div>
+              <strong>Passengers:</strong> {booking.passengerCount}
             </div>
+          )}
 
-            {/* Driver info + chat button */}
-            <div
-              style={{
-                display: "flex",
-                flexWrap: "wrap",
-                justifyContent: "space-between",
-                alignItems: "center",
-                gap: 12,
-              }}
-            >
-              <div style={{ fontSize: 14, color: "#4b5563" }}>
-                <div style={{ fontWeight: 600, marginBottom: 4 }}>
-                  Driver information
-                </div>
-                <div>
-                  Driver:{" "}
-                  {trip.driverName ? trip.driverName : "Not assigned"}
-                </div>
-                {trip.driverPublicId && (
-                  <div>Driver ID: {trip.driverPublicId}</div>
-                )}
-              </div>
-
-              <div>
-                <button
-                  type="button"
-                  onClick={() =>
-                    canChat &&
-                    setActiveConversationId(trip.conversationId as string)
-                  }
-                  disabled={!canChat}
-                  style={{
-                    padding: "8px 14px",
-                    borderRadius: 999,
-                    border: canChat
-                      ? "1px solid #d1d5db"
-                      : "1px solid #e5e7eb",
-                    background: canChat ? "#ffffff" : "#f9fafb",
-                    fontSize: 13,
-                    color: canChat ? "#111827" : "#9ca3af",
-                    cursor: canChat ? "pointer" : "not-allowed",
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 6,
-                  }}
-                >
-                  <span
-                    style={{
-                      display: "inline-block",
-                      width: 8,
-                      height: 8,
-                      borderRadius: "999px",
-                      backgroundColor: canChat ? "#22c55e" : "#d1d5db",
-                    }}
-                  />
-                  {canChat ? "View chat with driver" : "Chat not available"}
-                </button>
-              </div>
+          {booking.tripStartedAt && (
+            <div>
+              <strong>Trip started:</strong>{" "}
+              {new Date(booking.tripStartedAt).toLocaleString()}
             </div>
-          </section>
+          )}
 
-          {/* Timeline */}
-          <section
-            style={{
-              borderRadius: 12,
-              border: "1px solid #e5e7eb",
-              padding: 16,
-              background: "#ffffff",
-              marginBottom: 16,
-            }}
-          >
-            <h2
-              style={{
-                margin: "0 0 8px",
-                fontSize: 18,
-                fontWeight: 600,
-              }}
-            >
-              Trip timeline
-            </h2>
+          {booking.tripCompletedAt && (
+            <div>
+              <strong>Trip completed:</strong>{" "}
+              {new Date(booking.tripCompletedAt).toLocaleString()}
+            </div>
+          )}
+        </div>
+      </div>
 
-            <ul
-              style={{
-                listStyle: "none",
-                padding: 0,
-                margin: 0,
-                fontSize: 14,
-                color: "#374151",
-              }}
-            >
-              <TimelineItem
-                label="Ride requested"
-                time={trip.requestedAt || trip.departureTime}
-                active
-              />
-              <TimelineItem
-                label="Trip started"
-                time={trip.tripStartedAt}
-                active={!!trip.tripStartedAt}
-              />
-              <TimelineItem
-                label="Trip completed"
-                time={trip.tripCompletedAt}
-                active={trip.rideStatus === "COMPLETED"}
-              />
-            </ul>
-          </section>
-
-            {/* Receipt note */}
-          <section
-            style={{
-              borderRadius: 12,
-              border: "1px solid #e5e7eb",
-              padding: 16,
-              background: "#ffffff",
-            }}
-          >
-            <h2
-              style={{
-                margin: "0 0 8px",
-                fontSize: 18,
-                fontWeight: 600,
-              }}
-            >
-              Receipt
-            </h2>
-            <p
-              style={{
-                margin: "0 0 4px",
-                fontSize: 14,
-                color: "#4b5563",
-              }}
-            >
-              You can find this trip inside your{" "}
-              <a href="/rider/portal" style={{ color: "#4f46e5" }}>
-                completed rides
-              </a>{" "}
-              and resend a receipt from there.
-            </p>
-            <p style={{ margin: 0, fontSize: 13, color: "#6b7280" }}>
-              In a future version, you can also show the full receipt directly
-              on this page.
-            </p>
-          </section>
-        </>
-      )}
-
-      {activeConversationId && (
+      {activeChat && (
         <ChatOverlay
-          conversationId={activeConversationId}
-          onClose={() => setActiveConversationId(null)}
+          conversationId={activeChat.conversationId}
+          readOnly={activeChat.readOnly}
+          onClose={() => setActiveChat(null)}
         />
       )}
     </main>
   );
 }
 
-/* ---------- Small UI bits ---------- */
-
-function Chip(props: {
-  label: string;
-  value: string;
-  tone: "green" | "amber" | "red" | "gray";
+function ChatOverlay(props: {
+  conversationId: string;
+  readOnly: boolean;
+  onClose: () => void;
 }) {
-  const { label, value, tone } = props;
+  const { conversationId, readOnly, onClose } = props;
 
-  const palette: Record<
-    typeof tone,
-    { bg: string; border: string; text: string }
-  > = {
-    green: {
-      bg: "#ecfdf5",
-      border: "#bbf7d0",
-      text: "#166534",
-    },
-    amber: {
-      bg: "#fffbeb",
-      border: "#fef3c7",
-      text: "#92400e",
-    },
-    red: {
-      bg: "#fef2f2",
-      border: "#fecaca",
-      text: "#b91c1c",
-    },
-    gray: {
-      bg: "#f3f4f6",
-      border: "#e5e7eb",
-      text: "#374151",
-    },
-  };
-
-  const colors = palette[tone];
-
-  return (
-    <span
-      style={{
-        display: "inline-flex",
-        alignItems: "center",
-        gap: 4,
-        padding: "4px 10px",
-        borderRadius: 999,
-        border: `1px solid ${colors.border}`,
-        background: colors.bg,
-        fontSize: 12,
-        color: colors.text,
-      }}
-    >
-      <span style={{ fontWeight: 600 }}>{label}:</span>
-      <span>{value}</span>
-    </span>
-  );
-}
-
-function TimelineItem(props: {
-  label: string;
-  time?: string | null;
-  active?: boolean;
-}) {
-  const { label, time, active = false } = props;
-
-  const formatted = time
-    ? (() => {
-        const d = new Date(time);
-        if (Number.isNaN(d.getTime())) return time;
-        return d.toLocaleString();
-      })()
-    : "—";
-
-  return (
-    <li
-      style={{
-        display: "flex",
-        alignItems: "flex-start",
-        gap: 8,
-        marginBottom: 6,
-      }}
-    >
-      <span
-        style={{
-          marginTop: 4,
-          width: 8,
-          height: 8,
-          borderRadius: "999px",
-          backgroundColor: active ? "#22c55e" : "#d1d5db",
-          flexShrink: 0,
-        }}
-      />
-      <div>
-        <div style={{ fontWeight: 500 }}>{label}</div>
-        <div style={{ fontSize: 13, color: "#6b7280" }}>{formatted}</div>
-      </div>
-    </li>
-  );
-}
-
-/* ---------- Chat overlay ---------- */
-
-function ChatOverlay(props: { conversationId: string; onClose: () => void }) {
-  const { conversationId, onClose } = props;
+  const params = new URLSearchParams();
+  if (readOnly) params.set("readonly", "1");
+  const qs = params.toString();
+  const src = qs ? `/chat/${conversationId}?${qs}` : `/chat/${conversationId}`;
 
   return (
     <div
@@ -562,7 +396,9 @@ function ChatOverlay(props: { conversationId: string; onClose: () => void }) {
             fontSize: 14,
           }}
         >
-          <span style={{ fontWeight: 600 }}>Chat with driver</span>
+          <span style={{ fontWeight: 600 }}>
+            Chat with driver {readOnly ? "(read-only)" : ""}
+          </span>
           <button
             type="button"
             onClick={onClose}
@@ -580,12 +416,8 @@ function ChatOverlay(props: { conversationId: string; onClose: () => void }) {
         </div>
 
         <iframe
-          src={`/chat/${conversationId}`}
-          style={{
-            border: "none",
-            width: "100%",
-            height: "100%",
-          }}
+          src={src}
+          style={{ border: "none", width: "100%", height: "100%" }}
           title="Chat"
         />
       </div>
