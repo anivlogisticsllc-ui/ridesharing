@@ -1,15 +1,26 @@
 "use client";
 
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { useSession } from "next-auth/react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { TripMeter } from "@/components/driver/TripMeter";
+import { asRole } from "@/lib/roles";
 import {
   computeMembershipState,
   formatDate,
   type MeMembership,
 } from "@/lib/membership";
 import { daysUntil } from "@/lib/dateUtils";
+
+/**
+ * IMPORTANT:
+ * Unread badge polling must NOT fetch /api/chat/:conversationId for many convos.
+ * With Prisma pool limit=1, that can cause P2024 and make chat + ride actions hang/fail.
+ *
+ * This file uses a cheap notifications endpoint:
+ *   GET /api/driver/chat-notifications
+ */
+const ENABLE_UNREAD_BADGE = true;
 
 type ServiceCity = {
   id: string;
@@ -18,29 +29,21 @@ type ServiceCity = {
   cityLng: number;
 };
 
-type DriverProfile = {
-  id: string;
-  baseCity: string | null;
-  baseLat: number | null;
-  baseLng: number | null;
-  serviceCities: ServiceCity[];
-};
-
-type DriverProfileResponse =
-  | { ok: true; profile: DriverProfile | null }
-  | { ok: false; error: string }
-  | any;
+type DriverProfileResponse = any;
 
 type RideStatusUI = "OPEN" | "ACCEPTED" | "IN_ROUTE" | "COMPLETED" | "CANCELLED";
 
 type DriverRide = {
-  id: string;
   rideId: string;
+
   bookingId: string | null;
+  paymentType?: "CARD" | "CASH" | null;
+
   originCity: string;
   destinationCity: string;
   departureTime: string; // ISO
   status: RideStatusUI;
+
   riderName: string | null;
   riderPublicId: string | null;
 
@@ -64,20 +67,18 @@ type ActiveChatContext = {
 };
 
 type MembershipApiResponse =
-  | {
-      ok: true;
-      user: {
-        id: string;
-        name: string | null;
-        email: string;
-        role: "RIDER" | "DRIVER";
-        onboardingCompleted: boolean;
-      };
-      membership: MeMembership & { status?: string | null };
-    }
+  | { ok: true; membership: MeMembership & { status?: string | null } }
   | { ok: false; error: string };
 
-/* ---------- Helpers ---------- */
+type UnreadCounts = Record<string, number>;
+
+type DriverConversationNotification = {
+  conversationId: string;
+  latestMessageId: string | null;
+  latestMessageCreatedAt: string | null;
+  latestMessageSenderId: string | null;
+  senderType: "RIDER" | "DRIVER" | "UNKNOWN";
+};
 
 function isSameDay(a: Date, b: Date) {
   return (
@@ -93,19 +94,45 @@ function safeDate(value: string | null | undefined): Date | null {
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
+function formatMoneyFromCents(cents: number | null | undefined) {
+  if (cents === null || cents === undefined) return null;
+  return (cents / 100).toLocaleString(undefined, {
+    style: "currency",
+    currency: "USD",
+  });
+}
+
 async function readApiError(res: Response): Promise<string> {
   const text = await res.text().catch(() => "");
   if (!text) return `Request failed (HTTP ${res.status}).`;
 
   try {
     const json = JSON.parse(text);
-    return json?.error || json?.message || `Request failed (HTTP ${res.status}).`;
+    return (
+      json?.error || json?.message || `Request failed (HTTP ${res.status}).`
+    );
   } catch {
     return text.slice(0, 300) || `Request failed (HTTP ${res.status}).`;
   }
 }
 
-/* ---------- Component ---------- */
+/** messageId-based "seen" store for driver */
+function getDriverSeenMessageId(conversationId: string): string | null {
+  try {
+    return localStorage.getItem(`chat:lastSeenMsgId:driver:${conversationId}`);
+  } catch {
+    return null;
+  }
+}
+
+function setDriverSeenMessageId(conversationId: string, messageId: string | null) {
+  try {
+    if (!messageId) return;
+    localStorage.setItem(`chat:lastSeenMsgId:driver:${conversationId}`, messageId);
+  } catch {
+    // ignore
+  }
+}
 
 export default function DriverPortalInner() {
   const { data: session, status } = useSession();
@@ -129,12 +156,64 @@ export default function DriverPortalInner() {
 
   const [activeChat, setActiveChat] = useState<ActiveChatContext | null>(null);
 
-  // Ride action feedback
   const [rideActionError, setRideActionError] = useState<string | null>(null);
   const [busyRideId, setBusyRideId] = useState<string | null>(null);
 
-  /* ---------- Session / access control + initial loads ---------- */
+  const [unread, setUnread] = useState<UnreadCounts>({});
 
+  const unreadPollRef = useRef<number | null>(null);
+  const latestByConvRef = useRef<Record<string, string | null>>({});
+
+  const driverName =
+    ((session?.user as any)?.name as string | undefined) || "your driver";
+
+  async function loadRides() {
+    setRidesLoading(true);
+    try {
+      const res = await fetch("/api/driver/portal-rides", { cache: "no-store" });
+      const data: PortalRidesResponse = await res
+        .json()
+        .catch(() => ({ ok: false, error: "Bad JSON" } as any));
+
+      if (!res.ok || !data.ok) {
+        throw new Error((data as any)?.error || "Failed to load rides.");
+      }
+
+      const normalize = (r: any): DriverRide => ({
+        rideId: r.rideId ?? r.id,
+        bookingId: r.bookingId ?? null,
+        paymentType: r.paymentType ?? null,
+
+        originCity: r.originCity,
+        destinationCity: r.destinationCity,
+        departureTime: r.departureTime,
+        status: r.status,
+
+        riderName: r.riderName ?? null,
+        riderPublicId: r.riderPublicId ?? null,
+        conversationId: r.conversationId ?? null,
+
+        tripStartedAt: r.tripStartedAt ?? null,
+        tripCompletedAt: r.tripCompletedAt ?? null,
+        distanceMiles: r.distanceMiles ?? null,
+        totalPriceCents: r.totalPriceCents ?? null,
+      });
+
+      const accepted = (data as any).accepted?.map(normalize) ?? [];
+      const completed = (data as any).completed?.map(normalize) ?? [];
+
+      setAcceptedRides(accepted);
+      setCompletedRides(completed);
+      setRidesError(null);
+    } catch (err: any) {
+      console.error("Error loading driver rides:", err);
+      setRidesError(err?.message || "Could not load rides.");
+    } finally {
+      setRidesLoading(false);
+    }
+  }
+
+  // Session + initial load
   useEffect(() => {
     if (status === "loading") return;
 
@@ -143,19 +222,25 @@ export default function DriverPortalInner() {
       return;
     }
 
-    const role = (session.user as any).role as "RIDER" | "DRIVER" | "BOTH" | undefined;
-    if (role !== "DRIVER" && role !== "BOTH") {
+    const role = asRole((session.user as any)?.role);
+
+    // driver portal: DRIVER (optionally ADMIN)
+    if (role !== "DRIVER" && role !== "ADMIN") {
       router.replace("/");
       return;
     }
 
     async function loadProfile() {
       try {
-        const res = await fetch("/api/driver/service-cities", { cache: "no-store" });
+        const res = await fetch("/api/driver/service-cities", {
+          cache: "no-store",
+        });
         const data: DriverProfileResponse = await res.json().catch(() => null);
-
         const profile =
-          (data?.ok && data?.profile) || data?.driverProfile || data?.profile || null;
+          (data?.ok && data?.profile) ||
+          data?.driverProfile ||
+          data?.profile ||
+          null;
 
         if (res.ok && profile?.serviceCities) {
           setServiceCities(profile.serviceCities);
@@ -179,12 +264,11 @@ export default function DriverPortalInner() {
         const json = (await res.json().catch(() => null)) as MembershipApiResponse | null;
 
         if (!res.ok || !json?.ok) {
-          console.warn("Membership API error:", (json as any)?.error);
           setMembership(null);
           return;
         }
 
-        setMembership(json.membership);
+        setMembership((json as any).membership);
       } catch (err) {
         console.error("Error loading membership:", err);
         setMembership(null);
@@ -193,42 +277,13 @@ export default function DriverPortalInner() {
       }
     }
 
-    async function loadRides() {
-      try {
-        const res = await fetch("/api/driver/portal-rides", { cache: "no-store" });
-        const data: PortalRidesResponse = await res.json();
-
-        if (!res.ok || !data.ok) {
-          throw new Error((data as any)?.error || "Failed to load rides.");
-        }
-
-        const normalize = (r: any): DriverRide => ({
-          ...r,
-          rideId: r.rideId ?? r.id,
-          bookingId: r.bookingId ?? null, // keep it
-          tripStartedAt: r.tripStartedAt ?? null,
-          tripCompletedAt: r.tripCompletedAt ?? null,
-          conversationId: r.conversationId ?? null,
-        });
-
-        setAcceptedRides(data.accepted.map(normalize));
-        setCompletedRides(data.completed.map(normalize));
-        setRidesError(null);
-      } catch (err: any) {
-        console.error("Error loading driver rides:", err);
-        setRidesError(err?.message || "Could not load rides.");
-      } finally {
-        setRidesLoading(false);
-      }
-    }
-
     loadProfile();
     loadMembership();
     loadRides();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session, status, router]);
 
-  /* ---------- Auto-open chat when arriving with query params ---------- */
-
+  // Auto-open chat from query params
   useEffect(() => {
     if (activeChat) return;
 
@@ -239,6 +294,7 @@ export default function DriverPortalInner() {
     const autoOpenChat = sp.get("autoOpenChat") === "1";
     const prefillParam = sp.get("prefill");
 
+    // If prefill param exists (even empty), open exactly that
     if (prefillParam !== null) {
       const autoClose = sp.get("autoClose") === "1";
       setActiveChat({
@@ -256,16 +312,19 @@ export default function DriverPortalInner() {
     const ride = acceptedRides.find((r) => r.conversationId === convId);
 
     if (!ride) {
-      setActiveChat({ conversationId: convId, prefill: null, autoClose: true, readOnly: false });
+      setActiveChat({
+        conversationId: convId,
+        prefill: null,
+        autoClose: true,
+        readOnly: false,
+      });
       router.replace("/driver/portal");
       return;
     }
 
     const riderLabel = ride.riderPublicId || ride.riderName || "there";
-    const driverLabel = (session?.user as any)?.name || "your driver";
-
     const riderFirst = String(riderLabel).trim().split(" ")[0];
-    const driverFirst = String(driverLabel).trim().split(" ")[0];
+    const driverFirst = String(driverName).trim().split(" ")[0];
 
     setActiveChat({
       conversationId: convId,
@@ -275,9 +334,185 @@ export default function DriverPortalInner() {
     });
 
     router.replace("/driver/portal");
-  }, [searchParams, activeChat, ridesLoading, acceptedRides, router, session]);
+  }, [searchParams, activeChat, ridesLoading, acceptedRides, router, driverName]);
 
-  /* ---------- Service cities actions ---------- */
+  /**
+   * Unread polling (driver)
+   * - Polls /api/driver/chat-notifications every 8s
+   * - Only shows a badge when latest message is from RIDER AND differs from last seen messageId
+   * - Sticky-until-open: once badge is 1, it stays 1 until driver opens chat
+   *
+   * FIX:
+   * - Completed rides should NOT keep a sticky badge. Once a ride is completed, clear the badge.
+   * - Only poll for accepted rides' conversations (active work).
+   */
+  useEffect(() => {
+    if (!ENABLE_UNREAD_BADGE) {
+      setUnread({});
+      return;
+    }
+    if (status !== "authenticated") return;
+
+    const driverUserId = (session?.user as any)?.id as string | undefined;
+    if (!driverUserId) return;
+
+    const acceptedConvIds = Array.from(
+      new Set(
+        acceptedRides
+          .map((r) => r.conversationId?.trim() || "")
+          .filter(Boolean)
+      )
+    );
+
+    const completedConvIds = Array.from(
+      new Set(
+        completedRides
+          .map((r) => r.conversationId?.trim() || "")
+          .filter(Boolean)
+      )
+    );
+
+    // clear any existing interval
+    if (unreadPollRef.current) {
+      window.clearInterval(unreadPollRef.current);
+      unreadPollRef.current = null;
+    }
+
+    // Always clear badges for completed convos (even if we don't poll)
+    if (completedConvIds.length > 0) {
+      setUnread((prev) => {
+        let changed = false;
+        const next = { ...prev };
+        for (const id of completedConvIds) {
+          if ((next[id] ?? 0) !== 0) {
+            next[id] = 0;
+            changed = true;
+          }
+        }
+        return changed ? next : prev;
+      });
+    }
+
+    // If no accepted convos, nothing to poll
+    if (acceptedConvIds.length === 0) return;
+
+    let cancelled = false;
+
+    async function poll() {
+      try {
+        const res = await fetch("/api/driver/chat-notifications", {
+          method: "GET",
+          cache: "no-store",
+        });
+        if (!res.ok) return;
+
+        const data = (await res.json()) as
+          | { ok: true; notifications: DriverConversationNotification[] }
+          | { ok: false; error: string };
+
+        if (cancelled || !data.ok) return;
+
+        const list = data.notifications || [];
+        const activeConvId = activeChat?.conversationId ?? null;
+
+        // keep latest messageId in a ref so openChat can mark it seen without another fetch
+        const nextLatest: Record<string, string | null> = {
+          ...latestByConvRef.current,
+        };
+
+        const nextUnread: Record<string, number> = {};
+
+        // Force-clear completed convos on every poll (sticky badge should not persist there)
+        for (const completedId of completedConvIds) {
+          nextUnread[completedId] = 0;
+
+          // Optional: if we already know a latest message id, mark it seen so it doesn't re-trigger later
+          const knownLatest = nextLatest[completedId] ?? null;
+          if (knownLatest) setDriverSeenMessageId(completedId, knownLatest);
+        }
+
+        for (const n of list) {
+          const convId = n.conversationId;
+
+          // Only consider accepted rides for unread/sticky behavior
+          if (!acceptedConvIds.includes(convId)) continue;
+
+          const latestId = n.latestMessageId ?? null;
+          nextLatest[convId] = latestId;
+
+          // if chat is open for this conversation, mark as seen and clear
+          if (activeConvId && convId === activeConvId) {
+            nextUnread[convId] = 0;
+            if (latestId) setDriverSeenMessageId(convId, latestId);
+            continue;
+          }
+
+          if (!latestId) {
+            nextUnread[convId] = 0;
+            continue;
+          }
+
+          const seenId = getDriverSeenMessageId(convId);
+          const isNewRiderMsg = n.senderType === "RIDER" && latestId !== seenId;
+
+          nextUnread[convId] = isNewRiderMsg ? 1 : 0;
+        }
+
+        latestByConvRef.current = nextLatest;
+
+        setUnread((prev) => {
+          let changed = false;
+          const merged = { ...prev };
+
+          // Merge with sticky-until-open logic for accepted convos only.
+          for (const [convId, freshValue] of Object.entries(nextUnread)) {
+            const prevValue = merged[convId] ?? 0;
+
+            const isAccepted = acceptedConvIds.includes(convId);
+            const isCompleted = completedConvIds.includes(convId);
+
+            // Completed: always 0 (no sticky)
+            if (isCompleted) {
+              const finalValue = 0;
+              if (prevValue !== finalValue) {
+                merged[convId] = finalValue;
+                changed = true;
+              }
+              continue;
+            }
+
+            // Accepted: sticky until open
+            if (isAccepted) {
+              const finalValue = freshValue === 1 ? 1 : prevValue;
+              if (prevValue !== finalValue) {
+                merged[convId] = finalValue;
+                changed = true;
+              }
+              continue;
+            }
+
+            // Anything else: keep as-is (shouldn't happen)
+          }
+
+          return changed ? merged : prev;
+        });
+      } catch (e) {
+        console.error("Driver chat notification poll failed:", e);
+      }
+    }
+
+    poll();
+    unreadPollRef.current = window.setInterval(poll, 8_000);
+
+    return () => {
+      cancelled = true;
+      if (unreadPollRef.current) {
+        window.clearInterval(unreadPollRef.current);
+        unreadPollRef.current = null;
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session, status, acceptedRides, completedRides, activeChat]);
 
   async function handleAddCity(e: FormEvent) {
     e.preventDefault();
@@ -326,8 +561,6 @@ export default function DriverPortalInner() {
       console.error("Error removing service city:", err);
     }
   }
-
-  /* ---------- Trip meter & ride actions ---------- */
 
   async function handleStartRide(rideId: string) {
     if (busyRideId) return;
@@ -403,10 +636,18 @@ export default function DriverPortalInner() {
           totalPriceCents: summary?.fareCents ?? ride.totalPriceCents ?? null,
         };
 
-        setCompletedRides((prevCompleted) => {
-          const withoutThis = prevCompleted.filter((r) => r.rideId !== rideId);
-          return [completedRide, ...withoutThis];
-        });
+        // Also clear unread badge immediately when ride completes
+        if (ENABLE_UNREAD_BADGE && completedRide.conversationId) {
+          const cid = completedRide.conversationId;
+          setUnread((prev) => ({ ...prev, [cid]: 0 }));
+          const latestId = latestByConvRef.current[cid] ?? null;
+          if (latestId) setDriverSeenMessageId(cid, latestId);
+        }
+
+        setCompletedRides((prevCompleted) => [
+          completedRide,
+          ...prevCompleted.filter((r) => r.rideId !== rideId),
+        ]);
 
         return prevAccepted.filter((r) => r.rideId !== rideId);
       });
@@ -417,8 +658,6 @@ export default function DriverPortalInner() {
       setBusyRideId(null);
     }
   }
-
-  /* ---------- Membership banner ---------- */
 
   const membershipBanner = useMemo(() => {
     if (!membership) return null;
@@ -433,7 +672,6 @@ export default function DriverPortalInner() {
     if (state === "TRIAL") {
       const daysText =
         daysLeft === null ? "" : daysLeft === 1 ? "1 day left" : `${daysLeft} days left`;
-
       return {
         tone: "warning" as const,
         title: `Free trial${daysText ? `: ${daysText}` : ""}.`,
@@ -442,7 +680,11 @@ export default function DriverPortalInner() {
     }
 
     if (state === "ACTIVE") {
-      return { tone: "good" as const, title: "Driver membership is active.", body: "Thanks — billing is active for your account." };
+      return {
+        tone: "good" as const,
+        title: "Driver membership is active.",
+        body: "Thanks — billing is active for your account.",
+      };
     }
 
     if (state === "EXPIRED") {
@@ -453,10 +695,12 @@ export default function DriverPortalInner() {
       };
     }
 
-    return { tone: "warning" as const, title: "No membership found.", body: "If this is unexpected, open Membership & Billing to fix it." };
+    return {
+      tone: "warning" as const,
+      title: "No membership found.",
+      body: "If this is unexpected, open Membership & Billing to fix it.",
+    };
   }, [membership]);
-
-  /* ---------- Derived lists ---------- */
 
   const today = useMemo(() => new Date(), []);
 
@@ -496,38 +740,83 @@ export default function DriverPortalInner() {
     return <p className="py-10 text-center text-slate-600">Loading…</p>;
   }
 
-  const driverName = (session.user as any)?.name || "your driver";
+  function renderUnreadBadge(conversationId: string | null) {
+    if (!ENABLE_UNREAD_BADGE) return null;
+    if (!conversationId) return null;
+
+    const n = unread[conversationId] ?? 0;
+    if (n <= 0) return null;
+
+    return (
+      <span className="inline-flex min-w-[18px] items-center justify-center rounded-full bg-red-600 px-1.5 text-[11px] font-semibold text-white">
+        {n}
+      </span>
+    );
+  }
+
+  function openChat(args: {
+    conversationId: string;
+    readOnly: boolean;
+    prefill: string | null;
+    autoClose: boolean;
+  }) {
+    // clear badge immediately
+    if (ENABLE_UNREAD_BADGE) {
+      setUnread((prev) => ({ ...prev, [args.conversationId]: 0 }));
+    }
+
+    // mark latest messageId as seen (so badge stays cleared)
+    const latestId = latestByConvRef.current[args.conversationId] ?? null;
+    if (latestId) setDriverSeenMessageId(args.conversationId, latestId);
+
+    setActiveChat({
+      conversationId: args.conversationId,
+      prefill: args.prefill,
+      autoClose: args.autoClose,
+      readOnly: args.readOnly,
+    });
+  }
 
   return (
     <main className="min-h-[calc(100vh-4rem)] bg-slate-50">
       <div className="mx-auto max-w-4xl space-y-8 px-4 py-10">
-        <section>
-          {membershipLoading ? (
-            <p className="text-xs text-slate-500">Checking membership…</p>
-          ) : membershipBanner ? (
-            <div
-              className={`rounded-2xl border px-4 py-3 text-xs ${
-                membershipBanner.tone === "good"
-                  ? "border-emerald-200 bg-emerald-50 text-emerald-900"
-                  : membershipBanner.tone === "danger"
-                  ? "border-rose-200 bg-rose-50 text-rose-900"
-                  : "border-amber-200 bg-amber-50 text-amber-900"
-              }`}
-            >
-              <p className="font-semibold">{membershipBanner.title}</p>
-              <p className="mt-1 text-[11px] opacity-90">{membershipBanner.body}</p>
+        <section className="flex items-center justify-between">
+          <div>
+            {membershipLoading ? (
+              <p className="text-xs text-slate-500">Checking membership…</p>
+            ) : membershipBanner ? (
+              <div
+                className={`rounded-2xl border px-4 py-3 text-xs ${
+                  membershipBanner.tone === "good"
+                    ? "border-emerald-200 bg-emerald-50 text-emerald-900"
+                    : membershipBanner.tone === "danger"
+                    ? "border-rose-200 bg-rose-50 text-rose-900"
+                    : "border-amber-200 bg-amber-50 text-amber-900"
+                }`}
+              >
+                <p className="font-semibold">{membershipBanner.title}</p>
+                <p className="mt-1 text-[11px] opacity-90">{membershipBanner.body}</p>
 
-              {membershipBanner.tone !== "good" ? (
-                <button
-                  type="button"
-                  onClick={() => router.push("/billing/membership")}
-                  className="mt-2 rounded-full border border-current/20 bg-white/60 px-3 py-1 text-[11px] font-medium hover:bg-white"
-                >
-                  Open Membership & Billing
-                </button>
-              ) : null}
-            </div>
-          ) : null}
+                {membershipBanner.tone !== "good" ? (
+                  <button
+                    type="button"
+                    onClick={() => router.push("/billing/membership")}
+                    className="mt-2 rounded-full border border-current/20 bg-white/60 px-3 py-1 text-[11px] font-medium hover:bg-white"
+                  >
+                    Open Membership & Billing
+                  </button>
+                ) : null}
+              </div>
+            ) : null}
+          </div>
+
+          <button
+            type="button"
+            onClick={loadRides}
+            className="rounded-full border border-slate-300 bg-white px-3 py-2 text-xs font-medium text-slate-800 hover:bg-slate-50"
+          >
+            Refresh
+          </button>
         </section>
 
         {rideActionError ? (
@@ -547,13 +836,12 @@ export default function DriverPortalInner() {
           ) : ridesError ? (
             <p className="text-sm text-rose-600">{ridesError}</p>
           ) : sortedAcceptedRides.length === 0 ? (
-            <p className="text-sm text-slate-500">
-              You haven&apos;t accepted any rides yet. Book one from the home page.
-            </p>
+            <p className="text-sm text-slate-500">You haven&apos;t accepted any rides yet.</p>
           ) : (
             <ul className="space-y-3">
               {sortedAcceptedRides.map((ride) => {
                 const dt = safeDate(ride.departureTime) ?? new Date(ride.departureTime);
+
                 const meterStatus: "OPEN" | "FULL" | "IN_ROUTE" | "COMPLETED" =
                   ride.status === "IN_ROUTE"
                     ? "IN_ROUTE"
@@ -567,9 +855,12 @@ export default function DriverPortalInner() {
                 const riderLabel = ride.riderPublicId || ride.riderName || "there";
                 const isBusy = busyRideId === ride.rideId;
 
+                const priceLabel = formatMoneyFromCents(ride.totalPriceCents);
+                const payLabel = ride.paymentType ? String(ride.paymentType) : null;
+
                 return (
                   <li
-                    key={ride.id}
+                    key={ride.rideId}
                     className="space-y-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"
                   >
                     <div>
@@ -578,9 +869,12 @@ export default function DriverPortalInner() {
                       </p>
                       <p className="text-xs text-slate-500">
                         {dt.toLocaleString()} • Status: {ride.status}
+                        {payLabel ? ` • Pay: ${payLabel}` : ""}
+                        {priceLabel ? ` • Fare: ${priceLabel}` : ""}
                       </p>
                       <p className="mt-1 text-xs text-slate-500">
-                        Rider: <span className="font-medium text-slate-800">{riderLabel}</span>
+                        Rider:{" "}
+                        <span className="font-medium text-slate-800">{riderLabel}</span>
                       </p>
                     </div>
 
@@ -609,11 +903,11 @@ export default function DriverPortalInner() {
                           const riderFirst = String(riderLabel).trim().split(" ")[0];
                           const driverFirst = String(driverName).trim().split(" ")[0];
 
-                          setActiveChat({
+                          openChat({
                             conversationId: ride.conversationId,
-                            prefill: `Hi ${riderFirst}, this is ${driverFirst}. I will be at your location in 10 minutes.`,
-                            autoClose: true,
                             readOnly: false,
+                            autoClose: true,
+                            prefill: `Hi ${riderFirst}, this is ${driverFirst}. I will be at your location in 10 minutes.`,
                           });
                         }}
                         disabled={chatDisabled || isBusy}
@@ -623,7 +917,10 @@ export default function DriverPortalInner() {
                             : "bg-indigo-600 hover:bg-indigo-700"
                         }`}
                       >
-                        View chat
+                        <span className="inline-flex items-center gap-2">
+                          View chat
+                          {renderUnreadBadge(ride.conversationId)}
+                        </span>
                       </button>
                     </div>
 
@@ -658,10 +955,11 @@ export default function DriverPortalInner() {
 
                 const canChat = !!ride.conversationId?.trim();
                 const riderLabel = ride.riderPublicId || ride.riderName || "there";
+                const priceLabel = formatMoneyFromCents(ride.totalPriceCents);
 
                 return (
                   <li
-                    key={ride.id}
+                    key={ride.rideId}
                     className="flex flex-col gap-2 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm md:flex-row md:items-center md:justify-between"
                   >
                     <div>
@@ -670,9 +968,11 @@ export default function DriverPortalInner() {
                       </p>
                       <p className="text-xs text-slate-500">
                         {dt.toLocaleString()} • Status: {ride.status}
+                        {priceLabel ? ` • Fare: ${priceLabel}` : ""}
                       </p>
                       <p className="mt-1 text-xs text-slate-500">
-                        Rider: <span className="font-medium text-slate-800">{riderLabel}</span>
+                        Rider:{" "}
+                        <span className="font-medium text-slate-800">{riderLabel}</span>
                       </p>
                     </div>
 
@@ -688,7 +988,7 @@ export default function DriverPortalInner() {
                       <button
                         type="button"
                         onClick={() => {
-                          if (!ride.bookingId) return; // should be present for completed rides, but safe guard
+                          if (!ride.bookingId) return;
                           router.push(`/receipt/${ride.bookingId}`);
                         }}
                         disabled={!ride.bookingId}
@@ -701,17 +1001,15 @@ export default function DriverPortalInner() {
                         View receipt
                       </button>
 
-
-
                       <button
                         type="button"
                         onClick={() => {
                           if (!canChat || !ride.conversationId) return;
-                          setActiveChat({
+                          openChat({
                             conversationId: ride.conversationId,
-                            prefill: null,
-                            autoClose: false,
                             readOnly: true,
+                            autoClose: false,
+                            prefill: null,
                           });
                         }}
                         disabled={!canChat}
@@ -721,7 +1019,10 @@ export default function DriverPortalInner() {
                             : "cursor-not-allowed border-slate-200 text-slate-400"
                         }`}
                       >
-                        View chat
+                        <span className="inline-flex items-center gap-2">
+                          View chat
+                          {renderUnreadBadge(ride.conversationId)}
+                        </span>
                       </button>
                     </div>
                   </li>
@@ -731,12 +1032,10 @@ export default function DriverPortalInner() {
           )}
         </section>
 
-        {/* Service area UI left as-is */}
         <header className="space-y-1">
           <h1 className="text-2xl font-semibold text-slate-900">Driver service area</h1>
           <p className="text-sm text-slate-600">
-            Add the cities where you regularly work. For now, keep your area local (within about 10 miles). Later
-            we&apos;ll automatically enforce distance limits and use these cities to match you with rider requests.
+            Add the cities where you regularly work. For now, keep your area local (within about 10 miles).
           </p>
         </header>
 
@@ -801,8 +1100,6 @@ export default function DriverPortalInner() {
   );
 }
 
-/* ---------- Chat overlay (driver side) ---------- */
-
 function ChatOverlay(props: { context: ActiveChatContext; onClose: () => void }) {
   const { context, onClose } = props;
   const { conversationId, prefill, autoClose, readOnly } = context;
@@ -818,7 +1115,6 @@ function ChatOverlay(props: { context: ActiveChatContext; onClose: () => void })
   const params = new URLSearchParams();
   params.set("embed", "1");
   params.set("role", "driver");
-
   if (readOnly) params.set("readonly", "1");
   if (autoClose) params.set("autoClose", "1");
   if (prefill) params.set("prefill", prefill);
