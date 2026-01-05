@@ -44,11 +44,12 @@ export default async function RideDetailPage({ params }: Props) {
     ? `/chat/${conversationId}?role=driver${isCompletedOrCancelled ? "&readonly=1" : ""}`
     : null;
 
-  // IMPORTANT: receipt page expects bookingId (but our receipt page also supports rideId now)
+  // IMPORTANT: receipt page expects bookingId
   const receiptHref =
-    ride.status === RideStatus.COMPLETED
-      ? `/receipt/${booking?.id ?? ride.id}`
+    ride.status === RideStatus.COMPLETED && booking?.id
+      ? `/receipt/${booking.id}?autoprint=1`
       : null;
+
 
   const startedAt = ride.tripStartedAt ?? ride.departureTime;
   const completedAt = ride.tripCompletedAt ?? ride.updatedAt;
@@ -110,6 +111,8 @@ export default async function RideDetailPage({ params }: Props) {
             {receiptHref ? (
               <Link
                 href={receiptHref}
+                target="_blank"
+                rel="noopener noreferrer"
                 className="inline-flex items-center rounded-full bg-indigo-600 px-4 py-2 text-xs font-medium text-white hover:bg-indigo-700"
               >
                 View receipt
@@ -119,6 +122,7 @@ export default async function RideDetailPage({ params }: Props) {
                 Receipt not available
               </span>
             )}
+
           </div>
         </header>
 

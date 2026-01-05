@@ -5,10 +5,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useSession, signIn, signOut } from "next-auth/react";
 import { usePathname } from "next/navigation";
 
-type Role = "RIDER" | "DRIVER";
+type Role = "RIDER" | "DRIVER" | "ADMIN";
 
-function asRole(v: any): Role | null {
-  return v === "RIDER" || v === "DRIVER" ? v : null;
+function asRole(v: unknown): Role | null {
+  return v === "RIDER" || v === "DRIVER" || v === "ADMIN" ? v : null;
 }
 
 const ROUTES = {
@@ -27,15 +27,22 @@ const ROUTES = {
   rider: {
     portal: "/rider/portal",
     profile: "/rider/profile",
-    payments: "/rider/payments", // reserved route
+    payments: "/rider/payments",
   },
 
   driver: {
     portal: "/driver/portal",
     dashboard: "/driver/dashboard",
     profile: "/driver/profile",
-    payments: "/driver/payments", // reserved route
-    payouts: "/driver/payouts", // reserved route
+    payments: "/driver/payments",
+    payouts: "/driver/payouts",
+  },
+
+  admin: {
+    home: "/admin",
+    metrics: "/admin/metrics",
+    users: "/admin/users",
+    riders: "/admin/riders",
   },
 } as const;
 
@@ -44,6 +51,7 @@ export function Header() {
   const pathname = usePathname();
 
   const role = asRole((session?.user as any)?.role);
+  const isAdmin = role === "ADMIN";
   const isRider = role === "RIDER";
   const isDriver = role === "DRIVER";
 
@@ -74,7 +82,6 @@ export function Header() {
   const [open, setOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement | null>(null);
 
-  // Close dropdown on outside click / esc
   useEffect(() => {
     function onDocMouseDown(e: MouseEvent) {
       if (!open) return;
@@ -96,12 +103,22 @@ export function Header() {
     };
   }, [open]);
 
-  // Close dropdown on route change
   useEffect(() => {
     setOpen(false);
   }, [pathname]);
 
-  const profileHref = isDriver ? ROUTES.driver.profile : ROUTES.rider.profile;
+  const profileHref = isDriver
+    ? ROUTES.driver.profile
+    : isRider
+    ? ROUTES.rider.profile
+    : ROUTES.account.overview; // admin fallback
+
+  const roleLabel = role ?? "—";
+
+  function handleSignOut() {
+    setOpen(false);
+    signOut({ callbackUrl: ROUTES.home });
+  }
 
   return (
     <header className="relative z-50 border-b border-slate-200 bg-white">
@@ -129,6 +146,12 @@ export function Header() {
             {session && isDriver && (
               <Link href={ROUTES.driver.portal} className={linkClass(ROUTES.driver.portal)}>
                 Driver portal
+              </Link>
+            )}
+
+            {session && isAdmin && (
+              <Link href={ROUTES.admin.home} className={linkClass(ROUTES.admin.home)}>
+                Admin
               </Link>
             )}
 
@@ -164,11 +187,32 @@ export function Header() {
                   className="absolute right-0 z-[9999] mt-2 w-72 overflow-hidden rounded-xl border border-slate-200 bg-white shadow-lg"
                 >
                   <div className="px-3 py-2">
-                    <div className="text-xs font-semibold text-slate-900 truncate">{rawName}</div>
-                    <div className="text-[11px] text-slate-500">Role: {role ?? "—"}</div>
+                    <div className="truncate text-xs font-semibold text-slate-900">{rawName}</div>
+                    <div className="text-[11px] text-slate-500">Role: {roleLabel}</div>
                   </div>
 
                   <div className="h-px bg-slate-200" />
+
+                  {/* Admin */}
+                  {isAdmin ? (
+                    <>
+                      <div className="px-1 py-1">
+                        <MenuLink href={ROUTES.admin.home} onClick={() => setOpen(false)}>
+                          Admin portal
+                        </MenuLink>
+                        <MenuLink href={ROUTES.admin.metrics} onClick={() => setOpen(false)}>
+                          Metrics
+                        </MenuLink>
+                        <MenuLink href={ROUTES.admin.users} onClick={() => setOpen(false)}>
+                          Users
+                        </MenuLink>
+                        <MenuLink href={ROUTES.admin.riders} onClick={() => setOpen(false)}>
+                          Riders
+                        </MenuLink>
+                      </div>
+                      <div className="h-px bg-slate-200" />
+                    </>
+                  ) : null}
 
                   {/* Core */}
                   <div className="px-1 py-1">
@@ -201,7 +245,6 @@ export function Header() {
                           Driver portal
                         </MenuLink>
 
-                        {/* reserved routes (not 404 anymore) */}
                         <MenuLink href={ROUTES.driver.payments} onClick={() => setOpen(false)}>
                           Payments (soon)
                         </MenuLink>
@@ -221,7 +264,6 @@ export function Header() {
                           Rider portal
                         </MenuLink>
 
-                        {/* reserved route */}
                         <MenuLink href={ROUTES.rider.payments} onClick={() => setOpen(false)}>
                           Payments (soon)
                         </MenuLink>
@@ -234,7 +276,7 @@ export function Header() {
                   <div className="px-1 py-1">
                     <button
                       type="button"
-                      onClick={() => signOut({ callbackUrl: ROUTES.home })}
+                      onClick={handleSignOut}
                       className="w-full rounded-lg px-3 py-2 text-left text-xs font-medium text-slate-700 hover:bg-slate-50"
                       role="menuitem"
                     >

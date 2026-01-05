@@ -6,22 +6,33 @@ import { RiderRequestFormHome } from "@/components/RiderRequestFormHome";
 import { MembershipSelector } from "@/components/MembershipSelector";
 import { BookRideButton } from "@/components/BookRideButton";
 
+function computeDisplayedTotalCents(args: {
+  rideTotalCents: number | null | undefined;
+  paymentType?: string | null;
+  cashDiscountBps?: number | null;
+}) {
+  const rideTotal = typeof args.rideTotalCents === "number" ? args.rideTotalCents : 0;
+  const paymentType = (args.paymentType || "").toUpperCase();
+  const bps = typeof args.cashDiscountBps === "number" ? args.cashDiscountBps : 0;
+
+  if (paymentType === "CASH" && bps > 0) {
+    const discounted = Math.round(rideTotal * (1 - bps / 10000));
+    return Math.max(0, discounted);
+  }
+
+  return rideTotal;
+}
+
 export default async function Home() {
   const session = await getServerSession(authOptions);
-  const role = (session?.user as any)?.role as
-    | "RIDER"
-    | "DRIVER"
-    | undefined;
+  const role = (session?.user as any)?.role as "RIDER" | "DRIVER" | undefined;
 
-  // 🚩 NEW: only rides that are OPEN *and* have no ACCEPTED bookings
+  // Only rides that are OPEN and have no ACCEPTED booking
+  // Include the PENDING booking so we can show CASH vs CARD + discounted total correctly
   const rides = await prisma.ride.findMany({
     where: {
       status: "OPEN",
-      bookings: {
-        none: {
-          status: "ACCEPTED",
-        },
-      },
+      bookings: { none: { status: "ACCEPTED" } },
     },
     orderBy: { departureTime: "asc" },
     take: 10,
@@ -34,13 +45,19 @@ export default async function Home() {
           isVerifiedDriver: true,
         },
       },
+      bookings: {
+        where: { status: "PENDING" },
+        take: 1,
+        select: {
+          paymentType: true,
+          cashDiscountBps: true,
+        },
+      },
     },
   });
 
-  const showAvailableRidesSection =
-    !session || role === "DRIVER";
+  const showAvailableRidesSection = !session || role === "DRIVER";
 
-  // …keep the rest of your JSX exactly as you have it now
   return (
     <main className="min-h-[calc(100vh-4rem)] bg-slate-50">
       <div className="mx-auto max-w-6xl px-4 py-10 space-y-10">
@@ -61,14 +78,12 @@ export default async function Home() {
               safe and sustainable for everyone.
             </p>
 
-            {/* Membership “first month free” highlight */}
             <div className="mt-4 rounded-2xl border border-emerald-100 bg-emerald-50/70 p-4">
               <p className="text-xs font-semibold uppercase tracking-wide text-emerald-700">
                 Membership – first month free
               </p>
               <p className="mt-2 text-sm text-slate-800">
-                Both{" "}
-                <span className="font-semibold">driver</span> and{" "}
+                Both <span className="font-semibold">driver</span> and{" "}
                 <span className="font-semibold">rider</span> plans start with a{" "}
                 <span className="font-semibold text-emerald-700">
                   30-day free membership
@@ -82,28 +97,21 @@ export default async function Home() {
               </ul>
             </div>
 
-            {/* CTA buttons + membership selector for guests */}
             {!session && <MembershipSelector />}
 
-            {/* Pricing summary */}
             <div className="mt-6 rounded-2xl bg-white/90 border border-slate-100 p-4 shadow-sm">
               <h2 className="text-sm font-semibold text-slate-800 mb-1">
                 Pricing model
               </h2>
               <p className="text-sm text-slate-600">
                 Riders pay a{" "}
-                <span className="font-semibold text-slate-900">
-                  $3.00 booking fee
-                </span>{" "}
+                <span className="font-semibold text-slate-900">$3.00 booking fee</span>{" "}
                 plus{" "}
-                <span className="font-semibold text-slate-900">
-                  $2.00 per mile
-                </span>{" "}
+                <span className="font-semibold text-slate-900">$2.00 per mile</span>{" "}
                 for each trip.
               </p>
               <p className="mt-2 text-xs text-slate-500">
-                Example: a 10 mile trip costs $3.00 + (10 × $2.00) = $23.00
-                total for the ride.
+                Example: a 10 mile trip costs $3.00 + (10 × $2.00) = $23.00 total for the ride.
               </p>
             </div>
           </div>
@@ -112,19 +120,14 @@ export default async function Home() {
           <div className="md:justify-self-end">
             <div className="relative overflow-hidden rounded-3xl bg-gradient-to-br from-indigo-600 via-sky-500 to-emerald-400 p-[1px] shadow-lg">
               <div className="bg-slate-950/95 rounded-[22px] p-5 h-full">
-                <p className="text-xs font-medium text-slate-300 mb-3">
-                  Live example
-                </p>
+                <p className="text-xs font-medium text-slate-300 mb-3">Live example</p>
                 <div className="space-y-3 text-xs text-slate-200">
                   <div className="flex items-center justify-between">
                     <span>San Francisco → San Jose</span>
-                    <span className="font-semibold text-emerald-300">
-                      $105.00
-                    </span>
+                    <span className="font-semibold text-emerald-300">$105.00</span>
                   </div>
                   <p className="text-slate-400">
-                    51 miles · Total ride price: $3.00 booking + $102.00
-                    distance = $105.00.
+                    51 miles · Total ride price: $3.00 booking + $102.00 distance = $105.00.
                   </p>
                   <div className="mt-3 grid grid-cols-3 gap-2 text-[11px]">
                     <div className="rounded-xl bg-slate-900/70 border border-slate-800 p-2">
@@ -137,47 +140,47 @@ export default async function Home() {
                     </div>
                     <div className="rounded-xl bg-slate-900/70 border border-slate-800 p-2">
                       <p className="text-slate-400">Total</p>
-                      <p className="font-semibold text-emerald-300">
-                        $105.00
-                      </p>
+                      <p className="font-semibold text-emerald-300">$105.00</p>
                     </div>
                   </div>
                 </div>
                 <div className="mt-4 text-[11px] text-slate-500">
-                  Drivers see their earnings after platform fees in their
-                  dashboard.
+                  Drivers see their earnings after platform fees in their dashboard.
                 </div>
               </div>
             </div>
           </div>
         </section>
 
-        {/* Rider “Request a ride” – only for logged-in riders */}
-        {session && (role === "RIDER") && (
-          <RiderRequestFormHome />
-        )}
+        {/* Rider “Request a ride” */}
+        {session && role === "RIDER" && <RiderRequestFormHome />}
 
         {/* Available rides – guests + drivers */}
         {showAvailableRidesSection && (
           <section className="space-y-3">
-            <h2 className="text-xl font-semibold text-slate-900">
-              Available rides
-            </h2>
+            <h2 className="text-xl font-semibold text-slate-900">Available rides</h2>
+
             {rides.length === 0 ? (
               <p className="text-sm text-slate-600">
-                No rides are available yet. Drivers will see their upcoming trips
-                here once they start posting rides.
+                No rides are available yet. Drivers will see their upcoming trips here once they start posting rides.
               </p>
             ) : (
               <ul className="space-y-3">
                 {rides.map((ride) => {
                   const departure = new Date(ride.departureTime);
-                  const price =
-                    typeof ride.totalPriceCents === "number"
-                      ? ride.totalPriceCents / 100
-                      : 0;
-                  const passengerCount =
-                    (ride as any).passengerCount ?? 1;
+                  const pending = (ride as any).bookings?.[0] as
+                    | { paymentType?: string | null; cashDiscountBps?: number | null }
+                    | undefined;
+
+                  const displayTotalCents = computeDisplayedTotalCents({
+                    rideTotalCents: ride.totalPriceCents,
+                    paymentType: pending?.paymentType ?? null,
+                    cashDiscountBps: pending?.cashDiscountBps ?? null,
+                  });
+
+                  const price = displayTotalCents / 100;
+                  const passengerCount = (ride as any).passengerCount ?? 1;
+                  const payLabel = (pending?.paymentType || "CARD").toUpperCase();
 
                   return (
                     <li
@@ -188,22 +191,35 @@ export default async function Home() {
                         <p className="text-sm font-semibold text-slate-900">
                           {ride.originCity} → {ride.destinationCity}
                         </p>
+
                         <p className="text-xs text-slate-500">
-                          {departure.toLocaleString()} • {ride.distanceMiles}{" "}
-                          miles
+                          {departure.toLocaleString()} • {ride.distanceMiles} miles
                         </p>
+
                         <p className="mt-1 text-xs text-slate-500">
                           Driver:{" "}
                           <span className="font-medium text-slate-800">
                             {ride.driver?.name ?? "Unknown driver"}
-                          </span>{" "}
+                          </span>
                           {ride.driver?.isVerifiedDriver && (
                             <span className="ml-1 inline-flex items-center rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-semibold text-emerald-700">
                               Verified
                             </span>
                           )}
                         </p>
+
+                        <div className="mt-2 flex items-center gap-2">
+                          <span className="inline-flex items-center rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-semibold text-slate-700">
+                            Pay: {payLabel}
+                          </span>
+                          {payLabel === "CASH" && (pending?.cashDiscountBps ?? 0) > 0 && (
+                            <span className="inline-flex items-center rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-semibold text-emerald-700">
+                              CASH {(pending!.cashDiscountBps! / 100).toFixed(0)}% off
+                            </span>
+                          )}
+                        </div>
                       </div>
+
                       <div className="mt-2 flex items-center gap-3 md:mt-0">
                         <div className="text-right">
                           <p className="text-sm font-semibold text-slate-900">

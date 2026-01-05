@@ -24,7 +24,7 @@ export default async function handler(
         id?: string;
         name?: string | null;
         email?: string | null;
-        role?: "RIDER" | "DRIVER" | "BOTH";
+        role?: "RIDER" | "DRIVER";
       } & Record<string, unknown>)
     | undefined;
 
@@ -32,7 +32,7 @@ export default async function handler(
     return res.status(401).json({ ok: false, error: "Not authenticated" });
   }
 
-  if (user.role !== "DRIVER" && user.role !== "BOTH") {
+  if (user.role !== "DRIVER") {
     return res.status(403).json({ ok: false, error: "Not a driver" });
   }
 

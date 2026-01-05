@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useSearchParams } from "next/navigation";
 
 type ChatMessage = {
@@ -14,11 +14,40 @@ type ChatMessage = {
   };
 };
 
+function safeConversationId(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  return trimmed.length ? decodeURIComponent(trimmed) : null;
+}
+
+function markSeen(role: string | null, conversationId: string) {
+  // MVP: localStorage "last seen"
+  try {
+    const who = role === "driver" ? "driver" : role === "rider" ? "rider" : "user";
+    localStorage.setItem(`chat:lastSeen:${who}:${conversationId}`, new Date().toISOString());
+  } catch {
+    // ignore
+  }
+}
+
 export default function ChatPage() {
   const params = useParams<{ conversationId: string }>();
   const searchParams = useSearchParams();
 
-  const conversationId = params?.conversationId;
+  const conversationId = useMemo(
+    () => safeConversationId(params?.conversationId),
+    [params]
+  );
+
+  // Query params
+  const sp = searchParams ?? new URLSearchParams();
+  const isEmbedded = sp.get("embed") === "1";
+  const role = sp.get("role"); // "driver" | "rider" | null
+  const autoClose = sp.get("autoClose") === "1";
+  const prefill = sp.get("prefill") ?? "";
+  const isReadOnly = sp.get("readonly") === "1";
+
+  const canSend = useMemo(() => !isReadOnly, [isReadOnly]);
 
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
@@ -26,30 +55,27 @@ export default function ChatPage() {
   const [hadFirstLoad, setHadFirstLoad] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Query params (safe at build time)
-  const sp = searchParams ?? new URLSearchParams();
+  const pollRef = useRef<number | null>(null);
 
-  // Embed context
-  const isEmbedded = sp.get("embed") === "1";
-  const role = sp.get("role");
-  const autoClose = sp.get("autoClose") === "1";
-  const prefill = sp.get("prefill") ?? "";
+  // Mark seen as soon as chat opens (helps badge clear immediately)
+  useEffect(() => {
+    if (!conversationId) return;
+    markSeen(role, conversationId);
+  }, [conversationId, role]);
 
-  // Read-only mode
-  const isReadOnly = sp.get("readonly") === "1";
-
-  const canSend = useMemo(() => !isReadOnly, [isReadOnly]);
-
-  // Poll messages every 5 seconds
+  // Poll messages
   useEffect(() => {
     if (!conversationId) return;
 
     let cancelled = false;
-    let interval: NodeJS.Timeout;
 
     async function loadMessages() {
       try {
-        const res = await fetch(`/api/chat/${conversationId}`);
+        const res = await fetch(`/api/chat/${encodeURIComponent(conversationId)}`, {
+          method: "GET",
+          cache: "no-store",
+        });
+
         const data = await res.json().catch(() => null);
 
         if (!res.ok || !data?.ok) {
@@ -58,8 +84,12 @@ export default function ChatPage() {
         }
 
         if (!cancelled) {
-          setMessages(data.messages || []);
+          const next = (data.messages || []) as ChatMessage[];
+          setMessages(next);
           setError(null);
+
+          // If messages loaded successfully, also mark as seen again (keeps timestamp fresh)
+          markSeen(role, conversationId);
         }
       } catch {
         if (!cancelled) setError("Network error while loading chat.");
@@ -72,13 +102,20 @@ export default function ChatPage() {
     }
 
     loadMessages();
-    interval = setInterval(loadMessages, 5000);
+
+    // clear any existing interval
+    if (pollRef.current) window.clearInterval(pollRef.current);
+
+    pollRef.current = window.setInterval(loadMessages, 5000);
 
     return () => {
       cancelled = true;
-      clearInterval(interval);
+      if (pollRef.current) {
+        window.clearInterval(pollRef.current);
+        pollRef.current = null;
+      }
     };
-  }, [conversationId]);
+  }, [conversationId, role]);
 
   // Apply one-time prefill only after first load finished AND there are truly no messages
   useEffect(() => {
@@ -100,7 +137,7 @@ export default function ChatPage() {
     setInput("");
 
     try {
-      const res = await fetch(`/api/chat/${conversationId}`, {
+      const res = await fetch(`/api/chat/${encodeURIComponent(conversationId)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ body: text }),
@@ -113,13 +150,13 @@ export default function ChatPage() {
       }
 
       setMessages((prev) => [...prev, data.message]);
+      setError(null);
+
+      // When you send, you’ve definitely “seen” the chat
+      markSeen(role, conversationId);
 
       if (isEmbedded && role === "driver" && autoClose) {
-        if (
-          typeof window !== "undefined" &&
-          window.parent &&
-          window.parent !== window
-        ) {
+        if (window.parent && window.parent !== window) {
           window.parent.postMessage({ type: "ridechat:close" }, "*");
         }
       }
@@ -167,6 +204,7 @@ export default function ChatPage() {
                     marginBottom: 4,
                     display: "flex",
                     justifyContent: "space-between",
+                    gap: 12,
                   }}
                 >
                   <span>{m.sender.publicId || m.sender.name || "User"}</span>
@@ -174,7 +212,7 @@ export default function ChatPage() {
                     {new Date(m.createdAt).toLocaleTimeString()}
                   </span>
                 </div>
-                <div style={{ fontSize: 14 }}>{m.body}</div>
+                <div style={{ fontSize: 14, whiteSpace: "pre-wrap" }}>{m.body}</div>
               </li>
             ))}
           </ul>

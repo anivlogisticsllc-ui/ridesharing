@@ -2,9 +2,10 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { prisma } from "@/lib/prisma";
-import { RideStatus } from "@prisma/client";
+import { PaymentType, RideStatus } from "@prisma/client";
 import EmailReceiptButton from "./EmailReceiptButton";
 import PrintButton from "./PrintButton";
+import AutoPrint from "./AutoPrint";
 
 type Props = {
   params: Promise<{ bookingId: string }>;
@@ -15,8 +16,18 @@ function moneyFromCents(cents: number | null | undefined) {
   return (v / 100).toFixed(2);
 }
 
+function applyCashDiscount(baseCents: number, cashDiscountBps: number | null) {
+  const bps =
+    typeof cashDiscountBps === "number" && Number.isFinite(cashDiscountBps)
+      ? cashDiscountBps
+      : 0;
+
+  // 10000 bps = 100%
+  const multiplier = Math.max(0, 10000 - bps) / 10000;
+  return Math.round(baseCents * multiplier);
+}
+
 export default async function ReceiptPage({ params }: Props) {
-  // ✅ important: unwrap params
   const { bookingId } = await params;
   if (!bookingId) notFound();
 
@@ -29,6 +40,7 @@ export default async function ReceiptPage({ params }: Props) {
   });
 
   if (!booking?.ride) notFound();
+
   const ride = booking.ride;
 
   if (ride.status !== RideStatus.COMPLETED) {
@@ -48,11 +60,29 @@ export default async function ReceiptPage({ params }: Props) {
   }
 
   const distance = ride.distanceMiles ?? null;
-  const fare = ride.totalPriceCents ?? null;
+
+  const baseFareCents = ride.totalPriceCents ?? 0;
+  const paymentType = booking.paymentType ?? null;
+
+  // If your schema includes cashDiscountBps on Booking, keep this.
+  // Otherwise, this can safely stay null.
+  const cashDiscountBps = (booking as any).cashDiscountBps as number | null | undefined;
+
+  const isCash = paymentType === PaymentType.CASH;
+  const hasDiscount = isCash && (cashDiscountBps ?? 0) > 0;
+
+  const effectiveFareCents = hasDiscount
+    ? applyCashDiscount(baseFareCents, cashDiscountBps ?? null)
+    : baseFareCents;
+
+  const showDiscount = hasDiscount && effectiveFareCents !== baseFareCents;
 
   return (
     <main className="min-h-[calc(100vh-4rem)] bg-slate-50">
       <div className="mx-auto max-w-2xl space-y-6 px-4 py-10">
+        {/* ✅ Auto-print runs only when URL has ?autoprint=1 */}
+        <AutoPrint />
+
         <div className="flex items-start justify-between gap-4">
           <div>
             <h1 className="text-2xl font-semibold text-slate-900">Ride receipt</h1>
@@ -95,7 +125,7 @@ export default async function ReceiptPage({ params }: Props) {
             </div>
           </div>
 
-          <div className="mt-5 grid gap-4 sm:grid-cols-3">
+          <div className="mt-5 grid gap-4 sm:grid-cols-4">
             <div>
               <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Distance</p>
               <p className="mt-1 text-sm font-semibold text-slate-900">
@@ -104,16 +134,42 @@ export default async function ReceiptPage({ params }: Props) {
             </div>
 
             <div>
-              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Passengers</p>
-              <p className="mt-1 text-sm font-semibold text-slate-900">{ride.passengerCount}</p>
+              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                Passengers
+              </p>
+              <p className="mt-1 text-sm font-semibold text-slate-900">
+                {ride.passengerCount}
+              </p>
+            </div>
+
+            <div>
+              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Payment</p>
+              <p className="mt-1 text-sm font-semibold text-slate-900">
+                {paymentType ?? "n/a"}
+                {showDiscount ? (
+                  <span className="ml-2 text-xs text-emerald-700">
+                    ({Math.round((cashDiscountBps ?? 0) / 100)}% off)
+                  </span>
+                ) : null}
+              </p>
             </div>
 
             <div className="sm:text-right">
               <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Total</p>
               <p className="mt-1 text-lg font-semibold text-slate-900">
-                ${moneyFromCents(fare)}
+                ${moneyFromCents(effectiveFareCents)}
               </p>
-              <p className="text-[11px] text-slate-500">Stored as {fare ?? 0} cents</p>
+
+              {showDiscount && (
+                <p className="text-[11px] text-slate-500">
+                  Base ${moneyFromCents(baseFareCents)} → Discounted $
+                  {moneyFromCents(effectiveFareCents)}
+                </p>
+              )}
+
+              <p className="text-[11px] text-slate-500">
+                Stored base: {baseFareCents} cents
+              </p>
             </div>
           </div>
         </section>

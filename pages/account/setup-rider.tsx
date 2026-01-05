@@ -3,10 +3,9 @@ import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { useRouter } from "next/router";
 import { useSession } from "next-auth/react";
 
-type Role = "RIDER" | "DRIVER";
-
-function asRole(v: any): Role | null {
-  return v === "RIDER" || v === "DRIVER" ? v : null;
+type Role = "RIDER" | "DRIVER" | "ADMIN";
+function asRole(v: unknown): Role | null {
+  return v === "RIDER" || v === "DRIVER" || v === "ADMIN" ? v : null;
 }
 
 export default function RiderSetupPage() {
@@ -39,7 +38,9 @@ export default function RiderSetupPage() {
     }
 
     if (role !== "RIDER") {
+      // drivers/admins shouldn't be here
       router.replace("/account/setup-driver");
+      return;
     }
   }, [session, status, role, router]);
 
@@ -92,7 +93,9 @@ export default function RiderSetupPage() {
       }
 
       const redirectTo =
-        (data?.redirectTo && typeof data.redirectTo === "string" && data.redirectTo) ||
+        (data?.redirectTo &&
+          typeof data.redirectTo === "string" &&
+          data.redirectTo) ||
         "/billing/membership";
 
       router.push(redirectTo);
@@ -145,7 +148,8 @@ export default function RiderSetupPage() {
           Rider account setup
         </h1>
         <p style={{ fontSize: 14, marginBottom: 16 }}>
-          To use the platform, we need your basic address information. Your name from registration is shown below and can be updated later.
+          To use the platform, we need your basic address information. Your name
+          from registration is shown below and can be updated later.
         </p>
 
         {error && (
@@ -164,10 +168,23 @@ export default function RiderSetupPage() {
               background: "#fafafa",
             }}
           >
-            <h2 style={{ fontSize: 14, fontWeight: 600, marginBottom: 6, color: "#333" }}>
+            <h2
+              style={{
+                fontSize: 14,
+                fontWeight: 600,
+                marginBottom: 6,
+                color: "#333",
+              }}
+            >
               Profile
             </h2>
-            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 14 }}>
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                fontSize: 14,
+              }}
+            >
               <span style={{ color: "#666" }}>Name</span>
               <span style={{ fontWeight: 600 }}>{displayName}</span>
             </div>
@@ -177,12 +194,22 @@ export default function RiderSetupPage() {
           </section>
         )}
 
-        <h2 style={{ fontSize: 16, fontWeight: 600, marginBottom: 8, marginTop: 8 }}>
+        <h2
+          style={{
+            fontSize: 16,
+            fontWeight: 600,
+            marginBottom: 8,
+            marginTop: 8,
+          }}
+        >
           Address
         </h2>
 
         <div style={{ marginBottom: 10 }}>
-          <label htmlFor="addressLine1" style={{ display: "block", fontSize: 13, marginBottom: 4 }}>
+          <label
+            htmlFor="addressLine1"
+            style={{ display: "block", fontSize: 13, marginBottom: 4 }}
+          >
             Address line 1 *
           </label>
           <input
@@ -190,25 +217,48 @@ export default function RiderSetupPage() {
             name="addressLine1"
             type="text"
             required
-            style={{ width: "100%", padding: 6, borderRadius: 4, border: "1px solid #ccc" }}
+            style={{
+              width: "100%",
+              padding: 6,
+              borderRadius: 4,
+              border: "1px solid #ccc",
+            }}
           />
         </div>
 
         <div style={{ marginBottom: 10 }}>
-          <label htmlFor="addressLine2" style={{ display: "block", fontSize: 13, marginBottom: 4 }}>
+          <label
+            htmlFor="addressLine2"
+            style={{ display: "block", fontSize: 13, marginBottom: 4 }}
+          >
             Address line 2 (optional)
           </label>
           <input
             id="addressLine2"
             name="addressLine2"
             type="text"
-            style={{ width: "100%", padding: 6, borderRadius: 4, border: "1px solid #ccc" }}
+            style={{
+              width: "100%",
+              padding: 6,
+              borderRadius: 4,
+              border: "1px solid #ccc",
+            }}
           />
         </div>
 
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 120px", gap: 8, marginBottom: 10 }}>
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "1fr 120px",
+            gap: 8,
+            marginBottom: 10,
+          }}
+        >
           <div>
-            <label htmlFor="city" style={{ display: "block", fontSize: 13, marginBottom: 4 }}>
+            <label
+              htmlFor="city"
+              style={{ display: "block", fontSize: 13, marginBottom: 4 }}
+            >
               City *
             </label>
             <input
@@ -216,11 +266,19 @@ export default function RiderSetupPage() {
               name="city"
               type="text"
               required
-              style={{ width: "100%", padding: 6, borderRadius: 4, border: "1px solid #ccc" }}
+              style={{
+                width: "100%",
+                padding: 6,
+                borderRadius: 4,
+                border: "1px solid #ccc",
+              }}
             />
           </div>
           <div>
-            <label htmlFor="state" style={{ display: "block", fontSize: 13, marginBottom: 4 }}>
+            <label
+              htmlFor="state"
+              style={{ display: "block", fontSize: 13, marginBottom: 4 }}
+            >
               State *
             </label>
             <input
@@ -228,14 +286,29 @@ export default function RiderSetupPage() {
               name="state"
               type="text"
               required
-              style={{ width: "100%", padding: 6, borderRadius: 4, border: "1px solid #ccc" }}
+              style={{
+                width: "100%",
+                padding: 6,
+                borderRadius: 4,
+                border: "1px solid #ccc",
+              }}
             />
           </div>
         </div>
 
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 16 }}>
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "1fr 1fr",
+            gap: 8,
+            marginBottom: 16,
+          }}
+        >
           <div>
-            <label htmlFor="postalCode" style={{ display: "block", fontSize: 13, marginBottom: 4 }}>
+            <label
+              htmlFor="postalCode"
+              style={{ display: "block", fontSize: 13, marginBottom: 4 }}
+            >
               ZIP / Postal code *
             </label>
             <input
@@ -243,11 +316,19 @@ export default function RiderSetupPage() {
               name="postalCode"
               type="text"
               required
-              style={{ width: "100%", padding: 6, borderRadius: 4, border: "1px solid #ccc" }}
+              style={{
+                width: "100%",
+                padding: 6,
+                borderRadius: 4,
+                border: "1px solid #ccc",
+              }}
             />
           </div>
           <div>
-            <label htmlFor="country" style={{ display: "block", fontSize: 13, marginBottom: 4 }}>
+            <label
+              htmlFor="country"
+              style={{ display: "block", fontSize: 13, marginBottom: 4 }}
+            >
               Country
             </label>
             <input
@@ -255,7 +336,12 @@ export default function RiderSetupPage() {
               name="country"
               type="text"
               defaultValue="US"
-              style={{ width: "100%", padding: 6, borderRadius: 4, border: "1px solid #ccc" }}
+              style={{
+                width: "100%",
+                padding: 6,
+                borderRadius: 4,
+                border: "1px solid #ccc",
+              }}
             />
           </div>
         </div>

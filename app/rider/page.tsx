@@ -1,9 +1,8 @@
+// app/rider/page.tsx
 "use client";
 
 import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { useRouter } from "next/navigation";
-
-/* ---------- Local types (instead of @/lib/geoTypes) ---------- */
 
 type AddressSuggestion = {
   id: string;
@@ -23,9 +22,8 @@ type DistanceEstimateResponse = {
   error?: string;
 };
 
-/* ---------- Page-specific types ---------- */
-
 type DepartureMode = "ASAP" | "SCHEDULED";
+type PaymentChoice = "CARD" | "CASH";
 
 type AddressFields = {
   streetNumber: string;
@@ -49,8 +47,6 @@ type FormErrors = {
 const MIN_PASSENGERS = 1;
 const MAX_PASSENGERS = 6;
 
-/* ---------- Shared hooks / helpers ---------- */
-
 function useDebouncedValue<T>(value: T, delay: number) {
   const [debounced, setDebounced] = useState(value);
 
@@ -62,14 +58,32 @@ function useDebouncedValue<T>(value: T, delay: number) {
   return debounced;
 }
 
-/* ---------- Main rider request form (page component) ---------- */
+function buildDisplay(a: AddressFields) {
+  return [
+    a.streetNumber,
+    a.streetName,
+    a.city && `, ${a.city}`,
+    a.state && `, ${a.state}`,
+    a.zip && ` ${a.zip}`,
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+function makeClientRequestId() {
+  // Works in modern browsers; fallback for older
+  const anyCrypto = globalThis.crypto as any;
+  if (anyCrypto?.randomUUID) return anyCrypto.randomUUID();
+  return `cr_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
 
 export function RiderRequestFormHome() {
   const router = useRouter();
 
-  const [departureMode, setDepartureMode] =
-    useState<DepartureMode>("ASAP");
+  const [departureMode, setDepartureMode] = useState<DepartureMode>("ASAP");
   const [departureTime, setDepartureTime] = useState<string>("");
+
+  const [paymentType, setPaymentType] = useState<PaymentChoice>("CASH");
 
   const [pickup, setPickup] = useState<AddressFields>({
     streetNumber: "",
@@ -92,12 +106,8 @@ export function RiderRequestFormHome() {
   const [pickupQuery, setPickupQuery] = useState("");
   const [dropoffQuery, setDropoffQuery] = useState("");
 
-  const [pickupSuggestions, setPickupSuggestions] = useState<
-    AddressSuggestion[]
-  >([]);
-  const [dropoffSuggestions, setDropoffSuggestions] = useState<
-    AddressSuggestion[]
-  >([]);
+  const [pickupSuggestions, setPickupSuggestions] = useState<AddressSuggestion[]>([]);
+  const [dropoffSuggestions, setDropoffSuggestions] = useState<AddressSuggestion[]>([]);
 
   const [isEstimating, setIsEstimating] = useState(false);
   const [distanceMiles, setDistanceMiles] = useState<number | null>(null);
@@ -109,7 +119,6 @@ export function RiderRequestFormHome() {
   const debouncedPickupQuery = useDebouncedValue(pickupQuery, 250);
   const debouncedDropoffQuery = useDebouncedValue(dropoffQuery, 250);
 
-  // Fetch suggestions for pickup
   useEffect(() => {
     if (!debouncedPickupQuery.trim()) {
       setPickupSuggestions([]);
@@ -118,29 +127,23 @@ export function RiderRequestFormHome() {
 
     const controller = new AbortController();
 
-    const run = async () => {
+    (async () => {
       try {
         const res = await fetch(
-          `/api/geo/suggest?q=${encodeURIComponent(
-            debouncedPickupQuery
-          )}&limit=5`,
+          `/api/geo/suggest?q=${encodeURIComponent(debouncedPickupQuery)}&limit=5`,
           { signal: controller.signal }
         );
         if (!res.ok) return;
         const data: AddressSuggestion[] = await res.json();
         setPickupSuggestions(data);
       } catch (err) {
-        if ((err as any).name !== "AbortError") {
-          console.error("Pickup suggest error:", err);
-        }
+        if ((err as any).name !== "AbortError") console.error("Pickup suggest error:", err);
       }
-    };
+    })();
 
-    run();
     return () => controller.abort();
   }, [debouncedPickupQuery]);
 
-  // Fetch suggestions for dropoff
   useEffect(() => {
     if (!debouncedDropoffQuery.trim()) {
       setDropoffSuggestions([]);
@@ -149,55 +152,25 @@ export function RiderRequestFormHome() {
 
     const controller = new AbortController();
 
-    const run = async () => {
+    (async () => {
       try {
         const res = await fetch(
-          `/api/geo/suggest?q=${encodeURIComponent(
-            debouncedDropoffQuery
-          )}&limit=5`,
+          `/api/geo/suggest?q=${encodeURIComponent(debouncedDropoffQuery)}&limit=5`,
           { signal: controller.signal }
         );
         if (!res.ok) return;
         const data: AddressSuggestion[] = await res.json();
         setDropoffSuggestions(data);
       } catch (err) {
-        if ((err as any).name !== "AbortError") {
-          console.error("Dropoff suggest error:", err);
-        }
+        if ((err as any).name !== "AbortError") console.error("Dropoff suggest error:", err);
       }
-    };
+    })();
 
-    run();
     return () => controller.abort();
   }, [debouncedDropoffQuery]);
 
-  const pickupDisplay = useMemo(
-    () =>
-      [
-        pickup.streetNumber,
-        pickup.streetName,
-        pickup.city && `, ${pickup.city}`,
-        pickup.state && `, ${pickup.state}`,
-        pickup.zip && ` ${pickup.zip}`,
-      ]
-        .filter(Boolean)
-        .join(" "),
-    [pickup]
-  );
-
-  const dropoffDisplay = useMemo(
-    () =>
-      [
-        dropoff.streetNumber,
-        dropoff.streetName,
-        dropoff.city && `, ${dropoff.city}`,
-        dropoff.state && `, ${dropoff.state}`,
-        dropoff.zip && ` ${dropoff.zip}`,
-      ]
-        .filter(Boolean)
-        .join(" "),
-    [dropoff]
-  );
+  const pickupDisplay = useMemo(() => buildDisplay(pickup), [pickup]);
+  const dropoffDisplay = useMemo(() => buildDisplay(dropoff), [dropoff]);
 
   function handleSelectPickup(s: AddressSuggestion) {
     setPickup({
@@ -226,45 +199,21 @@ export function RiderRequestFormHome() {
     });
     setDropoffQuery(s.label);
     setDropoffSuggestions([]);
-    setErrors((prev) => ({
-      ...prev,
-      dropoff: undefined,
-      zipDropoff: undefined,
-    }));
+    setErrors((prev) => ({ ...prev, dropoff: undefined, zipDropoff: undefined }));
   }
 
   function validate(): boolean {
     const next: FormErrors = {};
 
     const hasPickupBasic =
-      pickup.streetNumber &&
-      pickup.streetName &&
-      pickup.city &&
-      pickup.state &&
-      pickup.zip;
-
-    if (!hasPickupBasic) {
-      next.pickup = "Pickup address is required.";
-    }
-
-    if (!/^\d{5}$/.test(pickup.zip.trim())) {
-      next.zipPickup = "Pickup ZIP must be 5 digits.";
-    }
+      pickup.streetNumber && pickup.streetName && pickup.city && pickup.state && pickup.zip;
+    if (!hasPickupBasic) next.pickup = "Pickup address is required.";
+    if (!/^\d{5}$/.test(pickup.zip.trim())) next.zipPickup = "Pickup ZIP must be 5 digits.";
 
     const hasDropoffBasic =
-      dropoff.streetNumber &&
-      dropoff.streetName &&
-      dropoff.city &&
-      dropoff.state &&
-      dropoff.zip;
-
-    if (!hasDropoffBasic) {
-      next.dropoff = "Dropoff address is required.";
-    }
-
-    if (!/^\d{5}$/.test(dropoff.zip.trim())) {
-      next.zipDropoff = "Dropoff ZIP must be 5 digits.";
-    }
+      dropoff.streetNumber && dropoff.streetName && dropoff.city && dropoff.state && dropoff.zip;
+    if (!hasDropoffBasic) next.dropoff = "Dropoff address is required.";
+    if (!/^\d{5}$/.test(dropoff.zip.trim())) next.zipDropoff = "Dropoff ZIP must be 5 digits.";
 
     if (
       !Number.isFinite(passengerCount) ||
@@ -283,9 +232,7 @@ export function RiderRequestFormHome() {
   }
 
   async function estimateDistanceIfReady() {
-    if (!pickup.lat || !pickup.lng || !dropoff.lat || !dropoff.lng) {
-      return;
-    }
+    if (!pickup.lat || !pickup.lng || !dropoff.lat || !dropoff.lng) return;
 
     setIsEstimating(true);
     setEstimateError(null);
@@ -319,52 +266,74 @@ export function RiderRequestFormHome() {
     }
   }
 
-  // Re-estimate when coords change
   useEffect(() => {
     estimateDistanceIfReady();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pickup.lat, pickup.lng, dropoff.lat, dropoff.lng]);
 
-  // Very basic pricing just for MVP UI
   const estimatedPrice = useMemo(() => {
     if (!distanceMiles || distanceMiles <= 0) return null;
-    const baseFare = 3; // $
-    const perMile = 2.25; // $
-    const passengersMultiplier = 1 + (passengerCount - 1) * 0.1;
-    const raw =
-      (baseFare + distanceMiles * perMile) * passengersMultiplier;
-    return Math.max(raw, baseFare);
-  }, [distanceMiles, passengerCount]);
+
+    // Keep it aligned with API pricing: base $3 + $2/mile (ignore passenger multiplier for now)
+    const baseFare = 3;
+    const perMile = 2;
+    const raw = baseFare + distanceMiles * perMile;
+
+    // If CASH selected, show the discount preview (10% -> 1000 bps)
+    const discounted = paymentType === "CASH" ? raw * 0.9 : raw;
+    return Math.max(discounted, baseFare);
+  }, [distanceMiles, paymentType]);
 
   async function handleSubmit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
     if (!validate()) return;
 
+    if (!distanceMiles || distanceMiles <= 0) {
+      setEstimateError("Distance estimate missing. Select both addresses.");
+      return;
+    }
+
+    if (!pickup.lat || !pickup.lng || !dropoff.lat || !dropoff.lng) {
+      setEstimateError("Missing coordinates. Pick from suggestions.");
+      return;
+    }
+
     setSubmitting(true);
 
     try {
+      const dt =
+        departureMode === "SCHEDULED"
+          ? new Date(departureTime)
+          : new Date();
+
       const res = await fetch("/api/rides", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          pickup,
-          dropoff,
+          clientRequestId: makeClientRequestId(),
+          originCity: pickupQuery || pickupDisplay,
+          destinationCity: dropoffQuery || dropoffDisplay,
+          originLat: pickup.lat,
+          originLng: pickup.lng,
+          destinationLat: dropoff.lat,
+          destinationLng: dropoff.lng,
+          departureTime: dt.toISOString(),
           passengerCount,
-          departureMode,
-          scheduledTime:
-            departureMode === "SCHEDULED" ? departureTime : null,
           distanceMiles,
+          paymentType, // "CASH" | "CARD"
         }),
       });
 
-      if (!res.ok) {
-        console.error("Create ride error:", await res.text());
-        alert("Something went wrong booking your ride.");
+      const data = await res.json().catch(() => null);
+
+      if (!res.ok || !data?.ok) {
+        console.error("Create ride error:", data);
+        alert(data?.error || "Something went wrong requesting your ride.");
         return;
       }
 
-      const { rideId } = await res.json();
-      router.push(`/rider/portal?highlight=${rideId}`);
+      const rideId = data.ride?.id;
+      router.push(rideId ? `/rider/portal?highlight=${rideId}` : "/rider/portal");
     } catch (err) {
       console.error("Create ride exception:", err);
       alert("Unexpected error booking ride.");
@@ -380,6 +349,31 @@ export function RiderRequestFormHome() {
     >
       <h1 className="text-xl font-semibold">Request a ride</h1>
 
+      {/* Payment */}
+      <div className="space-y-2">
+        <label className="block text-sm font-medium text-gray-700">Payment</label>
+        <div className="flex gap-2">
+          <button
+            type="button"
+            onClick={() => setPaymentType("CARD")}
+            className={`flex-1 rounded border px-3 py-2 text-sm ${
+              paymentType === "CARD" ? "border-black bg-black text-white" : "border-gray-300 bg-white"
+            }`}
+          >
+            Card
+          </button>
+          <button
+            type="button"
+            onClick={() => setPaymentType("CASH")}
+            className={`flex-1 rounded border px-3 py-2 text-sm ${
+              paymentType === "CASH" ? "border-black bg-black text-white" : "border-gray-300 bg-white"
+            }`}
+          >
+            Cash (10% off)
+          </button>
+        </div>
+      </div>
+
       {/* Departure mode */}
       <div className="space-y-2">
         <label className="block text-sm font-medium text-gray-700">
@@ -390,9 +384,7 @@ export function RiderRequestFormHome() {
             type="button"
             onClick={() => setDepartureMode("ASAP")}
             className={`flex-1 rounded border px-3 py-2 text-sm ${
-              departureMode === "ASAP"
-                ? "border-black bg-black text-white"
-                : "border-gray-300 bg-white"
+              departureMode === "ASAP" ? "border-black bg-black text-white" : "border-gray-300 bg-white"
             }`}
           >
             As soon as possible
@@ -401,14 +393,13 @@ export function RiderRequestFormHome() {
             type="button"
             onClick={() => setDepartureMode("SCHEDULED")}
             className={`flex-1 rounded border px-3 py-2 text-sm ${
-              departureMode === "SCHEDULED"
-                ? "border-black bg-black text-white"
-                : "border-gray-300 bg-white"
+              departureMode === "SCHEDULED" ? "border-black bg-black text-white" : "border-gray-300 bg-white"
             }`}
           >
             Schedule
           </button>
         </div>
+
         {departureMode === "SCHEDULED" && (
           <div className="mt-2">
             <input
@@ -416,17 +407,12 @@ export function RiderRequestFormHome() {
               value={departureTime}
               onChange={(e) => {
                 setDepartureTime(e.target.value);
-                setErrors((prev) => ({
-                  ...prev,
-                  departureTime: undefined,
-                }));
+                setErrors((prev) => ({ ...prev, departureTime: undefined }));
               }}
               className="w-full rounded border border-gray-300 px-3 py-2 text-sm"
             />
             {errors.departureTime && (
-              <p className="mt-1 text-xs text-red-600">
-                {errors.departureTime}
-              </p>
+              <p className="mt-1 text-xs text-red-600">{errors.departureTime}</p>
             )}
           </div>
         )}
@@ -434,9 +420,7 @@ export function RiderRequestFormHome() {
 
       {/* Pickup */}
       <div className="space-y-1">
-        <label className="block text-sm font-medium text-gray-700">
-          Pickup
-        </label>
+        <label className="block text-sm font-medium text-gray-700">Pickup</label>
         <input
           type="text"
           placeholder="Start typing your pickup address"
@@ -444,19 +428,10 @@ export function RiderRequestFormHome() {
           onChange={(e) => setPickupQuery(e.target.value)}
           className="w-full rounded border border-gray-300 px-3 py-2 text-sm"
         />
-        {pickupDisplay && (
-          <p className="text-xs text-gray-500">
-            Selected: {pickupDisplay}
-          </p>
-        )}
-        {errors.pickup && (
-          <p className="mt-1 text-xs text-red-600">{errors.pickup}</p>
-        )}
-        {errors.zipPickup && (
-          <p className="mt-1 text-xs text-red-600">
-            {errors.zipPickup}
-          </p>
-        )}
+        {pickupDisplay && <p className="text-xs text-gray-500">Selected: {pickupDisplay}</p>}
+        {errors.pickup && <p className="mt-1 text-xs text-red-600">{errors.pickup}</p>}
+        {errors.zipPickup && <p className="mt-1 text-xs text-red-600">{errors.zipPickup}</p>}
+
         {pickupSuggestions.length > 0 && (
           <ul className="mt-1 max-h-48 overflow-y-auto rounded border border-gray-200 bg-white text-sm shadow">
             {pickupSuggestions.map((s) => (
@@ -474,9 +449,7 @@ export function RiderRequestFormHome() {
 
       {/* Dropoff */}
       <div className="space-y-1">
-        <label className="block text-sm font-medium text-gray-700">
-          Destination
-        </label>
+        <label className="block text-sm font-medium text-gray-700">Destination</label>
         <input
           type="text"
           placeholder="Start typing your destination"
@@ -484,21 +457,10 @@ export function RiderRequestFormHome() {
           onChange={(e) => setDropoffQuery(e.target.value)}
           className="w-full rounded border border-gray-300 px-3 py-2 text-sm"
         />
-        {dropoffDisplay && (
-          <p className="text-xs text-gray-500">
-            Selected: {dropoffDisplay}
-          </p>
-        )}
-        {errors.dropoff && (
-          <p className="mt-1 text-xs text-red-600">
-            {errors.dropoff}
-          </p>
-        )}
-        {errors.zipDropoff && (
-          <p className="mt-1 text-xs text-red-600">
-            {errors.zipDropoff}
-          </p>
-        )}
+        {dropoffDisplay && <p className="text-xs text-gray-500">Selected: {dropoffDisplay}</p>}
+        {errors.dropoff && <p className="mt-1 text-xs text-red-600">{errors.dropoff}</p>}
+        {errors.zipDropoff && <p className="mt-1 text-xs text-red-600">{errors.zipDropoff}</p>}
+
         {dropoffSuggestions.length > 0 && (
           <ul className="mt-1 max-h-48 overflow-y-auto rounded border border-gray-200 bg-white text-sm shadow">
             {dropoffSuggestions.map((s) => (
@@ -516,25 +478,17 @@ export function RiderRequestFormHome() {
 
       {/* Passengers */}
       <div className="space-y-1">
-        <label className="block text-sm font-medium text-gray-700">
-          Passengers
-        </label>
+        <label className="block text-sm font-medium text-gray-700">Passengers</label>
         <input
           type="number"
           min={MIN_PASSENGERS}
           max={MAX_PASSENGERS}
           value={passengerCount}
-          onChange={(e) =>
-            setPassengerCount(
-              Number(e.target.value) || MIN_PASSENGERS
-            )
-          }
+          onChange={(e) => setPassengerCount(Number(e.target.value) || MIN_PASSENGERS)}
           className="w-24 rounded border border-gray-300 px-3 py-2 text-sm"
         />
         {errors.passengerCount && (
-          <p className="mt-1 text-xs text-red-600">
-            {errors.passengerCount}
-          </p>
+          <p className="mt-1 text-xs text-red-600">{errors.passengerCount}</p>
         )}
       </div>
 
@@ -544,19 +498,13 @@ export function RiderRequestFormHome() {
         {isEstimating && <p className="text-gray-500">Calculating…</p>}
         {!isEstimating && distanceMiles && (
           <>
-            <p>Distance: {distanceMiles.toFixed(1)} miles</p>
-            {estimatedPrice && (
-              <p>Estimated price: ${estimatedPrice.toFixed(2)}</p>
-            )}
+            <p>Distance: {distanceMiles.toFixed(2)} miles</p>
+            {estimatedPrice != null && <p>Estimated price: ${estimatedPrice.toFixed(2)}</p>}
           </>
         )}
-        {estimateError && (
-          <p className="mt-1 text-xs text-red-600">{estimateError}</p>
-        )}
+        {estimateError && <p className="mt-1 text-xs text-red-600">{estimateError}</p>}
         {!isEstimating && !distanceMiles && !estimateError && (
-          <p className="text-gray-500">
-            Select both pickup and destination to see an estimate.
-          </p>
+          <p className="text-gray-500">Select both pickup and destination to see an estimate.</p>
         )}
       </div>
 
@@ -571,7 +519,4 @@ export function RiderRequestFormHome() {
   );
 }
 
-/**
- * Default export so Next.js App Router recognizes this as the /rider page.
- */
 export default RiderRequestFormHome;

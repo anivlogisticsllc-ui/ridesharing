@@ -1,14 +1,11 @@
+// app/rider/portal/page.tsx
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
-type BookingStatus =
-  | "PENDING"
-  | "CONFIRMED"
-  | "COMPLETED"
-  | "CANCELLED"
-  | "EXPIRED";
+type BookingStatus = "PENDING" | "CONFIRMED" | "COMPLETED" | "CANCELLED" | "EXPIRED";
+type PaymentType = "CARD" | "CASH";
 
 type Booking = {
   id: string; // UI id (real booking id OR synthetic "ride-<rideId>")
@@ -25,28 +22,34 @@ type Booking = {
   conversationId: string | null;
   isRideOnly?: boolean;
 
-  // Receipt-related fields
   distanceMiles?: number | null;
-  totalPriceCents?: number | null;
   passengerCount?: number | null;
   tripStartedAt?: string | null;
   tripCompletedAt?: string | null;
+
+  paymentType?: PaymentType | null;
+  cashDiscountBps?: number | null;
+
+  baseTotalPriceCents?: number | null;
+  effectiveTotalPriceCents?: number | null;
+
+  // legacy fallback
+  totalPriceCents?: number | null;
 };
 
-type ApiResponse =
-  | { ok: true; bookings: Booking[] }
-  | { ok: false; error: string };
+type ApiResponse = { ok: true; bookings: Booking[] } | { ok: false; error: string };
 
 type ConversationNotification = {
   conversationId: string;
   latestMessageId: string | null;
   latestMessageCreatedAt: string | null;
+  latestMessageSenderId: string | null; // new
   senderType: "RIDER" | "DRIVER" | "UNKNOWN";
 };
 
 type CompletedFilter = "LAST_7" | "LAST_30" | "ALL" | "CUSTOM";
 
-/* ---------- Small helper functions ---------- */
+/* ---------- helpers ---------- */
 
 function safeDate(value: string | null | undefined): Date | null {
   if (!value) return null;
@@ -59,17 +62,85 @@ function formatMoney(cents: number) {
 }
 
 function isChatReadOnly(b: Booking): boolean {
-  // You can tweak this rule, but this is the typical one:
-  // - completed/cancelled/expired chats are read-only
-  // - in-route / upcoming are writable
-  const completed =
-    b.status === "COMPLETED" || b.rideStatus === "COMPLETED";
+  const completed = b.status === "COMPLETED" || b.rideStatus === "COMPLETED";
   const cancelledLike = b.status === "CANCELLED" || b.status === "EXPIRED";
   return completed || cancelledLike;
 }
 
+function getEffectiveFareCents(b: Booking): number | null {
+  if (typeof b.effectiveTotalPriceCents === "number") return b.effectiveTotalPriceCents;
+  if (typeof b.totalPriceCents === "number") return b.totalPriceCents;
+  if (typeof b.baseTotalPriceCents === "number") return b.baseTotalPriceCents;
+  return null;
+}
+
+// Dedupe: prefer real booking over ride-only
+function dedupeByRideId(list: Booking[]): Booking[] {
+  const map = new Map<string, Booking>();
+
+  for (const b of list) {
+    const existing = map.get(b.rideId);
+    if (!existing) {
+      map.set(b.rideId, b);
+      continue;
+    }
+
+    const aHasBooking = !!existing.bookingId;
+    const bHasBooking = !!b.bookingId;
+
+    if (bHasBooking && !aHasBooking) {
+      map.set(b.rideId, b);
+      continue;
+    }
+    if (aHasBooking && !bHasBooking) continue;
+
+    const score = (x: Booking) => {
+      if (x.status === "COMPLETED" || x.rideStatus === "COMPLETED") return 30;
+      if (x.rideStatus === "IN_ROUTE") return 20;
+      if (x.status === "CONFIRMED") return 10;
+      return 0;
+    };
+
+    if (score(b) > score(existing)) map.set(b.rideId, b);
+  }
+
+  return Array.from(map.values());
+}
+
+function PaymentBadge(props: { paymentType?: PaymentType | null; cashDiscountBps?: number | null }) {
+  const pt = props.paymentType ?? null;
+  const bps = props.cashDiscountBps ?? 0;
+
+  if (!pt) return null;
+
+  const isCash = pt === "CASH";
+  const percent = isCash && bps ? Math.round(bps / 100) : 0;
+
+  return (
+    <span
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 6,
+        padding: "2px 8px",
+        borderRadius: 999,
+        fontSize: 11,
+        fontWeight: 650,
+        border: "1px solid " + (isCash ? "#bbf7d0" : "#d1d5db"),
+        background: isCash ? "#ecfdf5" : "#f9fafb",
+        color: isCash ? "#166534" : "#111827",
+        marginTop: 6,
+      }}
+      title={isCash ? "Cash payment (discount applies)" : "Card payment"}
+    >
+      {pt}
+      {isCash && percent > 0 ? <span style={{ fontWeight: 600, color: "#166534" }}>{percent}% off</span> : null}
+    </span>
+  );
+}
+
 /* ============================================
- *           MAIN RIDER PORTAL PAGE
+ *              MAIN PAGE
  * ==========================================*/
 
 export default function RiderPortalPage() {
@@ -77,222 +148,269 @@ export default function RiderPortalPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  // id used for API calls:
-  // - real booking id (for normal bookings)
-  // - "ride-<rideId>" (for ride-only "request pending" entries)
   const [actionBusyId, setActionBusyId] = useState<string | null>(null);
   const [receiptBusyId, setReceiptBusyId] = useState<string | null>(null);
 
-  const [expandedBookingId, setExpandedBookingId] = useState<string | null>(
-    null
-  );
+  const [expandedBookingId, setExpandedBookingId] = useState<string | null>(null);
 
-  const [activeChat, setActiveChat] = useState<{
-    conversationId: string;
-    readOnly: boolean;
-  } | null>(null);
+  const [activeChat, setActiveChat] = useState<{ conversationId: string; readOnly: boolean } | null>(null);
 
-  const [chatNotifications, setChatNotifications] = useState<
-    Record<string, number>
-  >({});
-  const [lastSeenMessageId, setLastSeenMessageId] = useState<
-    Record<string, string | null>
-  >({});
+  const [chatNotifications, setChatNotifications] = useState<Record<string, number>>({});
+  const [lastSeenMessageId, setLastSeenMessageId] = useState<Record<string, string | null>>({});
+
+  const lastSeenRef = useRef<Record<string, string | null>>({});
+  const activeChatRef = useRef<{ conversationId: string; readOnly: boolean } | null>(null);
+  const bookingsIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const chatIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const [toastMessage, setToastMessage] = useState<string | null>(null);
-  const [toastVariant, setToastVariant] = useState<"success" | "error">(
-    "success"
-  );
+  const [toastVariant, setToastVariant] = useState<"success" | "error">("success");
 
-  // UI state: tabs & completed filters
-  const [activeTab, setActiveTab] = useState<"UPCOMING" | "COMPLETED">(
-    "UPCOMING"
-  );
-  const [completedFilter, setCompletedFilter] =
-    useState<CompletedFilter>("LAST_30");
+  const [activeTab, setActiveTab] = useState<"UPCOMING" | "COMPLETED">("UPCOMING");
+  const [completedFilter, setCompletedFilter] = useState<CompletedFilter>("LAST_30");
   const [customFrom, setCustomFrom] = useState("");
   const [customTo, setCustomTo] = useState("");
   const [completedSearch, setCompletedSearch] = useState("");
+  const [customFromDraft, setCustomFromDraft] = useState("");
+  const [customToDraft, setCustomToDraft] = useState("");
 
-  /* ---------- Load bookings + lightweight polling ---------- */
+  useEffect(() => {
+    activeChatRef.current = activeChat;
+  }, [activeChat]);
+
+  useEffect(() => {
+    lastSeenRef.current = lastSeenMessageId;
+  }, [lastSeenMessageId]);
+
+  /* ---------- Load bookings (initial + light polling) ---------- */
+
+  async function refreshBookings(opts?: { silent?: boolean }) {
+    const silent = opts?.silent ?? false;
+
+    try {
+      if (!silent) {
+        setLoading(true);
+        setError(null);
+      }
+
+      const res = await fetch("/api/rider/bookings", { method: "GET" });
+      if (!res.ok) {
+        const text = await res.text().catch(() => "");
+        if (!silent) setError(`Failed to load bookings. Status ${res.status}: ${text || "Unknown error"}`);
+        return;
+      }
+
+      const data: ApiResponse = await res.json();
+      if (!data.ok) {
+        if (!silent) setError(data.error || "Failed to load bookings");
+        return;
+      }
+
+      setBookings(dedupeByRideId(data.bookings));
+    } catch (err) {
+      console.error("Error fetching rider bookings:", err);
+      if (!silent) setError("Unexpected error while loading bookings");
+    } finally {
+      if (!silent) setLoading(false);
+    }
+  }
 
   useEffect(() => {
     let cancelled = false;
 
-    async function load() {
-      try {
-        if (!cancelled) {
-          setLoading(true);
-          setError(null);
-        }
+    (async () => {
+      if (cancelled) return;
+      await refreshBookings({ silent: false });
+    })();
 
-        const res = await fetch("/api/rider/bookings", { method: "GET" });
-
-        if (!res.ok) {
-          const text = await res.text();
-          if (!cancelled) {
-            setError(
-              `Failed to load bookings. Status ${res.status}: ${
-                text || "Unknown error"
-              }`
-            );
-          }
-          return;
-        }
-
-        const data: ApiResponse = await res.json();
-        if (!data.ok) {
-          if (!cancelled) setError(data.error || "Failed to load bookings");
-          return;
-        }
-
-        if (!cancelled) setBookings(data.bookings);
-      } catch (err) {
-        console.error("Error fetching rider bookings:", err);
-        if (!cancelled) setError("Unexpected error while loading bookings");
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    }
-
-    load();
-    const intervalId = setInterval(load, 10_000);
+    bookingsIntervalRef.current = setInterval(() => {
+      refreshBookings({ silent: true });
+    }, 25_000);
 
     return () => {
       cancelled = true;
-      clearInterval(intervalId);
+      if (bookingsIntervalRef.current) clearInterval(bookingsIntervalRef.current);
+      bookingsIntervalRef.current = null;
     };
   }, []);
 
-  /* ---------- Poll chat notifications ---------- */
+/* ---------- Poll chat notifications ---------- */
 
-  useEffect(() => {
-    let cancelled = false;
-    let intervalId: any = null;
+useEffect(() => {
+  let cancelled = false;
 
-    async function poll() {
-      try {
-        const res = await fetch("/api/rider/chat-notifications");
-        if (!res.ok) return;
+  async function pollChat() {
+    try {
+      const res = await fetch("/api/rider/chat-notifications", { method: "GET" });
+      if (!res.ok) return;
 
-        const data = (await res.json()) as
-          | { ok: true; notifications: ConversationNotification[] }
-          | { ok: false; error: string };
+      const data = (await res.json()) as
+        | { ok: true; notifications: ConversationNotification[] }
+        | { ok: false; error: string };
 
-        if (!("ok" in data) || !data.ok || cancelled) return;
+      if (cancelled || !data.ok) return;
 
-        const notificationsRaw = data.notifications;
-        const badgeMap: Record<string, number> = {};
+      const notifications = data.notifications || [];
+      const activeConvId = activeChatRef.current?.conversationId ?? null;
 
-        setLastSeenMessageId((prev) => {
-          const next: Record<string, string | null> = { ...prev };
+      // "Seen" means: last message id rider has acknowledged by opening/viewing chat.
+      const seenMap = lastSeenRef.current || {};
 
-          for (const n of notificationsRaw) {
-            const convId = n.conversationId;
-            const newId = n.latestMessageId;
-            const prevId = prev[convId];
+      // Keep badges sticky: once unread=1, it stays 1 until rider opens chat.
+      setChatNotifications((prev) => {
+        let changed = false;
+        const next = { ...prev };
 
-            if (!newId) {
-              if (!(convId in next)) next[convId] = null;
-              continue;
+        for (const n of notifications) {
+          const convId = n.conversationId;
+          const latestId = n.latestMessageId ?? null;
+
+          // If chat is open for this conversation, always clear.
+          if (activeConvId && convId === activeConvId) {
+            if ((next[convId] ?? 0) !== 0) {
+              next[convId] = 0;
+              changed = true;
             }
-
-            const isNewDriverMessage =
-              n.senderType === "DRIVER" && newId !== prevId;
-
-            if (isNewDriverMessage) {
-              badgeMap[convId] = 1;
-            } else if (badgeMap[convId] == null) {
-              badgeMap[convId] = 0;
-            }
-
-            next[convId] = newId;
+            continue;
           }
 
-          return next;
-        });
+          // If there is no latest message, no unread.
+          if (!latestId) {
+            if ((next[convId] ?? 0) !== 0) {
+              next[convId] = 0;
+              changed = true;
+            }
+            continue;
+          }
 
-        if (!cancelled) {
-          setChatNotifications((prevBadges) => ({
-            ...prevBadges,
-            ...badgeMap,
-          }));
+          const lastSeenId = seenMap[convId] ?? null;
+
+          // Only mark unread when:
+          // - latest message is from DRIVER
+          // - rider has not seen that message id yet
+          const shouldBeUnread =
+            n.senderType === "DRIVER" &&
+            latestId !== lastSeenId;
+
+          if (shouldBeUnread) {
+            if ((next[convId] ?? 0) !== 1) {
+              next[convId] = 1;
+              changed = true;
+            }
+          } else {
+            // IMPORTANT:
+            // Do NOT force-clear if it's currently unread.
+            // Example: driver sent msg (unread=1), rider replies (latest sender becomes RIDER),
+            // but rider still hasn't opened chat -> keep unread badge.
+            if ((next[convId] ?? 0) === 1) {
+              // keep as-is
+            } else if ((next[convId] ?? 0) !== 0) {
+              next[convId] = 0;
+              changed = true;
+            } else {
+              // already 0
+            }
+          }
         }
-      } catch (err) {
-        console.error("Error polling chat notifications:", err);
+
+        return changed ? next : prev;
+      });
+
+      // Mark seen only while actively viewing the chat (optional but recommended)
+      if (activeConvId) {
+        const active = notifications.find((n) => n.conversationId === activeConvId);
+        const latestId = active?.latestMessageId ?? null;
+
+        if (latestId && (seenMap[activeConvId] ?? null) !== latestId) {
+          const nextSeen = { ...seenMap, [activeConvId]: latestId };
+          lastSeenRef.current = nextSeen;
+          setLastSeenMessageId(nextSeen);
+        }
       }
+    } catch (err) {
+      console.error("Error polling chat notifications:", err);
     }
+  }
 
-    poll();
-    intervalId = setInterval(poll, 8000);
+  pollChat();
+  chatIntervalRef.current = setInterval(pollChat, 8_000);
 
-    return () => {
-      cancelled = true;
-      if (intervalId) clearInterval(intervalId);
-    };
-  }, []);
+  return () => {
+    cancelled = true;
+    if (chatIntervalRef.current) clearInterval(chatIntervalRef.current);
+    chatIntervalRef.current = null;
+  };
+}, []);
 
-  /* ---------- Derived sets (with sorting) ---------- */
 
-  const isCompletedBooking = (b: Booking) =>
-    b.status === "COMPLETED" || b.rideStatus === "COMPLETED";
 
-  const isCancelledLike = (b: Booking) =>
-    b.status === "CANCELLED" || b.status === "EXPIRED";
+  /* ---------- Unified openChat handler ---------- */
 
-  const now = useMemo(() => new Date(), []);
+  function openChat(conversationId: string, readOnly: boolean) {
+    setActiveChat({ conversationId, readOnly });
+
+    // Clear the badge immediately
+    setChatNotifications((prev) => ({ ...prev, [conversationId]: 0 }));
+
+    // Mark as "seen" when opening chat:
+    // We don't have the latest message id here directly.
+    // Two options:
+    //  1) Keep it as-is and let the next poll (active chat) mark seen to latestId (recommended).
+    //  2) Or, if you store "last known latest id" separately, set it here.
+    //
+    // We'll do option #1 cleanly: keep lastSeen as-is on open,
+    // and the poll (active chat branch) will update lastSeen to the current latestId.
+  }
+
+
+  /* ---------- Derived sets ---------- */
+
+  const isCompletedBooking = (b: Booking) => b.status === "COMPLETED" || b.rideStatus === "COMPLETED";
+  const isCancelledLike = (b: Booking) => b.status === "CANCELLED" || b.status === "EXPIRED";
+  const now = new Date();
 
   const { activeRides, upcoming, completed } = useMemo(() => {
     const active = bookings.filter((b) => b.rideStatus === "IN_ROUTE");
 
     const upcomingRaw = bookings.filter(
-      (b) =>
-        !isCompletedBooking(b) &&
-        !isCancelledLike(b) &&
-        b.rideStatus !== "IN_ROUTE"
+      (b) => !isCompletedBooking(b) && !isCancelledLike(b) && b.rideStatus !== "IN_ROUTE"
     );
 
     const completedRaw = bookings.filter(isCompletedBooking);
 
-    active.sort((a, b) => {
-      const da = safeDate(a.departureTime)?.getTime() ?? 0;
-      const db = safeDate(b.departureTime)?.getTime() ?? 0;
-      return da - db;
-    });
-
-    upcomingRaw.sort((a, b) => {
-      const da = safeDate(a.departureTime)?.getTime() ?? 0;
-      const db = safeDate(b.departureTime)?.getTime() ?? 0;
-      return da - db;
-    });
-
+    active.sort((a, b) => (safeDate(a.departureTime)?.getTime() ?? 0) - (safeDate(b.departureTime)?.getTime() ?? 0));
+    upcomingRaw.sort(
+      (a, b) => (safeDate(a.departureTime)?.getTime() ?? 0) - (safeDate(b.departureTime)?.getTime() ?? 0)
+    );
     completedRaw.sort((a, b) => {
-      const da =
-        safeDate(a.tripCompletedAt || a.departureTime)?.getTime() ?? 0;
-      const db =
-        safeDate(b.tripCompletedAt || b.departureTime)?.getTime() ?? 0;
+      const da = safeDate(a.tripCompletedAt || a.departureTime)?.getTime() ?? 0;
+      const db = safeDate(b.tripCompletedAt || b.departureTime)?.getTime() ?? 0;
       return db - da;
     });
 
-    return {
-      activeRides: active,
-      upcoming: upcomingRaw,
-      completed: completedRaw,
-    };
+    return { activeRides: active, upcoming: upcomingRaw, completed: completedRaw };
   }, [bookings]);
 
-  const cancelledCount = useMemo(
-    () => bookings.filter((b) => b.status === "CANCELLED").length,
-    [bookings]
-  );
-
+  const cancelledCount = useMemo(() => bookings.filter((b) => b.status === "CANCELLED").length, [bookings]);
   const total = bookings.length;
 
-  /* ---------- Completed list filters & stats ---------- */
+  /* ---------- Completed filters & stats ---------- */
+
+  function applyCustomRange() {
+    setCompletedFilter("CUSTOM");
+    setCustomFrom(customFromDraft);
+    setCustomTo(customToDraft);
+  }
+
+  function clearCustomRange() {
+    setCustomFromDraft("");
+    setCustomToDraft("");
+    setCustomFrom("");
+    setCustomTo("");
+  }
 
   function inDateRange(b: Booking): boolean {
-    const completedDate =
-      safeDate(b.tripCompletedAt) || safeDate(b.departureTime);
+    const completedDate = safeDate(b.tripCompletedAt) || safeDate(b.departureTime);
     if (!completedDate) return true;
 
     if (completedFilter === "LAST_7") {
@@ -334,12 +452,10 @@ export default function RiderPortalPage() {
     () =>
       completed.filter((b) => {
         if (!inDateRange(b)) return false;
-
         if (normalizedSearch) {
           const text = `${b.originCity} ${b.destinationCity}`.toLowerCase();
           if (!text.includes(normalizedSearch)) return false;
         }
-
         return true;
       }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -347,30 +463,23 @@ export default function RiderPortalPage() {
   );
 
   const totalCompletedShown = filteredCompleted.length;
-  const totalMiles = filteredCompleted.reduce(
-    (sum, b) => sum + (b.distanceMiles ?? 0),
-    0
-  );
-  const totalFareCents = filteredCompleted.reduce(
-    (sum, b) => sum + (b.totalPriceCents ?? 0),
-    0
-  );
+  const totalMiles = filteredCompleted.reduce((sum, b) => sum + (b.distanceMiles ?? 0), 0);
+
+  const totalFareCents = filteredCompleted.reduce((sum, b) => {
+    const cents = getEffectiveFareCents(b);
+    return sum + (cents ?? 0);
+  }, 0);
+
   const avgMiles = totalCompletedShown ? totalMiles / totalCompletedShown : 0;
 
   /* ---------- Actions ---------- */
 
-  async function handleAction(
-    bookingOrRideId: string,
-    action: "cancel" | "complete"
-  ) {
+  async function handleAction(bookingOrRideId: string, action: "cancel" | "complete") {
     try {
       setActionBusyId(bookingOrRideId);
       setError(null);
 
-      const endpoint =
-        action === "cancel"
-          ? "/api/rider/bookings/cancel"
-          : "/api/rider/bookings/complete";
+      const endpoint = action === "cancel" ? "/api/rider/bookings/cancel" : "/api/rider/bookings/complete";
 
       const res = await fetch(endpoint, {
         method: "POST",
@@ -378,42 +487,14 @@ export default function RiderPortalPage() {
         body: JSON.stringify({ bookingId: bookingOrRideId }),
       });
 
-      if (!res.ok) {
-        let msg = `Failed to ${action} booking.`;
-        try {
-          const data = await res.json();
-          if (data?.error) msg = data.error;
-        } catch {
-          // ignore
-        }
-        setError(msg);
-        return;
-      }
+      const data: any = await res.json().catch(() => null);
 
-      const data: any = await res.json();
-      if (!data?.ok) {
+      if (!res.ok || !data?.ok) {
         setError(data?.error || `Failed to ${action} booking.`);
         return;
       }
 
-      if (action === "cancel" && bookingOrRideId.startsWith("ride-")) {
-        setBookings((prev) => prev.filter((b) => b.id !== bookingOrRideId));
-        return;
-      }
-
-      setBookings((prev) =>
-        prev.map((b) =>
-          b.bookingId === bookingOrRideId
-            ? {
-                ...b,
-                status:
-                  action === "cancel"
-                    ? ("CANCELLED" as BookingStatus)
-                    : ("COMPLETED" as BookingStatus),
-              }
-            : b
-        )
-      );
+      await refreshBookings({ silent: true });
     } catch (err) {
       console.error(`Error trying to ${action} booking:`, err);
       setError(`Unexpected error while trying to ${action} booking.`);
@@ -461,26 +542,25 @@ export default function RiderPortalPage() {
     if (!filteredCompleted.length) return;
 
     const rows: string[][] = [
-      [
-        "Ride ID",
-        "Booking ID",
-        "From",
-        "To",
-        "Departure",
-        "Distance (miles)",
-        "Total price",
-        "Passengers",
-      ],
-      ...filteredCompleted.map((b) => [
-        b.rideId,
-        b.bookingId ?? "",
-        b.originCity,
-        b.destinationCity,
-        new Date(b.departureTime).toLocaleString(),
-        b.distanceMiles != null ? b.distanceMiles.toFixed(2) : "",
-        b.totalPriceCents != null ? `$${formatMoney(b.totalPriceCents)}` : "",
-        b.passengerCount != null ? String(b.passengerCount) : "",
-      ]),
+      ["Ride ID", "Booking ID", "From", "To", "Departure", "Distance (miles)", "Payment", "Base price", "Effective price", "Passengers"],
+      ...filteredCompleted.map((b) => {
+        const base = typeof b.baseTotalPriceCents === "number" ? `$${formatMoney(b.baseTotalPriceCents)}` : "";
+        const effCents = getEffectiveFareCents(b);
+        const eff = typeof effCents === "number" ? `$${formatMoney(effCents)}` : "";
+
+        return [
+          b.rideId,
+          b.bookingId ?? "",
+          b.originCity,
+          b.destinationCity,
+          new Date(b.departureTime).toLocaleString(),
+          b.distanceMiles != null ? b.distanceMiles.toFixed(2) : "",
+          b.paymentType ?? "",
+          base,
+          eff,
+          b.passengerCount != null ? String(b.passengerCount) : "",
+        ];
+      }),
     ];
 
     const csv = rows
@@ -527,12 +607,9 @@ export default function RiderPortalPage() {
         }}
       >
         <div>
-          <h1 style={{ fontSize: 30, fontWeight: 650, marginBottom: 6 }}>
-            Rider portal
-          </h1>
+          <h1 style={{ fontSize: 30, fontWeight: 650, marginBottom: 6 }}>Rider portal</h1>
           <p style={{ margin: 0, color: "#555", maxWidth: 520, fontSize: 14 }}>
-            Track your upcoming and completed rides, chat with drivers, and
-            manage your trips.
+            Track your upcoming and completed rides, chat with drivers, and manage your trips.
           </p>
         </div>
 
@@ -584,10 +661,7 @@ export default function RiderPortalPage() {
       )}
 
       {loading && <p>Loading your bookings...</p>}
-
-      {!loading && error && (
-        <p style={{ color: "red", marginBottom: 16 }}>{error}</p>
-      )}
+      {!loading && error && <p style={{ color: "red", marginBottom: 16 }}>{error}</p>}
 
       {!loading && !error && (
         <>
@@ -611,10 +685,7 @@ export default function RiderPortalPage() {
                 cursor: "pointer",
                 fontWeight: activeTab === "UPCOMING" ? 600 : 500,
                 color: activeTab === "UPCOMING" ? "#111827" : "#6b7280",
-                borderBottom:
-                  activeTab === "UPCOMING"
-                    ? "2px solid #111827"
-                    : "2px solid transparent",
+                borderBottom: activeTab === "UPCOMING" ? "2px solid #111827" : "2px solid transparent",
               }}
             >
               Upcoming ({upcoming.length})
@@ -629,10 +700,7 @@ export default function RiderPortalPage() {
                 cursor: "pointer",
                 fontWeight: activeTab === "COMPLETED" ? 600 : 500,
                 color: activeTab === "COMPLETED" ? "#111827" : "#6b7280",
-                borderBottom:
-                  activeTab === "COMPLETED"
-                    ? "2px solid #111827"
-                    : "2px solid transparent",
+                borderBottom: activeTab === "COMPLETED" ? "2px solid #111827" : "2px solid transparent",
               }}
             >
               Completed ({completed.length})
@@ -643,11 +711,7 @@ export default function RiderPortalPage() {
             <section>
               <SectionHeader
                 title="Upcoming rides"
-                subtitle={
-                  activeRides.length > 0
-                    ? "Your active and upcoming rides."
-                    : "Your next rides."
-                }
+                subtitle={activeRides.length > 0 ? "Your active and upcoming rides." : "Your next rides."}
               />
 
               {activeRides.length > 0 && (
@@ -682,9 +746,7 @@ export default function RiderPortalPage() {
                 <>
                   {activeRides.length > 0 && (
                     <>
-                      <h3 style={{ margin: "8px 0 4px", fontSize: 14, fontWeight: 600 }}>
-                        Active ride
-                      </h3>
+                      <h3 style={{ margin: "8px 0 4px", fontSize: 14, fontWeight: 600 }}>Active ride</h3>
 
                       <RideList
                         bookings={activeRides}
@@ -694,16 +756,8 @@ export default function RiderPortalPage() {
                         onComplete={(bookingId) => handleAction(bookingId, "complete")}
                         actionBusyId={actionBusyId}
                         expandedBookingId={expandedBookingId}
-                        onToggleExpand={(id) =>
-                          setExpandedBookingId((curr) => (curr === id ? null : id))
-                        }
-                        onOpenChat={(conversationId, readOnly) => {
-                          setActiveChat({ conversationId, readOnly });
-                          setChatNotifications((prev) => ({
-                            ...prev,
-                            [conversationId]: 0,
-                          }));
-                        }}
+                        onToggleExpand={(id) => setExpandedBookingId((curr) => (curr === id ? null : id))}
+                        onOpenChat={openChat}
                         chatNotifications={chatNotifications}
                         onResendReceipt={handleResendReceipt}
                         receiptBusyId={receiptBusyId}
@@ -715,9 +769,7 @@ export default function RiderPortalPage() {
 
                   {upcoming.length > 0 && (
                     <>
-                      <h3 style={{ margin: "8px 0 4px", fontSize: 14, fontWeight: 600 }}>
-                        Upcoming rides
-                      </h3>
+                      <h3 style={{ margin: "8px 0 4px", fontSize: 14, fontWeight: 600 }}>Upcoming rides</h3>
 
                       <RideList
                         bookings={upcoming}
@@ -727,16 +779,8 @@ export default function RiderPortalPage() {
                         onComplete={(bookingId) => handleAction(bookingId, "complete")}
                         actionBusyId={actionBusyId}
                         expandedBookingId={expandedBookingId}
-                        onToggleExpand={(id) =>
-                          setExpandedBookingId((curr) => (curr === id ? null : id))
-                        }
-                        onOpenChat={(conversationId, readOnly) => {
-                          setActiveChat({ conversationId, readOnly });
-                          setChatNotifications((prev) => ({
-                            ...prev,
-                            [conversationId]: 0,
-                          }));
-                        }}
+                        onToggleExpand={(id) => setExpandedBookingId((curr) => (curr === id ? null : id))}
+                        onOpenChat={openChat}
                         chatNotifications={chatNotifications}
                         onResendReceipt={handleResendReceipt}
                         receiptBusyId={receiptBusyId}
@@ -750,10 +794,7 @@ export default function RiderPortalPage() {
 
           {activeTab === "COMPLETED" && (
             <section>
-              <SectionHeader
-                title="Completed rides"
-                subtitle="Your ride history and receipts."
-              />
+              <SectionHeader title="Completed rides" subtitle="Your ride history and receipts." />
 
               <div
                 style={{
@@ -765,83 +806,72 @@ export default function RiderPortalPage() {
                   marginBottom: 8,
                 }}
               >
-                <div
-                  style={{
-                    display: "flex",
-                    flexWrap: "wrap",
-                    gap: 12,
-                    marginBottom: 8,
-                    fontSize: 12,
-                  }}
-                >
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 12, marginBottom: 8, fontSize: 12 }}>
                   <MiniStat label="Rides shown" value={String(totalCompletedShown)} />
                   <MiniStat label="Total miles" value={totalMiles ? totalMiles.toFixed(2) : "0.00"} />
-                  <MiniStat
-                    label="Total spent"
-                    value={totalFareCents ? `$${formatMoney(totalFareCents)}` : "$0.00"}
-                  />
+                  <MiniStat label="Total spent" value={totalFareCents ? `$${formatMoney(totalFareCents)}` : "$0.00"} />
                   <MiniStat label="Avg. miles / ride" value={avgMiles ? avgMiles.toFixed(2) : "0.00"} />
                 </div>
 
-                <div
-                  style={{
-                    display: "flex",
-                    flexWrap: "wrap",
-                    gap: 8,
-                    alignItems: "center",
-                  }}
-                >
-                  <FilterPill
-                    label="Last 7 days"
-                    active={completedFilter === "LAST_7"}
-                    onClick={() => setCompletedFilter("LAST_7")}
-                  />
-                  <FilterPill
-                    label="Last 30 days"
-                    active={completedFilter === "LAST_30"}
-                    onClick={() => setCompletedFilter("LAST_30")}
-                  />
-                  <FilterPill
-                    label="All time"
-                    active={completedFilter === "ALL"}
-                    onClick={() => setCompletedFilter("ALL")}
-                  />
-                  <FilterPill
-                    label="Custom"
-                    active={completedFilter === "CUSTOM"}
-                    onClick={() => setCompletedFilter("CUSTOM")}
-                  />
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
+                  <FilterPill label="Last 7 days" active={completedFilter === "LAST_7"} onClick={() => setCompletedFilter("LAST_7")} />
+                  <FilterPill label="Last 30 days" active={completedFilter === "LAST_30"} onClick={() => setCompletedFilter("LAST_30")} />
+                  <FilterPill label="All time" active={completedFilter === "ALL"} onClick={() => setCompletedFilter("ALL")} />
+                  <FilterPill label="Custom" active={completedFilter === "CUSTOM"} onClick={() => setCompletedFilter("CUSTOM")} />
 
                   {completedFilter === "CUSTOM" && (
-                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, fontSize: 11 }}>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6, fontSize: 11, alignItems: "center" }}>
                       <label>
                         <span style={{ marginRight: 4 }}>From</span>
                         <input
                           type="date"
-                          value={customFrom}
-                          onChange={(e) => setCustomFrom(e.target.value)}
-                          style={{
-                            borderRadius: 999,
-                            border: "1px solid #d1d5db",
-                            padding: "3px 8px",
-                            fontSize: 11,
-                          }}
+                          value={customFromDraft}
+                          onChange={(e) => setCustomFromDraft(e.target.value)}
+                          style={{ borderRadius: 999, border: "1px solid #d1d5db", padding: "3px 8px", fontSize: 11 }}
                         />
                       </label>
+
                       <label>
                         <span style={{ marginRight: 4 }}>To</span>
                         <input
                           type="date"
-                          value={customTo}
-                          onChange={(e) => setCustomTo(e.target.value)}
-                          style={{
-                            borderRadius: 999,
-                            border: "1px solid #d1d5db",
-                            padding: "3px 8px",
-                            fontSize: 11,
-                          }}
+                          value={customToDraft}
+                          onChange={(e) => setCustomToDraft(e.target.value)}
+                          style={{ borderRadius: 999, border: "1px solid #d1d5db", padding: "3px 8px", fontSize: 11 }}
                         />
                       </label>
+
+                      <button
+                        type="button"
+                        onClick={applyCustomRange}
+                        style={{
+                          borderRadius: 999,
+                          border: "1px solid #111827",
+                          padding: "6px 10px",
+                          fontSize: 12,
+                          background: "#111827",
+                          color: "#ffffff",
+                          cursor: "pointer",
+                        }}
+                      >
+                        Apply
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={clearCustomRange}
+                        style={{
+                          borderRadius: 999,
+                          border: "1px solid #d1d5db",
+                          padding: "6px 10px",
+                          fontSize: 12,
+                          background: "#ffffff",
+                          color: "#111827",
+                          cursor: "pointer",
+                        }}
+                      >
+                        Clear
+                      </button>
                     </div>
                   )}
 
@@ -852,13 +882,7 @@ export default function RiderPortalPage() {
                     placeholder="Search by address"
                     value={completedSearch}
                     onChange={(e) => setCompletedSearch(e.target.value)}
-                    style={{
-                      minWidth: 220,
-                      borderRadius: 999,
-                      border: "1px solid #d1d5db",
-                      padding: "6px 10px",
-                      fontSize: 12,
-                    }}
+                    style={{ minWidth: 220, borderRadius: 999, border: "1px solid #d1d5db", padding: "6px 10px", fontSize: 12 }}
                   />
 
                   <button
@@ -881,9 +905,7 @@ export default function RiderPortalPage() {
               </div>
 
               {filteredCompleted.length === 0 ? (
-                <p style={{ color: "#555", fontSize: 14 }}>
-                  No completed rides match this filter.
-                </p>
+                <p style={{ color: "#555", fontSize: 14 }}>No completed rides match this filter.</p>
               ) : (
                 <RideList
                   bookings={filteredCompleted}
@@ -891,16 +913,8 @@ export default function RiderPortalPage() {
                   allowChat
                   showActions={false}
                   expandedBookingId={expandedBookingId}
-                  onToggleExpand={(id) =>
-                    setExpandedBookingId((curr) => (curr === id ? null : id))
-                  }
-                  onOpenChat={(conversationId, readOnly) => {
-                    setActiveChat({ conversationId, readOnly });
-                    setChatNotifications((prev) => ({
-                      ...prev,
-                      [conversationId]: 0,
-                    }));
-                  }}
+                  onToggleExpand={(id) => setExpandedBookingId((curr) => (curr === id ? null : id))}
+                  onOpenChat={openChat}
                   chatNotifications={chatNotifications}
                   onResendReceipt={handleResendReceipt}
                   receiptBusyId={receiptBusyId}
@@ -912,18 +926,14 @@ export default function RiderPortalPage() {
       )}
 
       {activeChat && (
-        <ChatOverlay
-          conversationId={activeChat.conversationId}
-          readOnly={activeChat.readOnly}
-          onClose={() => setActiveChat(null)}
-        />
+        <ChatOverlay conversationId={activeChat.conversationId} readOnly={activeChat.readOnly} onClose={() => setActiveChat(null)} />
       )}
     </main>
   );
 }
 
 /* ============================================
- *                SMALL UI HELPERS
+ *              SMALL UI HELPERS
  * ==========================================*/
 
 function SummaryCard(props: { label: string; value: number }) {
@@ -941,9 +951,7 @@ function SummaryCard(props: { label: string; value: number }) {
         justifyContent: "center",
       }}
     >
-      <div style={{ fontSize: 12, textTransform: "uppercase", color: "#6b7280" }}>
-        {label}
-      </div>
+      <div style={{ fontSize: 12, textTransform: "uppercase", color: "#6b7280" }}>{label}</div>
       <div style={{ fontSize: 20, fontWeight: 600 }}>{value}</div>
     </div>
   );
@@ -998,17 +1006,8 @@ function EmptyState(props: { message: string; actionLabel?: string; actionHref?:
 function MiniStat(props: { label: string; value: string }) {
   const { label, value } = props;
   return (
-    <div
-      style={{
-        padding: "6px 10px",
-        borderRadius: 999,
-        border: "1px solid #e5e7eb",
-        background: "#ffffff",
-      }}
-    >
-      <span style={{ fontSize: 11, color: "#6b7280", marginRight: 6 }}>
-        {label}:
-      </span>
+    <div style={{ padding: "6px 10px", borderRadius: 999, border: "1px solid #e5e7eb", background: "#ffffff" }}>
+      <span style={{ fontSize: 11, color: "#6b7280", marginRight: 6 }}>{label}:</span>
       <span style={{ fontSize: 12, fontWeight: 600 }}>{value}</span>
     </div>
   );
@@ -1036,7 +1035,7 @@ function FilterPill(props: { label: string; active: boolean; onClick: () => void
 }
 
 /* ============================================
- *        RIDE LIST + TIMER + CHAT OVERLAY
+ *                RIDE LIST + TIMER + CHAT
  * ==========================================*/
 
 function RideList(props: {
@@ -1085,30 +1084,27 @@ function RideList(props: {
         const busy = actionBusyId != null && actionBusyId === cancelKey;
 
         const canChat = allowChat && !!b.conversationId;
-        const unread =
-          b.conversationId && chatNotifications
-            ? chatNotifications[b.conversationId] ?? 0
-            : 0;
+        const unread = b.conversationId && chatNotifications ? chatNotifications[b.conversationId] ?? 0 : 0;
 
-        const receiptBusy =
-          receiptBusyId != null && hasRealBooking && receiptBusyId === b.bookingId;
+        const receiptBusy = receiptBusyId != null && hasRealBooking && receiptBusyId === b.bookingId;
 
-        const dollars =
-          typeof b.totalPriceCents === "number"
-            ? (b.totalPriceCents / 100).toFixed(2)
-            : null;
+        const effFare = getEffectiveFareCents(b);
+        const dollars = typeof effFare === "number" ? formatMoney(effFare) : null;
 
         const distanceLabel =
-          typeof b.distanceMiles === "number" && b.distanceMiles > 0
-            ? `${b.distanceMiles.toFixed(2)} miles`
-            : null;
+          typeof b.distanceMiles === "number" && b.distanceMiles > 0 ? `${b.distanceMiles.toFixed(2)} miles` : null;
 
-        // ✅ This is the missing piece you asked about:
         const readOnly = isChatReadOnly(b);
 
-        const handlePrintReceipt = () => {
-          if (!b.rideId) return;
-          window.open(`/driver/rides/${b.rideId}`, "_blank");
+        // ✅ Receipt should always go to /receipt/<bookingId> (never driver page)
+        const openReceipt = () => {
+          if (!b.bookingId) return;
+          window.open(`/receipt/${encodeURIComponent(b.bookingId)}`, "_blank");
+        };
+
+        // ✅ Keep one primary action: Trip (always for any rideId)
+        const goToTrip = () => {
+          router.push(`/rider/trips/${encodeURIComponent(b.rideId)}`);
         };
 
         return (
@@ -1140,6 +1136,7 @@ function RideList(props: {
                 <div style={{ fontSize: 13, color: "#4b5563" }}>
                   Departure: {dt.toLocaleString()}
                   {distanceLabel && ` • ${distanceLabel}`}
+                  {dollars && ` • $${dollars}`}
                 </div>
 
                 <div style={{ fontSize: 12, color: "#6b7280" }}>
@@ -1147,18 +1144,16 @@ function RideList(props: {
                   {b.isRideOnly && " (request pending)"}
                 </div>
 
-                {b.driverName && (
-                  <div style={{ fontSize: 12, color: "#6b7280" }}>
-                    Driver: {b.driverName}
-                  </div>
-                )}
+                {b.driverName && <div style={{ fontSize: 12, color: "#6b7280" }}>Driver: {b.driverName}</div>}
+
+                <PaymentBadge paymentType={b.paymentType ?? null} cashDiscountBps={b.cashDiscountBps ?? null} />
 
                 {isInRoute && (
                   <>
                     <div
                       style={{
                         display: "inline-block",
-                        marginTop: 4,
+                        marginTop: 6,
                         padding: "2px 8px",
                         borderRadius: 999,
                         fontSize: 11,
@@ -1203,9 +1198,46 @@ function RideList(props: {
                   justifyContent: "center",
                   alignItems: "flex-end",
                   gap: 6,
-                  minWidth: allowChat || showActions ? 210 : 0,
+                  minWidth: allowChat || showActions ? 220 : 0,
                 }}
               >
+                {/* ✅ Primary: Trip (always) */}
+                <button
+                  type="button"
+                  onClick={goToTrip}
+                  style={{
+                    padding: "6px 12px",
+                    borderRadius: 999,
+                    border: "1px solid #d1d5db",
+                    background: "#ffffff",
+                    fontSize: 13,
+                    cursor: "pointer",
+                    whiteSpace: "nowrap",
+                  }}
+                >
+                  Trip
+                </button>
+
+                {/* ✅ Receipt only when completed + real booking */}
+                {isCompleted && hasRealBooking && (
+                  <button
+                    type="button"
+                    onClick={openReceipt}
+                    style={{
+                      padding: "6px 12px",
+                      borderRadius: 999,
+                      border: "1px solid #d1d5db",
+                      background: "#ffffff",
+                      fontSize: 13,
+                      cursor: "pointer",
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    Receipt
+                  </button>
+                )}
+
+                {/* ✅ Chat */}
                 {allowChat && (
                   <button
                     type="button"
@@ -1239,14 +1271,15 @@ function RideList(props: {
                     />
                     {canChat
                       ? unread > 0
-                        ? `View chat (${unread} new)`
+                        ? `Chat (${unread} new)`
                         : readOnly
-                          ? "View chat (read-only)"
-                          : "View chat"
+                        ? "Chat (read-only)"
+                        : "Chat"
                       : "Chat not started"}
                   </button>
                 )}
 
+                {/* Actions only for upcoming/active lists */}
                 {showActions && !isCancelled && (
                   <div style={{ display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }}>
                     <button
@@ -1285,11 +1318,12 @@ function RideList(props: {
                   </div>
                 )}
 
+                {/* Optional details (kept, but no extra “receipt”/driver links inside) */}
                 <button
                   type="button"
                   onClick={() => onToggleExpand && onToggleExpand(b.id)}
                   style={{
-                    marginTop: 4,
+                    marginTop: 2,
                     padding: "4px 10px",
                     borderRadius: 999,
                     border: "none",
@@ -1299,27 +1333,8 @@ function RideList(props: {
                     whiteSpace: "nowrap",
                   }}
                 >
-                  {isExpanded ? "Hide details" : "View ride details"}
+                  {isExpanded ? "Hide details" : "Details"}
                 </button>
-
-                {(isCompleted || isInRoute) && (
-                  <button
-                    type="button"
-                    onClick={() => router.push(`/rider/trips/${encodeURIComponent(b.rideId)}`)}
-                    style={{
-                      marginTop: 4,
-                      padding: "4px 10px",
-                      borderRadius: 999,
-                      border: "1px solid #d1d5db",
-                      background: "#ffffff",
-                      fontSize: 12,
-                      cursor: "pointer",
-                      whiteSpace: "nowrap",
-                    }}
-                  >
-                    Open full trip page
-                  </button>
-                )}
               </div>
             </div>
 
@@ -1351,6 +1366,15 @@ function RideList(props: {
                   <strong>Departure time:</strong> {dt.toLocaleString()}
                 </div>
 
+                <div>
+                  <strong>Payment:</strong> {b.paymentType ?? "n/a"}
+                  {b.paymentType === "CASH" && (b.cashDiscountBps ?? 0) > 0 ? (
+                    <span style={{ marginLeft: 8, color: "#166534", fontWeight: 600 }}>
+                      ({Math.round((b.cashDiscountBps ?? 0) / 100)}% off)
+                    </span>
+                  ) : null}
+                </div>
+
                 {isCompleted && (
                   <div
                     style={{
@@ -1367,11 +1391,22 @@ function RideList(props: {
                           <strong>Distance:</strong> {b.distanceMiles.toFixed(2)} mi
                         </span>
                       )}
-                      {dollars && (
+
+                      {typeof b.baseTotalPriceCents === "number" && (
                         <span>
-                          <strong>Fare:</strong> ${dollars}
+                          <strong>Base fare:</strong> ${formatMoney(b.baseTotalPriceCents)}
                         </span>
                       )}
+
+                      {(() => {
+                        const cents = getEffectiveFareCents(b);
+                        return typeof cents === "number" ? (
+                          <span>
+                            <strong>Final fare:</strong> ${formatMoney(cents)}
+                          </span>
+                        ) : null;
+                      })()}
+
                       {b.passengerCount != null && (
                         <span>
                           <strong>Passengers:</strong> {b.passengerCount}
@@ -1389,41 +1424,27 @@ function RideList(props: {
                       )}
                     </div>
 
-                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 8 }}>
-                      <button
-                        type="button"
-                        onClick={handlePrintReceipt}
-                        style={{
-                          padding: "6px 12px",
-                          borderRadius: 999,
-                          border: "1px solid #d1d5db",
-                          background: "#ffffff",
-                          fontSize: 12,
-                          cursor: "pointer",
-                        }}
-                      >
-                        Print receipt
-                      </button>
-
-                      {onResendReceipt && hasRealBooking && (
+                    {/* ✅ Only one secondary action here: resend receipt (optional) */}
+                    {onResendReceipt && hasRealBooking && (
+                      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 10 }}>
                         <button
                           type="button"
                           onClick={() => b.bookingId && onResendReceipt(b.bookingId)}
-                          disabled={!hasRealBooking || receiptBusy}
+                          disabled={receiptBusy}
                           style={{
                             padding: "6px 12px",
                             borderRadius: 999,
                             border: "1px solid #0f766e",
-                            background: hasRealBooking ? "#0d9488" : "#9ca3af",
+                            background: "#0d9488",
                             color: "#ffffff",
                             fontSize: 12,
-                            cursor: !hasRealBooking || receiptBusy ? "not-allowed" : "pointer",
+                            cursor: receiptBusy ? "not-allowed" : "pointer",
                           }}
                         >
                           {receiptBusy ? "Sending..." : "Resend receipt"}
                         </button>
-                      )}
-                    </div>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
@@ -1457,11 +1478,7 @@ function InRouteTimer(props: { startedAt: string }) {
   );
 }
 
-function ChatOverlay(props: {
-  conversationId: string;
-  readOnly: boolean;
-  onClose: () => void;
-}) {
+function ChatOverlay(props: { conversationId: string; readOnly: boolean; onClose: () => void }) {
   const { conversationId, readOnly, onClose } = props;
 
   const params = new URLSearchParams();
@@ -1487,8 +1504,7 @@ function ChatOverlay(props: {
           height: "min(650px, 100%)",
           background: "#fff",
           borderRadius: 16,
-          boxShadow:
-            "0 20px 35px rgba(15,23,42,0.35), 0 0 0 1px rgba(148,163,184,0.15)",
+          boxShadow: "0 20px 35px rgba(15,23,42,0.35), 0 0 0 1px rgba(148,163,184,0.15)",
           display: "flex",
           flexDirection: "column",
           overflow: "hidden",
@@ -1504,30 +1520,18 @@ function ChatOverlay(props: {
             fontSize: 14,
           }}
         >
-          <span style={{ fontWeight: 600 }}>
-            Chat with driver {readOnly ? "(read-only)" : ""}
-          </span>
+          <span style={{ fontWeight: 600 }}>Chat with driver {readOnly ? "(read-only)" : ""}</span>
           <button
             type="button"
             onClick={onClose}
-            style={{
-              border: "none",
-              background: "transparent",
-              cursor: "pointer",
-              fontSize: 18,
-              lineHeight: 1,
-            }}
+            style={{ border: "none", background: "transparent", cursor: "pointer", fontSize: 18, lineHeight: 1 }}
             aria-label="Close chat"
           >
             ×
           </button>
         </div>
 
-        <iframe
-          src={src}
-          style={{ border: "none", width: "100%", height: "100%" }}
-          title="Chat"
-        />
+        <iframe src={src} style={{ border: "none", width: "100%", height: "100%" }} title="Chat" />
       </div>
     </div>
   );

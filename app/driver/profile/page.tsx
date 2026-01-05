@@ -33,7 +33,7 @@ type DriverProfileApiResponse =
   | {
       ok: true;
       user: {
-        role: "RIDER" | "DRIVER" | "BOTH";
+        role: "RIDER" | "DRIVER";
         onboardingCompleted: boolean;
         onboardingStep: number | null;
       };

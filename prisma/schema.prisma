@@ -4,18 +4,14 @@ generator client {
 
 datasource db {
   provider  = "postgresql"
-  url       = env("DATABASE_URL") // pooled (-pooler) for runtime
-  directUrl = env("DIRECT_DATABASE_URL") // direct (non-pooler) for migrate/tools
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_DATABASE_URL")
 }
 
 model User {
   id                      String                   @id @default(cuid())
   email                   String                   @unique
-  stripeCustomerId        String?                  @unique
-
-  // Make nullable to match real-world signup flows + your UI assumptions
   name                    String?
-
   role                    UserRole                 @default(RIDER)
   phone                   String?
   passwordHash            String
@@ -23,36 +19,27 @@ model User {
   bio                     String?
   ratingAverage           Float                    @default(0)
   ratingCount             Int                      @default(0)
-
-  // Legacy / redundant (prefer DriverProfile.verificationStatus)
   isVerifiedDriver        Boolean                  @default(false)
-
   memberSince             DateTime                 @default(now())
   accountStatus           AccountStatus            @default(ACTIVE)
   createdAt               DateTime                 @default(now())
   updatedAt               DateTime                 @updatedAt
   emailVerified           Boolean                  @default(false)
-
   addressLine1            String?
   addressLine2            String?
   city                    String?
   country                 String?                  @default("US")
+  onboardingCompleted     Boolean                  @default(false)
   postalCode              String?
   state                   String?
-
-  onboardingCompleted     Boolean                  @default(false)
-  onboardingStep          Int?
-
-  stripeCustomerId        String?
+  stripeCustomerId        String?                  @unique
   stripeDefaultPaymentId  String?
-
-  // Legacy membership flags (prefer Membership table)
   membershipActive        Boolean                  @default(false)
   membershipPlan          String?
   trialEndsAt             DateTime?
-
   publicId                String?                  @unique
-
+  onboardingStep          Int?
+  isAdmin                 Boolean                  @default(false)
   bookings                Booking[]                @relation("RiderBookings")
   driverConversations     Conversation[]           @relation("DriverConversations")
   riderConversations      Conversation[]           @relation("RiderConversations")
@@ -61,43 +48,36 @@ model User {
   memberships             Membership[]
   messages                Message[]                @relation("UserMessages")
   passwordResetTokens     PasswordResetToken[]
+  paymentMethods          PaymentMethod[]
+  payouts                 Payout[]
   rides                   Ride[]                   @relation("DriverRides")
   riderRides              Ride[]                   @relation("RiderRides")
-  transactions            Transaction[]            @relation("DriverTransactions")
-  paymentMethods          PaymentMethod[]
   ridePayments            RidePayment[]
-  payouts                 Payout[]
+  transactions            Transaction[]            @relation("DriverTransactions")
 }
 
 model DriverProfile {
   id                    String                   @id @default(cuid())
   userId                String                   @unique
-
   baseCity              String?
   baseLat               Float?
   baseLng               Float?
-
   createdAt             DateTime                 @default(now())
   updatedAt             DateTime                 @updatedAt
-
   driverLicenseExpiry   DateTime?
   driverLicenseImageUrl String?
   driverLicenseNumber   String?
   driverLicenseState    String?
-
   verificationNotes     String?
   verificationStatus    DriverVerificationStatus @default(PENDING)
-
   dateOfBirth           DateTime?
   legalName             String?
-
   plateNumber           String?
   plateState            String?
   vehicleColor          String?
   vehicleMake           String?
   vehicleModel          String?
   vehicleYear           Int?
-
   user                  User                     @relation(fields: [userId], references: [id])
   serviceCities         DriverServiceCity[]
 }
@@ -109,7 +89,6 @@ model DriverServiceCity {
   cityLat         Float
   cityLng         Float
   createdAt       DateTime      @default(now())
-
   driverProfile   DriverProfile @relation(fields: [driverProfileId], references: [id])
 
   @@unique([driverProfileId, cityName])
@@ -120,25 +99,19 @@ model Membership {
   id              String           @id @default(cuid())
   userId          String
   type            MembershipType
-  plan            MembershipPlan   @default(STANDARD)
-
   startDate       DateTime
   expiryDate      DateTime
   status          MembershipStatus @default(ACTIVE)
-
   amountPaidCents Int
   paymentProvider String?
   paymentRef      String?
-
   createdAt       DateTime         @default(now())
+  plan            MembershipPlan   @default(STANDARD)
   updatedAt       DateTime         @updatedAt
-
   user            User             @relation(fields: [userId], references: [id])
 
   @@index([userId, type, startDate])
   @@index([userId, type, expiryDate])
-  // Optional: prevents duplicate backfills; keep if you like guardrails.
-  // @@unique([userId, type, plan, startDate])
 }
 
 model EmailVerificationToken {
@@ -147,7 +120,6 @@ model EmailVerificationToken {
   token     String   @unique
   expiresAt DateTime
   createdAt DateTime @default(now())
-
   user      User     @relation(fields: [userId], references: [id])
 
   @@index([userId])
@@ -156,43 +128,34 @@ model EmailVerificationToken {
 model Ride {
   id              String         @id @default(cuid())
   driverId        String?
-  riderId         String?
-
   originCity      String
   originLat       Float
   originLng       Float
-
   destinationCity String
   destinationLat  Float
   destinationLng  Float
-
   departureTime   DateTime
   distanceMiles   Float
-
   vehicleMake     String?
   vehicleModel    String?
   vehicleColor    String?
   licensePlate    String?
-
   preferencesJson Json?
   status          RideStatus     @default(OPEN)
-
-  passengerCount  Int            @default(1)
-  totalPriceCents Int            @default(0)
-
-  tripCompletedAt DateTime?
-  tripStartedAt   DateTime?
-
   createdAt       DateTime       @default(now())
   updatedAt       DateTime       @updatedAt
-
+  riderId         String?
+  passengerCount  Int            @default(1)
+  totalPriceCents Int            @default(0)
+  tripCompletedAt DateTime?
+  tripStartedAt   DateTime?
+  clientRequestId String?        @unique
   bookings        Booking[]
   conversations   Conversation[]
-  transactions    Transaction[]
-  ridePayments    RidePayment[]
-
   driver          User?          @relation("DriverRides", fields: [driverId], references: [id])
   rider           User?          @relation("RiderRides", fields: [riderId], references: [id])
+  ridePayments    RidePayment[]
+  transactions    Transaction[]
 
   @@index([driverId, status])
   @@index([riderId, status])
@@ -200,39 +163,45 @@ model Ride {
 }
 
 model Booking {
-  id           String        @id @default(cuid())
-  rideId       String
-  riderId      String?
-
-  status       BookingStatus @default(PENDING)
-  riderEmail   String?
-  riderName    String?
-
-  createdAt    DateTime      @default(now())
-  updatedAt    DateTime      @updatedAt
-
-  ride         Ride          @relation(fields: [rideId], references: [id])
-  rider        User?         @relation("RiderBookings", fields: [riderId], references: [id])
-  conversation Conversation?
+  id               String         @id @default(cuid())
+  rideId           String
+  status           BookingStatus  @default(PENDING)
+  createdAt        DateTime       @default(now())
+  riderEmail       String?
+  riderName        String?
+  updatedAt        DateTime       @updatedAt
+  riderId          String?
+  cashDiscountBps  Int            @default(1000)
+  paymentMethodId  String?
+  paymentType      PaymentType    @default(CARD)
+  baseAmountCents  Int            @default(0)
+  currency         String         @default("usd")
+  discountCents    Int            @default(0)
+  finalAmountCents Int            @default(0)
+  paymentMethod    PaymentMethod? @relation(fields: [paymentMethodId], references: [id])
+  ride             Ride           @relation(fields: [rideId], references: [id])
+  rider            User?          @relation("RiderBookings", fields: [riderId], references: [id])
+  conversation     Conversation?
+  ridePayments     RidePayment[]  @relation("BookingRidePayments")
 
   @@index([rideId])
   @@index([riderId])
   @@index([status])
+  @@index([paymentType])
+  @@index([paymentMethodId])
 }
 
 model Conversation {
   id        String    @id @default(cuid())
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
   rideId    String
   driverId  String
   riderId   String
   bookingId String?   @unique
-
-  createdAt DateTime  @default(now())
-  updatedAt DateTime  @updatedAt
-
   booking   Booking?  @relation(fields: [bookingId], references: [id])
-  ride      Ride      @relation(fields: [rideId], references: [id])
   driver    User      @relation("DriverConversations", fields: [driverId], references: [id])
+  ride      Ride      @relation(fields: [rideId], references: [id])
   rider     User      @relation("RiderConversations", fields: [riderId], references: [id])
   messages  Message[]
 
@@ -243,13 +212,11 @@ model Conversation {
 
 model Message {
   id             String       @id @default(cuid())
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
   conversationId String
   senderId       String
   body           String
-
-  createdAt      DateTime     @default(now())
-  updatedAt      DateTime     @updatedAt
-
   conversation   Conversation @relation(fields: [conversationId], references: [id])
   sender         User         @relation("UserMessages", fields: [senderId], references: [id])
 
@@ -267,7 +234,6 @@ model Transaction {
   netAmountCents   Int
   status           TransactionStatus @default(PENDING)
   createdAt        DateTime          @default(now())
-
   driver           User              @relation("DriverTransactions", fields: [driverId], references: [id])
   ride             Ride              @relation(fields: [rideId], references: [id])
 
@@ -280,20 +246,110 @@ model PasswordResetToken {
   token     String   @id
   userId    String
   expiresAt DateTime
-
   user      User     @relation(fields: [userId], references: [id])
 
   @@index([userId])
 }
 
+model PaymentMethod {
+  id                      String        @id @default(cuid())
+  userId                  String
+  provider                String        @default("STRIPE")
+  providerPaymentMethodId String?       @unique
+  brand                   String?
+  last4                   String?
+  expMonth                Int?
+  expYear                 Int?
+  isDefault               Boolean       @default(false)
+  createdAt               DateTime      @default(now())
+  updatedAt               DateTime      @updatedAt
+  bookings                Booking[]
+  user                    User          @relation(fields: [userId], references: [id])
+  ridePayments            RidePayment[] @relation("RidePaymentPaymentMethod")
+
+  @@index([userId])
+  @@index([userId, isDefault])
+}
+
+model RidePayment {
+  id                    String            @id @default(cuid())
+  rideId                String
+  riderId               String
+  amountCents           Int
+  currency              String            @default("usd")
+  status                RidePaymentStatus @default(PENDING)
+  provider              String            @default("STRIPE")
+  providerRef           String?           @unique
+  paymentMethodId       String?
+  createdAt             DateTime          @default(now())
+  updatedAt             DateTime          @updatedAt
+  authorizedAt          DateTime?
+  baseAmountCents       Int               @default(0)
+  canceledAt            DateTime?
+  capturedAt            DateTime?
+  discountCents         Int               @default(0)
+  failedAt              DateTime?
+  finalAmountCents      Int               @default(0)
+  idempotencyKey        String?           @unique
+  paymentType           PaymentType       @default(CARD)
+  stripeChargeId        String?           @unique
+  stripeCustomerId      String?
+  stripePaymentIntentId String?           @unique
+  bookingId             String?
+  refunds               Refund[]
+  booking               Booking?          @relation("BookingRidePayments", fields: [bookingId], references: [id])
+  paymentMethod         PaymentMethod?    @relation("RidePaymentPaymentMethod", fields: [paymentMethodId], references: [id])
+  ride                  Ride              @relation(fields: [rideId], references: [id], onDelete: Cascade)
+  rider                 User              @relation(fields: [riderId], references: [id], onDelete: Cascade)
+
+  @@index([bookingId])
+  @@index([riderId])
+  @@index([rideId])
+  @@index([paymentMethodId])
+  @@index([paymentType])
+  @@index([status])
+  @@index([stripePaymentIntentId])
+}
+
+model Refund {
+  id            String       @id @default(cuid())
+  ridePaymentId String
+  amountCents   Int
+  currency      String       @default("USD")
+  status        RefundStatus @default(PENDING)
+  provider      String       @default("STRIPE")
+  providerRef   String?      @unique
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+  ridePayment   RidePayment  @relation(fields: [ridePaymentId], references: [id])
+
+  @@index([ridePaymentId])
+}
+
+model Payout {
+  id          String       @id @default(cuid())
+  driverId    String
+  amountCents Int
+  currency    String       @default("USD")
+  status      PayoutStatus @default(PENDING)
+  provider    String       @default("STRIPE")
+  providerRef String?      @unique
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  driver      User         @relation(fields: [driverId], references: [id])
+
+  @@index([driverId])
+}
+
 enum UserRole {
   RIDER
   DRIVER
+  ADMIN
 }
 
 enum AccountStatus {
   ACTIVE
-  WARNED
+  DISABLED
   SUSPENDED
 }
 
@@ -309,7 +365,6 @@ enum MembershipStatus {
 
 enum MembershipPlan {
   STANDARD
-  // later: PREMIUM, PRO, etc
 }
 
 enum RideStatus {
@@ -340,107 +395,6 @@ enum DriverVerificationStatus {
   REJECTED
 }
 
-model PaymentMethod {
-  id                      String   @id @default(cuid())
-  userId                  String
-  provider                String   @default("STRIPE")
-  providerPaymentMethodId String?  @unique
-  brand                   String?
-  last4                   String?
-  expMonth                Int?
-  expYear                 Int?
-  isDefault               Boolean  @default(false)
-  createdAt               DateTime @default(now())
-  updatedAt               DateTime @updatedAt
-
-  user User @relation(fields: [userId], references: [id])
-
-  ridePayments RidePayment[] @relation("RidePaymentPaymentMethod")
-
-  @@index([userId])
-}
-
-model RidePayment {
-  id          String            @id @default(cuid())
-
-  // Relations
-  rideId      String
-  ride        Ride              @relation(fields: [rideId], references: [id], onDelete: Cascade)
-
-  riderId     String
-  rider       User              @relation(fields: [riderId], references: [id], onDelete: Cascade)
-
-  paymentMethodId String?
-  paymentMethod   PaymentMethod? @relation("RidePaymentPaymentMethod", fields: [paymentMethodId], references: [id], onDelete: SetNull)
-
-  refunds     Refund[]
-
-  // Amounts
-  amountCents Int
-  currency    String            @default("usd") // Stripe uses lowercase ISO codes
-
-  // Provider / Stripe references
-  provider    String            @default("STRIPE")
-
-  // The important Stripe object for authorize/capture flow
-  stripePaymentIntentId String? @unique
-  stripeChargeId        String? @unique
-  stripeCustomerId      String?
-
-  // Prevent duplicates on retries
-  idempotencyKey String? @unique
-
-  // State
-  status      RidePaymentStatus @default(PENDING)
-
-  // Audit timestamps (super helpful for ops/debugging)
-  authorizedAt DateTime?
-  capturedAt   DateTime?
-  canceledAt   DateTime?
-  failedAt     DateTime?
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@index([riderId])
-  @@index([rideId])
-  @@index([paymentMethodId])
-  @@index([status])
-  @@index([stripePaymentIntentId])
-}
-
-model Refund {
-  id            String       @id @default(cuid())
-  ridePaymentId String
-  amountCents   Int
-  currency      String       @default("USD")
-  status        RefundStatus @default(PENDING)
-  provider      String       @default("STRIPE")
-  providerRef   String?      @unique
-  createdAt     DateTime     @default(now())
-  updatedAt     DateTime     @updatedAt
-
-  ridePayment RidePayment @relation(fields: [ridePaymentId], references: [id])
-
-  @@index([ridePaymentId])
-}
-
-model Payout {
-  id          String       @id @default(cuid())
-  driverId    String
-  amountCents Int
-  currency    String       @default("USD")
-  status      PayoutStatus @default(PENDING)
-  provider    String       @default("STRIPE")
-  providerRef String?      @unique
-  createdAt   DateTime     @default(now())
-  updatedAt   DateTime     @updatedAt
-
-  driver User @relation(fields: [driverId], references: [id])
-
-  @@index([driverId])
-}
-
 enum RidePaymentStatus {
   PENDING
   SUCCEEDED
@@ -458,4 +412,9 @@ enum PayoutStatus {
   PENDING
   PAID
   FAILED
+}
+
+enum PaymentType {
+  CARD
+  CASH
 }

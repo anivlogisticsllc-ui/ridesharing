@@ -4,6 +4,12 @@ import { useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { useSession } from "next-auth/react";
 
+type Role = "RIDER" | "DRIVER" | "ADMIN";
+
+function asRole(v: unknown): Role | null {
+  return v === "RIDER" || v === "DRIVER" || v === "ADMIN" ? v : null;
+}
+
 export default function DashboardRedirectPage() {
   const { data: session, status } = useSession();
   const router = useRouter();
@@ -11,29 +17,31 @@ export default function DashboardRedirectPage() {
   useEffect(() => {
     if (status === "loading") return;
 
-    // Not logged in → go to login, and come back to /dashboard after
     if (!session) {
       router.replace("/auth/login?callbackUrl=/dashboard");
       return;
     }
 
-    const role = (session.user as any).role as
-      | "RIDER"
-      | "DRIVER"
-      | "BOTH"
-      | undefined;
+    const role = asRole((session.user as any)?.role);
 
     if (role === "DRIVER") {
       router.replace("/driver");
-    } else if (role === "RIDER") {
-      router.replace("/rider");
-    } else if (role === "BOTH") {
-      // You can make this smarter later (pick or show a choice UI)
-      router.replace("/driver");
-    } else {
-      // fallback
-      router.replace("/");
+      return;
     }
+
+    if (role === "RIDER") {
+      router.replace("/rider");
+      return;
+    }
+
+    if (role === "ADMIN") {
+      // Pick your preferred admin landing page.
+      // If you don’t have one yet, sending home is safer than looping.
+      router.replace("/");
+      return;
+    }
+
+    router.replace("/");
   }, [session, status, router]);
 
   return (

@@ -5,6 +5,11 @@ import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useSession } from "next-auth/react";
 
+type Role = "RIDER" | "DRIVER" | "ADMIN";
+function asRole(v: unknown): Role | null {
+  return v === "RIDER" || v === "DRIVER" || v === "ADMIN" ? v : null;
+}
+
 type RiderPayment = {
   id: string;
   createdAt: string;
@@ -60,7 +65,6 @@ function money(cents: number, currency: string) {
       currency: c,
     }).format(amount);
   } catch {
-    // fallback if currency code is weird
     return `${amount.toFixed(2)} ${c}`;
   }
 }
@@ -71,7 +75,9 @@ function methodLabel(p: RiderPayment) {
   const brand = (m.brand || m.provider || "").toUpperCase();
   const last4 = m.last4 ? `•••• ${m.last4}` : "";
   const exp =
-    m.expMonth && m.expYear ? `Exp ${String(m.expMonth).padStart(2, "0")}/${String(m.expYear).slice(-2)}` : "";
+    m.expMonth && m.expYear
+      ? `Exp ${String(m.expMonth).padStart(2, "0")}/${String(m.expYear).slice(-2)}`
+      : "";
   return [brand, last4, exp].filter(Boolean).join(" ");
 }
 
@@ -89,8 +95,8 @@ function statusPill(status: string) {
   const cls = isGood
     ? "bg-emerald-50 text-emerald-700 ring-1 ring-emerald-200"
     : isBad
-      ? "bg-rose-50 text-rose-700 ring-1 ring-rose-200"
-      : "bg-slate-50 text-slate-700 ring-1 ring-slate-200";
+    ? "bg-rose-50 text-rose-700 ring-1 ring-rose-200"
+    : "bg-slate-50 text-slate-700 ring-1 ring-slate-200";
 
   return (
     <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${cls}`}>
@@ -102,7 +108,12 @@ function statusPill(status: string) {
 export default function AccountBillingPage() {
   const router = useRouter();
   const { data: session, status } = useSession();
-  const role = (session?.user as any)?.role as "RIDER" | "DRIVER" | "BOTH" | undefined;
+
+  const role = asRole((session?.user as any)?.role);
+
+  const showRider = role === "RIDER";
+  const showDriver = role === "DRIVER" || role === "ADMIN";
+  const showBothSections = role === "ADMIN"; // admins can see both blocks if desired
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -112,19 +123,20 @@ export default function AccountBillingPage() {
   const [serviceFeeTotal, setServiceFeeTotal] = useState<number>(0);
   const [serviceFeeCount, setServiceFeeCount] = useState<number>(0);
 
-  const callbackUrl = useMemo(() => encodeURIComponent("/account/billing"), []);
+  const callbackUrl = useMemo(() => "/account/billing", []);
 
   useEffect(() => {
     if (status === "loading") return;
 
     if (!session) {
-      router.replace(`/auth/login?callbackUrl=${callbackUrl}`);
+      router.replace(`/auth/login?callbackUrl=${encodeURIComponent(callbackUrl)}`);
       return;
     }
 
-    // Treat BOTH as: show driver view (fees/payouts) + rider payments below.
-    const effectiveRole = role === "BOTH" ? "BOTH" : role;
-    if (!effectiveRole) return;
+    if (!role) {
+      router.replace("/");
+      return;
+    }
 
     let cancelled = false;
 
@@ -134,17 +146,19 @@ export default function AccountBillingPage() {
         setError(null);
 
         // Rider payments
-        if (effectiveRole === "RIDER" || effectiveRole === "BOTH") {
+        if (showRider || showBothSections) {
           const res = await fetch("/api/account/billing/rider", { cache: "no-store" });
           const json = (await res.json().catch(() => null)) as RiderApiResponse | null;
           if (!res.ok || !json || !("ok" in json) || !json.ok) {
             throw new Error((json as any)?.error || "Failed to load rider billing");
           }
           if (!cancelled) setRiderPayments(json.payments || []);
+        } else if (!cancelled) {
+          setRiderPayments([]);
         }
 
         // Driver payouts / fees
-        if (effectiveRole === "DRIVER" || effectiveRole === "BOTH") {
+        if (showDriver || showBothSections) {
           const res = await fetch("/api/account/billing/driver", { cache: "no-store" });
           const json = (await res.json().catch(() => null)) as DriverApiResponse | null;
           if (!res.ok || !json || !("ok" in json) || !json.ok) {
@@ -156,6 +170,10 @@ export default function AccountBillingPage() {
             setServiceFeeTotal(json.serviceFees?.totalFeesCents ?? 0);
             setServiceFeeCount(json.serviceFees?.rideCount ?? 0);
           }
+        } else if (!cancelled) {
+          setDriverPayouts([]);
+          setServiceFeeTotal(0);
+          setServiceFeeCount(0);
         }
       } catch (e: any) {
         if (!cancelled) setError(e?.message || "Failed to load billing data");
@@ -168,14 +186,11 @@ export default function AccountBillingPage() {
     return () => {
       cancelled = true;
     };
-  }, [session, status, role, router, callbackUrl]);
-
-  const showRider = role === "RIDER" || role === "BOTH";
-  const showDriver = role === "DRIVER" || role === "BOTH";
+  }, [session, status, role, router, callbackUrl, showRider, showDriver, showBothSections]);
 
   return (
     <main className="min-h-[calc(100vh-4rem)] bg-slate-50">
-      <div className="mx-auto max-w-5xl px-4 py-10 space-y-6">
+      <div className="mx-auto max-w-5xl space-y-6 px-4 py-10">
         <header className="space-y-2">
           <h1 className="text-2xl font-semibold text-slate-900">Account billing</h1>
           <p className="text-sm text-slate-600">
@@ -209,14 +224,11 @@ export default function AccountBillingPage() {
           </div>
         ) : (
           <>
-            {/* Rider payments */}
-            {showRider && (
-              <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm space-y-3">
-                <div className="flex items-end justify-between gap-4">
-                  <div>
-                    <h2 className="text-sm font-semibold text-slate-900">Ride payments</h2>
-                    <p className="text-xs text-slate-500">Your recent ride charges.</p>
-                  </div>
+            {(showRider || showBothSections) && (
+              <section className="space-y-3 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                <div>
+                  <h2 className="text-sm font-semibold text-slate-900">Ride payments</h2>
+                  <p className="text-xs text-slate-500">Your recent ride charges.</p>
                 </div>
 
                 {riderPayments.length === 0 ? (
@@ -256,9 +268,8 @@ export default function AccountBillingPage() {
               </section>
             )}
 
-            {/* Driver fees + payouts */}
-            {showDriver && (
-              <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm space-y-4">
+            {(showDriver || showBothSections) && (
+              <section className="space-y-4 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
                 <div>
                   <h2 className="text-sm font-semibold text-slate-900">Driver fees and payouts</h2>
                   <p className="text-xs text-slate-500">Service fees collected and your payouts.</p>
@@ -281,9 +292,7 @@ export default function AccountBillingPage() {
                     <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
                       Payouts
                     </p>
-                    <p className="mt-2 text-xl font-semibold text-slate-900">
-                      {driverPayouts.length}
-                    </p>
+                    <p className="mt-2 text-xl font-semibold text-slate-900">{driverPayouts.length}</p>
                     <p className="mt-1 text-[11px] text-slate-500">Total payout records</p>
                   </div>
                 </div>
@@ -321,12 +330,9 @@ export default function AccountBillingPage() {
               </section>
             )}
 
-            {/* Membership link */}
             <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
               <h2 className="text-sm font-semibold text-slate-900">Membership</h2>
-              <p className="mt-1 text-sm text-slate-600">
-                Membership charges are managed separately.
-              </p>
+              <p className="mt-1 text-sm text-slate-600">Membership charges are managed separately.</p>
               <div className="mt-3">
                 <Link
                   href="/billing/membership"
@@ -336,11 +342,6 @@ export default function AccountBillingPage() {
                 </Link>
               </div>
             </section>
-
-            <p className="text-xs text-slate-500">
-              Devil’s advocate: if you eventually do Stripe, don’t store full card data in your DB.
-              Store Stripe customer + payment method ids only.
-            </p>
           </>
         )}
       </div>

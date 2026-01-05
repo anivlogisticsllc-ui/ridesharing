@@ -39,7 +39,7 @@ function normalizeYear(value: ProfileUpdateBody["vehicleYear"]): number | null |
 }
 
 function isDriverRole(role: UserRole | undefined) {
-  return role === "DRIVER" || role === "BOTH";
+  return role === "DRIVER";
 }
 
 export async function GET() {

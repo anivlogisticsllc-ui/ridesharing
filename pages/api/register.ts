@@ -61,7 +61,7 @@ export default async function handler(
   let role: UserRole = UserRole.RIDER; // safe default
 
   if (planNormalized.includes("both")) {
-    role = UserRole.BOTH;
+    role = UserRole.RIDER;
   } else if (
     planNormalized.includes("driver") &&
     !planNormalized.includes("rider")

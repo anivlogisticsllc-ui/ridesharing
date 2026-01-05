@@ -28,7 +28,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
       },
     });
 
-    if (!user || (user.role !== "DRIVER" && user.role !== "BOTH")) {
+    if (!user || (user.role !== "DRIVER")) {
       return res.status(403).json({ ok: false, error: "Driver account required" });
     }
 

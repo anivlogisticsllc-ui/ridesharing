@@ -7,7 +7,8 @@ import { formatUsdFromCents } from "@/lib/money";
 
 type DashboardRide = {
   id: string;
-  departureTime: string; // ISO
+  departureTime: string; // ISO (but we also support epoch below)
+  departureTimeMs?: number;
   status: string;
   totalPriceCents: number;
   distanceMiles: number;
@@ -30,11 +31,48 @@ type RangeKey =
 
 type NonCustomRange = Exclude<RangeKey, "CUSTOM">;
 
-/* ---------- Helpers ---------- */
+/* ---------- Date helpers ---------- */
 
-function safeDate(iso: string): Date | null {
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? null : d;
+function safeDate(value: unknown): Date | null {
+  if (value == null) return null;
+
+  if (value instanceof Date) {
+    return Number.isNaN(value.getTime()) ? null : value;
+  }
+
+  if (typeof value === "number") {
+    const d = new Date(value);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+
+  if (typeof value === "string") {
+    const s = value.trim();
+
+    // numeric string -> epoch ms
+    if (/^\d{10,17}$/.test(s)) {
+      const num = Number(s);
+      if (!Number.isFinite(num)) return null;
+      const d = new Date(num);
+      return Number.isNaN(d.getTime()) ? null : d;
+    }
+
+    const d = new Date(s);
+    return Number.isNaN(d.getTime()) ? null : d;
+  }
+
+  return null;
+}
+
+function startOfDay(d: Date) {
+  const x = new Date(d);
+  x.setHours(0, 0, 0, 0);
+  return x;
+}
+
+function endOfDay(d: Date) {
+  const x = new Date(d);
+  x.setHours(23, 59, 59, 999);
+  return x;
 }
 
 function isSameDay(a: Date, b: Date) {
@@ -45,44 +83,37 @@ function isSameDay(a: Date, b: Date) {
   );
 }
 
-function filterByPresetRange(rides: DashboardRide[], range: NonCustomRange) {
+function startOfWeekMonday(now: Date) {
+  const d = startOfDay(now);
+  const day = d.getDay(); // 0 Sun..6 Sat
+  const diffToMonday = (day + 6) % 7; // Mon=0, Sun=6
+  d.setDate(d.getDate() - diffToMonday);
+  return d;
+}
+
+function filterByPresetRange(
+  rides: { dt: Date; raw: DashboardRide }[],
+  range: NonCustomRange
+) {
   const now = new Date();
 
   if (range === "ALL") return rides;
 
   if (range === "TODAY") {
-    return rides.filter((r) => {
-      const d = safeDate(r.departureTime);
-      return d ? isSameDay(d, now) : false;
-    });
+    return rides.filter((r) => isSameDay(r.dt, now));
   }
 
   if (range === "YESTERDAY") {
     const y = new Date(now);
-    y.setDate(now.getDate() - 1);
-
-    return rides.filter((r) => {
-      const d = safeDate(r.departureTime);
-      return d ? isSameDay(d, y) : false;
-    });
+    y.setDate(y.getDate() - 1);
+    return rides.filter((r) => isSameDay(r.dt, y));
   }
 
   if (range === "THIS_WEEK") {
-    // Monday–Sunday in local time
-    const startOfWeek = new Date(now);
-    startOfWeek.setHours(0, 0, 0, 0);
-
-    const day = startOfWeek.getDay(); // 0 Sun - 6 Sat
-    const diffToMonday = (day + 6) % 7;
-    startOfWeek.setDate(startOfWeek.getDate() - diffToMonday);
-
-    const endOfWeek = new Date(startOfWeek);
-    endOfWeek.setDate(endOfWeek.getDate() + 7); // exclusive
-
-    return rides.filter((r) => {
-      const d = safeDate(r.departureTime);
-      return d ? d >= startOfWeek && d < endOfWeek : false;
-    });
+    const start = startOfWeekMonday(now);
+    const end = new Date(start);
+    end.setDate(end.getDate() + 7); // exclusive
+    return rides.filter((r) => r.dt >= start && r.dt < end);
   }
 
   if (range === "THIS_MONTH") {
@@ -90,54 +121,39 @@ function filterByPresetRange(rides: DashboardRide[], range: NonCustomRange) {
     const month = now.getMonth();
     const start = new Date(year, month, 1, 0, 0, 0, 0);
     const end = new Date(year, month + 1, 1, 0, 0, 0, 0);
-
-    return rides.filter((r) => {
-      const d = safeDate(r.departureTime);
-      return d ? d >= start && d < end : false;
-    });
+    return rides.filter((r) => r.dt >= start && r.dt < end);
   }
 
   if (range === "THIS_YEAR") {
     const year = now.getFullYear();
     const start = new Date(year, 0, 1, 0, 0, 0, 0);
     const end = new Date(year + 1, 0, 1, 0, 0, 0, 0);
-
-    return rides.filter((r) => {
-      const d = safeDate(r.departureTime);
-      return d ? d >= start && d < end : false;
-    });
+    return rides.filter((r) => r.dt >= start && r.dt < end);
   }
 
   return rides;
 }
 
 function filterByCustomRange(
-  rides: DashboardRide[],
+  rides: { dt: Date; raw: DashboardRide }[],
   startDateStr: string | null,
   endDateStr: string | null
 ) {
   if (!startDateStr || !endDateStr) return [];
 
-  const start = new Date(startDateStr);
-  const end = new Date(endDateStr);
+  const startRaw = safeDate(startDateStr);
+  const endRaw = safeDate(endDateStr);
+  if (!startRaw || !endRaw) return [];
 
-  start.setHours(0, 0, 0, 0);
-  end.setHours(23, 59, 59, 999);
+  const start = startOfDay(startRaw);
+  const end = endOfDay(endRaw);
 
-  if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime()) || start > end) {
-    return [];
-  }
+  if (start > end) return [];
 
-  return rides.filter((r) => {
-    const d = safeDate(r.departureTime);
-    return d ? d >= start && d <= end : false;
-  });
+  return rides.filter((r) => r.dt >= start && r.dt <= end);
 }
 
-function formatLocalDateTime(iso: string): { datePart: string; timePart: string } {
-  const dt = safeDate(iso);
-  if (!dt) return { datePart: "Invalid date", timePart: "" };
-
+function formatLocalDateTime(dt: Date): { datePart: string; timePart: string } {
   return {
     datePart: dt.toLocaleDateString(undefined, {
       year: "numeric",
@@ -183,8 +199,10 @@ export default function DriverDashboardPage() {
       return;
     }
 
-    const role = (session.user as any)?.role as "RIDER" | "DRIVER" | "BOTH" | undefined;
-    if (role !== "DRIVER" && role !== "BOTH") {
+    const role = (session.user as any)?.role as "RIDER" | "DRIVER" | "ADMIN" | undefined;
+
+    // If you want ADMIN to also access driver dashboard, keep ADMIN allowed.
+    if (role !== "DRIVER" && role !== "ADMIN") {
       router.replace("/");
       return;
     }
@@ -210,30 +228,37 @@ export default function DriverDashboardPage() {
     })();
   }, [session, status, router]);
 
-  const filteredRides = useMemo(() => {
-    const completed = rides.filter((r) => String(r.status || "").toUpperCase() === "COMPLETED");
-
-    if (range === "CUSTOM") {
-      return filterByCustomRange(completed, customStart || null, customEnd || null);
-    }
-
-    return filterByPresetRange(completed, range as NonCustomRange);
-  }, [rides, range, customStart, customEnd]);
-
-  const totals = useMemo(() => {
-    const ridesCount = filteredRides.length;
-
-    const totalMiles = filteredRides.reduce((sum, r) => sum + (r.distanceMiles ?? 0), 0);
-    const totalEarningsCents = filteredRides.reduce(
-      (sum, r) => sum + (r.totalPriceCents ?? 0),
-      0
+  const normalizedCompleted = useMemo(() => {
+    const completed = rides.filter(
+      (r) => String(r.status || "").toUpperCase() === "COMPLETED"
     );
 
-    // Keep cents as integer
+    const withDates = completed
+      .map((raw) => {
+        const dt = safeDate(raw.departureTimeMs) ?? safeDate(raw.departureTime) ?? null;
+        return dt ? { dt, raw } : null;
+      })
+      .filter(Boolean) as { dt: Date; raw: DashboardRide }[];
+
+    withDates.sort((a, b) => b.dt.getTime() - a.dt.getTime());
+    return withDates;
+  }, [rides]);
+
+  const filtered = useMemo(() => {
+    if (range === "CUSTOM") {
+      return filterByCustomRange(normalizedCompleted, customStart || null, customEnd || null);
+    }
+    return filterByPresetRange(normalizedCompleted, range as NonCustomRange);
+  }, [normalizedCompleted, range, customStart, customEnd]);
+
+  const totals = useMemo(() => {
+    const ridesCount = filtered.length;
+    const totalMiles = filtered.reduce((sum, r) => sum + (r.raw.distanceMiles ?? 0), 0);
+    const totalEarningsCents = filtered.reduce((sum, r) => sum + (r.raw.totalPriceCents ?? 0), 0);
     const avgPerRideCents = ridesCount ? Math.round(totalEarningsCents / ridesCount) : 0;
 
     return { ridesCount, totalMiles, totalEarningsCents, avgPerRideCents };
-  }, [filteredRides]);
+  }, [filtered]);
 
   const isCustomActive = range === "CUSTOM";
   const customHasBothDates = !!customStart && !!customEnd;
@@ -245,7 +270,6 @@ export default function DriverDashboardPage() {
   return (
     <main className="min-h-[calc(100vh-4rem)] bg-slate-50">
       <div className="mx-auto max-w-5xl px-4 py-10 space-y-8">
-        {/* Header */}
         <header className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
           <div>
             <h1 className="text-2xl font-semibold text-slate-900">Driver earnings dashboard</h1>
@@ -254,7 +278,6 @@ export default function DriverDashboardPage() {
             </p>
           </div>
 
-          {/* Range selector */}
           <div className="inline-flex flex-wrap gap-2 rounded-full bg-white p-1 shadow-sm border border-slate-200">
             {RANGE_OPTIONS.map(([key, label]) => (
               <button
@@ -271,12 +294,9 @@ export default function DriverDashboardPage() {
           </div>
         </header>
 
-        {/* Custom range picker */}
         {isCustomActive && (
           <section className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm space-y-2">
-            <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
-              Custom date range
-            </p>
+            <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Custom date range</p>
 
             <div className="flex flex-wrap items-center gap-3 text-sm">
               <div className="flex items-center gap-2">
@@ -308,20 +328,16 @@ export default function DriverDashboardPage() {
           </section>
         )}
 
-        {/* Error / loading */}
         {loading ? (
           <p className="text-sm text-slate-500">Loading stats…</p>
         ) : error ? (
           <p className="text-sm text-rose-600">{error}</p>
         ) : null}
 
-        {/* Summary cards */}
         {!loading && !error && (
           <section className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
             <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
-                Total earnings
-              </p>
+              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Total earnings</p>
               <p className="mt-2 text-2xl font-semibold text-slate-900">
                 {formatUsdFromCents(totals.totalEarningsCents)}
               </p>
@@ -329,43 +345,32 @@ export default function DriverDashboardPage() {
             </div>
 
             <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
-                Completed rides
-              </p>
+              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Completed rides</p>
               <p className="mt-2 text-2xl font-semibold text-slate-900">{totals.ridesCount}</p>
               <p className="mt-1 text-[11px] text-slate-500">Status: COMPLETED only</p>
             </div>
 
             <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
-                Total miles
-              </p>
-              <p className="mt-2 text-2xl font-semibold text-slate-900">
-                {totals.totalMiles.toFixed(1)}
-              </p>
+              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Total miles</p>
+              <p className="mt-2 text-2xl font-semibold text-slate-900">{totals.totalMiles.toFixed(1)}</p>
               <p className="mt-1 text-[11px] text-slate-500">Based on stored distanceMiles</p>
             </div>
 
             <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
-                Avg per ride
-              </p>
+              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Avg per ride</p>
               <p className="mt-2 text-2xl font-semibold text-slate-900">
                 {formatUsdFromCents(totals.avgPerRideCents)}
               </p>
-              <p className="mt-1 text-[11px] text-slate-500">
-                Average payout per completed ride
-              </p>
+              <p className="mt-1 text-[11px] text-slate-500">Average payout per completed ride</p>
             </div>
           </section>
         )}
 
-        {/* Rides table */}
         {!loading && !error && (
           <section className="space-y-3">
             <h2 className="text-sm font-semibold text-slate-800">Rides in selected period</h2>
 
-            {filteredRides.length === 0 ? (
+            {filtered.length === 0 ? (
               <p className="text-sm text-slate-500">
                 {range === "CUSTOM" && customHasBothDates
                   ? "No completed rides found in this custom range."
@@ -384,29 +389,27 @@ export default function DriverDashboardPage() {
                       </tr>
                     </thead>
                     <tbody>
-                      {filteredRides.map((r) => {
-                        const { datePart, timePart } = formatLocalDateTime(r.departureTime);
+                      {filtered.map(({ dt, raw }) => {
+                        const { datePart, timePart } = formatLocalDateTime(dt);
 
                         return (
                           <tr
-                            key={r.id}
+                            key={raw.id}
                             className="border-t border-slate-100 hover:bg-slate-50/60 cursor-pointer"
-                            onClick={() => router.push(`/driver/rides/${r.id}`)}
+                            onClick={() => router.push(`/driver/rides/${raw.id}`)}
                           >
                             <td className="px-4 py-2 align-middle text-slate-700">
                               {datePart}{" "}
-                              {timePart && (
-                                <span className="text-[11px] text-slate-400">{timePart}</span>
-                              )}
+                              {timePart && <span className="text-[11px] text-slate-400">{timePart}</span>}
                             </td>
                             <td className="px-4 py-2 align-middle text-slate-700">
-                              {r.originCity} → {r.destinationCity}
+                              {raw.originCity} → {raw.destinationCity}
                             </td>
                             <td className="px-4 py-2 align-middle text-right text-slate-700">
-                              {(r.distanceMiles ?? 0).toFixed(1)}
+                              {(raw.distanceMiles ?? 0).toFixed(1)}
                             </td>
                             <td className="px-4 py-2 align-middle text-right text-slate-900">
-                              {formatUsdFromCents(r.totalPriceCents)}
+                              {formatUsdFromCents(raw.totalPriceCents)}
                             </td>
                           </tr>
                         );

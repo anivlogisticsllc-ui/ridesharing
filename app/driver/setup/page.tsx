@@ -8,7 +8,7 @@ type DriverProfileResponse =
   | {
       ok: true;
       user: {
-        role: "RIDER" | "DRIVER" | "BOTH";
+        role: "RIDER" | "DRIVER";
         onboardingCompleted: boolean;
         onboardingStep: number | null;
       };
@@ -108,7 +108,7 @@ export default function DriverSetupPage() {
         }
 
         const user = data.user;
-        if (user.role !== "DRIVER" && user.role !== "BOTH") {
+        if (user.role !== "DRIVER") {
           router.replace("/");
           return;
         }

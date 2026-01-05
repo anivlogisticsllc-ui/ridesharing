@@ -40,17 +40,13 @@ export default function RiderBookingsPage() {
         setLoading(true);
         setError(null);
 
-        const res = await fetch("/api/rider/bookings", {
-          method: "GET",
-        });
+        const res = await fetch("/api/rider/bookings", { method: "GET" });
 
         if (!res.ok) {
-          const text = await res.text();
+          const text = await res.text().catch(() => "");
           if (!cancelled) {
             setError(
-              `Failed to load bookings. Status ${res.status}: ${
-                text || "Unknown error"
-              }`
+              `Failed to load bookings. Status ${res.status}: ${text || "Unknown error"}`
             );
           }
           return;
@@ -59,24 +55,16 @@ export default function RiderBookingsPage() {
         const data: ApiResponse = await res.json();
 
         if (!data.ok) {
-          if (!cancelled) {
-            setError(data.error || "Failed to load bookings");
-          }
+          if (!cancelled) setError(data.error || "Failed to load bookings");
           return;
         }
 
-        if (!cancelled) {
-          setBookings(data.bookings);
-        }
+        if (!cancelled) setBookings(data.bookings);
       } catch (err) {
         console.error("Error fetching rider bookings:", err);
-        if (!cancelled) {
-          setError("Unexpected error while loading bookings");
-        }
+        if (!cancelled) setError("Unexpected error while loading bookings");
       } finally {
-        if (!cancelled) {
-          setLoading(false);
-        }
+        if (!cancelled) setLoading(false);
       }
     }
 
@@ -101,7 +89,6 @@ export default function RiderBookingsPage() {
         fontFamily: "system-ui, sans-serif",
       }}
     >
-      {/* Top header: treat this as Rider Portal home */}
       <header
         style={{
           display: "flex",
@@ -111,13 +98,7 @@ export default function RiderBookingsPage() {
         }}
       >
         <div>
-          <h1
-            style={{
-              fontSize: 28,
-              fontWeight: 600,
-              marginBottom: 4,
-            }}
-          >
+          <h1 style={{ fontSize: 28, fontWeight: 600, marginBottom: 4 }}>
             Rider portal
           </h1>
           <p style={{ color: "#555", margin: 0 }}>
@@ -136,21 +117,17 @@ export default function RiderBookingsPage() {
         <>
           {/* Upcoming rides */}
           <section style={{ marginBottom: 32 }}>
-            <h2
-              style={{
-                fontSize: 20,
-                fontWeight: 600,
-                marginBottom: 8,
-              }}
-            >
+            <h2 style={{ fontSize: 20, fontWeight: 600, marginBottom: 8 }}>
               Upcoming rides
             </h2>
+
             {upcoming.length === 0 ? (
               <p style={{ color: "#555" }}>You have no upcoming rides.</p>
             ) : (
               <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
                 {upcoming.map((b) => {
                   const dt = new Date(b.departureTime);
+
                   return (
                     <li
                       key={b.id}
@@ -189,7 +166,7 @@ export default function RiderBookingsPage() {
                           flexDirection: "column",
                           justifyContent: "center",
                           gap: 8,
-                          minWidth: 140,
+                          minWidth: 160,
                         }}
                       >
                         {b.conversationId ? (
@@ -203,6 +180,7 @@ export default function RiderBookingsPage() {
                                 border: "1px solid #ccc",
                                 cursor: "pointer",
                                 fontSize: 14,
+                                background: "#fff",
                               }}
                             >
                               Open chat
@@ -236,21 +214,20 @@ export default function RiderBookingsPage() {
 
           {/* Completed rides */}
           <section>
-            <h2
-              style={{
-                fontSize: 20,
-                fontWeight: 600,
-                marginBottom: 8,
-              }}
-            >
+            <h2 style={{ fontSize: 20, fontWeight: 600, marginBottom: 8 }}>
               Completed rides
             </h2>
+
             {completed.length === 0 ? (
               <p style={{ color: "#555" }}>You have no completed rides yet.</p>
             ) : (
               <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
                 {completed.map((b) => {
                   const dt = new Date(b.departureTime);
+                  const receiptHref = `/receipt/${encodeURIComponent(
+                    b.id
+                  )}?autoprint=1`;
+
                   return (
                     <li
                       key={b.id}
@@ -282,16 +259,39 @@ export default function RiderBookingsPage() {
                         )}
                       </div>
 
-                      {/* Chat actions */}
+                      {/* Actions */}
                       <div
                         style={{
                           display: "flex",
                           flexDirection: "column",
                           justifyContent: "center",
                           gap: 8,
-                          minWidth: 140,
+                          minWidth: 160,
                         }}
                       >
+                        {/* Receipt */}
+                        <Link
+                          href={receiptHref}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                        >
+                          <button
+                            type="button"
+                            style={{
+                              width: "100%",
+                              padding: "8px 12px",
+                              borderRadius: 6,
+                              border: "1px solid #ccc",
+                              cursor: "pointer",
+                              fontSize: 14,
+                              background: "#fff",
+                            }}
+                          >
+                            Receipt
+                          </button>
+                        </Link>
+
+                        {/* Chat */}
                         {b.conversationId ? (
                           <Link href={`/chat/${b.conversationId}`}>
                             <button
@@ -303,6 +303,7 @@ export default function RiderBookingsPage() {
                                 border: "1px solid #ccc",
                                 cursor: "pointer",
                                 fontSize: 14,
+                                background: "#fff",
                               }}
                             >
                               Open chat

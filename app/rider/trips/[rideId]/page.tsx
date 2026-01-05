@@ -1,14 +1,11 @@
+// app/rider/trips/[rideId]/page.tsx
 "use client";
 
 import { useParams, useRouter } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
 
-type BookingStatus =
-  | "PENDING"
-  | "CONFIRMED"
-  | "COMPLETED"
-  | "CANCELLED"
-  | "EXPIRED";
+type BookingStatus = "PENDING" | "CONFIRMED" | "COMPLETED" | "CANCELLED" | "EXPIRED";
+type PaymentType = "CARD" | "CASH";
 
 type Booking = {
   id: string;
@@ -26,15 +23,21 @@ type Booking = {
   isRideOnly?: boolean;
 
   distanceMiles?: number | null;
-  totalPriceCents?: number | null;
   passengerCount?: number | null;
   tripStartedAt?: string | null;
   tripCompletedAt?: string | null;
+
+  // ✅ new fields already coming from /api/rider/bookings
+  paymentType?: PaymentType | null;
+  cashDiscountBps?: number | null;
+  baseTotalPriceCents?: number | null;
+  effectiveTotalPriceCents?: number | null;
+
+  // legacy fallback
+  totalPriceCents?: number | null;
 };
 
-type ApiResponse =
-  | { ok: true; bookings: Booking[] }
-  | { ok: false; error: string };
+type ApiResponse = { ok: true; bookings: Booking[] } | { ok: false; error: string };
 
 function safeDate(value: string | null | undefined): Date | null {
   if (!value) return null;
@@ -52,23 +55,24 @@ function isChatReadOnly(b: Booking): boolean {
   return completed || cancelledLike;
 }
 
+function getEffectiveFareCents(b: Booking): number | null {
+  if (typeof b.effectiveTotalPriceCents === "number") return b.effectiveTotalPriceCents;
+  if (typeof b.totalPriceCents === "number") return b.totalPriceCents;
+  if (typeof b.baseTotalPriceCents === "number") return b.baseTotalPriceCents;
+  return null;
+}
+
 export default function RiderTripPage() {
   const router = useRouter();
-
-  // ✅ Build-safe: params can be null-ish in TS typing; guard before use.
   const params = useParams();
   const rawRideId = params?.rideId;
-  const rideId =
-    typeof rawRideId === "string" ? decodeURIComponent(rawRideId) : null;
+  const rideId = typeof rawRideId === "string" ? decodeURIComponent(rawRideId) : null;
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [booking, setBooking] = useState<Booking | null>(null);
 
-  const [activeChat, setActiveChat] = useState<{
-    conversationId: string;
-    readOnly: boolean;
-  } | null>(null);
+  const [activeChat, setActiveChat] = useState<{ conversationId: string; readOnly: boolean } | null>(null);
 
   useEffect(() => {
     if (!rideId) return;
@@ -90,7 +94,6 @@ export default function RiderTripPage() {
         if (!data.ok) throw new Error(data.error || "Failed to load bookings");
 
         const match = data.bookings.find((b) => b.rideId === rideId) || null;
-
         if (!cancelled) setBooking(match);
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : "Failed to load trip";
@@ -107,21 +110,11 @@ export default function RiderTripPage() {
     };
   }, [rideId]);
 
-  const readOnly = useMemo(() => {
-    return booking ? isChatReadOnly(booking) : true;
-  }, [booking]);
+  const readOnly = useMemo(() => (booking ? isChatReadOnly(booking) : true), [booking]);
 
-  // If we don't have rideId, bail early (also prevents build-time complaints)
   if (!rideId) {
     return (
-      <main
-        style={{
-          maxWidth: 900,
-          margin: "0 auto",
-          padding: 24,
-          fontFamily: "system-ui, sans-serif",
-        }}
-      >
+      <main style={{ maxWidth: 900, margin: "0 auto", padding: 24, fontFamily: "system-ui, sans-serif" }}>
         <button
           type="button"
           onClick={() => router.back()}
@@ -143,14 +136,7 @@ export default function RiderTripPage() {
 
   if (loading) {
     return (
-      <main
-        style={{
-          maxWidth: 900,
-          margin: "0 auto",
-          padding: 24,
-          fontFamily: "system-ui, sans-serif",
-        }}
-      >
+      <main style={{ maxWidth: 900, margin: "0 auto", padding: 24, fontFamily: "system-ui, sans-serif" }}>
         <p>Loading trip...</p>
       </main>
     );
@@ -158,14 +144,7 @@ export default function RiderTripPage() {
 
   if (error) {
     return (
-      <main
-        style={{
-          maxWidth: 900,
-          margin: "0 auto",
-          padding: 24,
-          fontFamily: "system-ui, sans-serif",
-        }}
-      >
+      <main style={{ maxWidth: 900, margin: "0 auto", padding: 24, fontFamily: "system-ui, sans-serif" }}>
         <button
           type="button"
           onClick={() => router.back()}
@@ -187,14 +166,7 @@ export default function RiderTripPage() {
 
   if (!booking) {
     return (
-      <main
-        style={{
-          maxWidth: 900,
-          margin: "0 auto",
-          padding: 24,
-          fontFamily: "system-ui, sans-serif",
-        }}
-      >
+      <main style={{ maxWidth: 900, margin: "0 auto", padding: 24, fontFamily: "system-ui, sans-serif" }}>
         <button
           type="button"
           onClick={() => router.back()}
@@ -216,23 +188,13 @@ export default function RiderTripPage() {
 
   const dt = safeDate(booking.departureTime) ?? new Date(booking.departureTime);
 
+  const base = typeof booking.baseTotalPriceCents === "number" ? booking.baseTotalPriceCents : null;
+  const effective = getEffectiveFareCents(booking);
+  const hasDiscount = base != null && effective != null && effective < base;
+
   return (
-    <main
-      style={{
-        maxWidth: 900,
-        margin: "0 auto",
-        padding: 24,
-        fontFamily: "system-ui, sans-serif",
-      }}
-    >
-      <div
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          gap: 12,
-          marginBottom: 16,
-        }}
-      >
+    <main style={{ maxWidth: 900, margin: "0 auto", padding: 24, fontFamily: "system-ui, sans-serif" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 12, marginBottom: 16 }}>
         <button
           type="button"
           onClick={() => router.back()}
@@ -247,36 +209,57 @@ export default function RiderTripPage() {
           Back
         </button>
 
-        {booking.conversationId && (
-          <button
-            type="button"
-            onClick={() =>
-              setActiveChat({
-                conversationId: booking.conversationId!,
-                readOnly,
-              })
-            }
-            style={{
-              padding: "6px 12px",
-              borderRadius: 999,
-              border: "1px solid #d1d5db",
-              background: "#fff",
-              cursor: "pointer",
-              whiteSpace: "nowrap",
-            }}
-          >
-            Open chat {readOnly ? "(read-only)" : ""}
-          </button>
-        )}
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", justifyContent: "flex-end" }}>
+          {booking.bookingId && (
+            <button
+              type="button"
+              onClick={() => {
+                const url = `/receipt/${encodeURIComponent(booking.bookingId)}?autoprint=1`;
+                window.open(url, "_blank", "noopener,noreferrer");
+              }}
+
+              style={{
+                padding: "6px 12px",
+                borderRadius: 999,
+                border: "1px solid #d1d5db",
+                background: "#fff",
+                cursor: "pointer",
+                whiteSpace: "nowrap",
+              }}
+            >
+              Receipt
+            </button>
+          )}
+
+          {booking.conversationId && (
+            <button
+              type="button"
+              onClick={() =>
+                setActiveChat({
+                  conversationId: booking.conversationId!,
+                  readOnly,
+                })
+              }
+              style={{
+                padding: "6px 12px",
+                borderRadius: 999,
+                border: "1px solid #d1d5db",
+                background: "#fff",
+                cursor: "pointer",
+                whiteSpace: "nowrap",
+              }}
+            >
+              Chat {readOnly ? "(read-only)" : ""}
+            </button>
+          )}
+        </div>
       </div>
 
       <h1 style={{ margin: "0 0 6px", fontSize: 22, fontWeight: 700 }}>
         {booking.originCity} → {booking.destinationCity}
       </h1>
 
-      <p style={{ margin: 0, color: "#4b5563" }}>
-        Departure: {dt.toLocaleString()}
-      </p>
+      <p style={{ margin: 0, color: "#4b5563" }}>Departure: {dt.toLocaleString()}</p>
 
       <div
         style={{
@@ -310,9 +293,34 @@ export default function RiderTripPage() {
             </div>
           )}
 
-          {booking.totalPriceCents != null && (
+          {/* ✅ Fare block: show base + final if discounted */}
+          {effective != null && (
             <div>
-              <strong>Fare:</strong> ${formatMoney(booking.totalPriceCents)}
+              <strong>Fare:</strong>{" "}
+              {hasDiscount ? (
+                <>
+                  <span style={{ textDecoration: "line-through", color: "#6b7280", marginRight: 8 }}>
+                    ${formatMoney(base!)}
+                  </span>
+                  <span style={{ fontWeight: 700 }}>${formatMoney(effective)}</span>
+                  <span style={{ marginLeft: 8, color: "#166534", fontWeight: 600 }}>
+                    ({booking.paymentType === "CASH" ? "cash discount" : "discount"})
+                  </span>
+                </>
+              ) : (
+                <span style={{ fontWeight: 700 }}>${formatMoney(effective)}</span>
+              )}
+            </div>
+          )}
+
+          {booking.paymentType && (
+            <div>
+              <strong>Payment:</strong> {booking.paymentType}
+              {booking.paymentType === "CASH" && (booking.cashDiscountBps ?? 0) > 0 ? (
+                <span style={{ marginLeft: 8, color: "#166534", fontWeight: 600 }}>
+                  ({Math.round((booking.cashDiscountBps ?? 0) / 100)}% off)
+                </span>
+              ) : null}
             </div>
           )}
 
@@ -324,15 +332,13 @@ export default function RiderTripPage() {
 
           {booking.tripStartedAt && (
             <div>
-              <strong>Trip started:</strong>{" "}
-              {new Date(booking.tripStartedAt).toLocaleString()}
+              <strong>Trip started:</strong> {new Date(booking.tripStartedAt).toLocaleString()}
             </div>
           )}
 
           {booking.tripCompletedAt && (
             <div>
-              <strong>Trip completed:</strong>{" "}
-              {new Date(booking.tripCompletedAt).toLocaleString()}
+              <strong>Trip completed:</strong> {new Date(booking.tripCompletedAt).toLocaleString()}
             </div>
           )}
         </div>
@@ -349,11 +355,7 @@ export default function RiderTripPage() {
   );
 }
 
-function ChatOverlay(props: {
-  conversationId: string;
-  readOnly: boolean;
-  onClose: () => void;
-}) {
+function ChatOverlay(props: { conversationId: string; readOnly: boolean; onClose: () => void }) {
   const { conversationId, readOnly, onClose } = props;
 
   const params = new URLSearchParams();
@@ -379,8 +381,7 @@ function ChatOverlay(props: {
           height: "min(650px, 100%)",
           background: "#fff",
           borderRadius: 16,
-          boxShadow:
-            "0 20px 35px rgba(15,23,42,0.35), 0 0 0 1px rgba(148,163,184,0.15)",
+          boxShadow: "0 20px 35px rgba(15,23,42,0.35), 0 0 0 1px rgba(148,163,184,0.15)",
           display: "flex",
           flexDirection: "column",
           overflow: "hidden",
@@ -396,30 +397,18 @@ function ChatOverlay(props: {
             fontSize: 14,
           }}
         >
-          <span style={{ fontWeight: 600 }}>
-            Chat with driver {readOnly ? "(read-only)" : ""}
-          </span>
+          <span style={{ fontWeight: 600 }}>Chat with driver {readOnly ? "(read-only)" : ""}</span>
           <button
             type="button"
             onClick={onClose}
-            style={{
-              border: "none",
-              background: "transparent",
-              cursor: "pointer",
-              fontSize: 18,
-              lineHeight: 1,
-            }}
+            style={{ border: "none", background: "transparent", cursor: "pointer", fontSize: 18, lineHeight: 1 }}
             aria-label="Close chat"
           >
             ×
           </button>
         </div>
 
-        <iframe
-          src={src}
-          style={{ border: "none", width: "100%", height: "100%" }}
-          title="Chat"
-        />
+        <iframe src={src} style={{ border: "none", width: "100%", height: "100%" }} title="Chat" />
       </div>
     </div>
   );

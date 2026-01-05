@@ -1,22 +1,17 @@
-// components/BookRideButton.tsx
 "use client";
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { useSession } from "next-auth/react";
 
-type Role = "RIDER" | "DRIVER" | undefined;
+type Role = "RIDER" | "DRIVER" | "ADMIN";
+function asRole(v: unknown): Role | null {
+  return v === "RIDER" || v === "DRIVER" || v === "ADMIN" ? v : null;
+}
 
 type BookRideResponse =
-  | {
-      ok: true;
-      bookingId: string;
-      conversationId: string | null;
-    }
-  | {
-      ok: false;
-      error: string;
-    };
+  | { ok: true; bookingId: string; conversationId: string | null }
+  | { ok: false; error: string };
 
 export function BookRideButton({ rideId }: { rideId: string }) {
   const { data: session, status } = useSession();
@@ -29,20 +24,18 @@ export function BookRideButton({ rideId }: { rideId: string }) {
   async function handleClick() {
     setError(null);
 
-    // Still resolving session → do nothing
     if (status === "loading") return;
 
-    // Not logged in → send to login, then back to home (driver board)
     if (!session) {
       router.push("/auth/login?callbackUrl=/");
       return;
     }
 
-    const role = (session.user as any)?.role as Role;
+    const role = asRole((session.user as any)?.role);
 
-    // Riders cannot accept rides
-    if (role === "RIDER") {
-      setError("Only drivers can accept rider requests.");
+    // Driver-only (optionally allow ADMIN)
+    if (role !== "DRIVER" && role !== "ADMIN") {
+      setError("Only drivers can book rides.");
       return;
     }
 
@@ -55,26 +48,19 @@ export function BookRideButton({ rideId }: { rideId: string }) {
         body: JSON.stringify({ rideId }),
       });
 
-      // Session expired mid-click
       if (res.status === 401) {
         router.push("/auth/login?callbackUrl=/");
         return;
       }
 
-      let data: BookRideResponse | null = null;
-      try {
-        data = (await res.json()) as BookRideResponse;
-      } catch {
-        throw new Error("Unexpected response from server.");
-      }
+      const data = (await res.json().catch(() => null)) as BookRideResponse | null;
 
-      if (!res.ok || !data || !("ok" in data) || !data.ok) {
+      if (!res.ok || !data?.ok) {
         throw new Error((data as any)?.error || "Booking failed.");
       }
 
       setSuccess(true);
 
-      // Redirect driver to portal and let portal open the chat
       if (data.conversationId) {
         router.push(
           `/driver/portal?conversationId=${encodeURIComponent(
@@ -82,12 +68,11 @@ export function BookRideButton({ rideId }: { rideId: string }) {
           )}&autoOpenChat=1`
         );
       } else {
-        // No chat created (should be rare) – fall back to portal
         router.push("/driver/portal");
       }
     } catch (e: any) {
       console.error(e);
-      setError(e.message || "Something went wrong.");
+      setError(e?.message || "Something went wrong.");
     } finally {
       setLoading(false);
     }

@@ -6,7 +6,8 @@ import { prisma } from "../../../lib/prisma";
 
 type DashboardRide = {
   id: string;
-  departureTime: string; // ISO
+  departureTime: string;    // keep for display if you want
+  departureTimeMs: number;  // ✅ add this (source of truth)
   status: string;
   totalPriceCents: number;
   distanceMiles: number;
@@ -15,23 +16,15 @@ type DashboardRide = {
 };
 
 type DashboardStatsResponse =
-  | {
-      ok: true;
-      rides: DashboardRide[];
-    }
-  | {
-      ok: false;
-      error: string;
-    };
+  | { ok: true; rides: DashboardRide[] }
+  | { ok: false; error: string };
 
 export default async function handler(
   req: NextApiRequest,
   res: NextApiResponse<DashboardStatsResponse>
 ) {
   if (req.method !== "GET") {
-    return res
-      .status(405)
-      .json({ ok: false, error: "Method not allowed" });
+    return res.status(405).json({ ok: false, error: "Method not allowed" });
   }
 
   const session = await getServerSession(req, res, authOptions);
@@ -39,32 +32,22 @@ export default async function handler(
   const user = session?.user as
     | ({
         id?: string;
-        name?: string | null;
-        email?: string | null;
-        image?: string | null;
-      } & {
-        role?: "RIDER" | "DRIVER";
-      })
+        role?: "RIDER" | "DRIVER" | "ADMIN";
+      } & Record<string, any>)
     | undefined;
 
   if (!user?.id) {
-    return res
-      .status(401)
-      .json({ ok: false, error: "Not authenticated as driver" });
+    return res.status(401).json({ ok: false, error: "Not authenticated" });
   }
 
-  const role = user.role;
-
-  if (role !== "DRIVER") {
-    return res.status(403).json({
-      ok: false,
-      error: "Only drivers can access dashboard stats",
-    });
+  // If you want ADMIN to be able to view driver dashboard stats for themselves, allow it.
+  // If you want ADMIN to view other drivers, we’ll add query params later.
+  if (user.role !== "DRIVER" && user.role !== "ADMIN") {
+    return res.status(403).json({ ok: false, error: "Only drivers can access dashboard stats" });
   }
 
   const driverId = user.id;
 
-  // Limit to last 12 months for dashboard data
   const since = new Date();
   since.setFullYear(since.getFullYear() - 1);
 
@@ -73,18 +56,24 @@ export default async function handler(
       where: {
         driverId,
         status: "COMPLETED",
-        departureTime: {
-          gte: since,
-        },
+        departureTime: { gte: since },
       },
-      orderBy: {
-        departureTime: "desc",
+      orderBy: { departureTime: "desc" },
+      select: {
+        id: true,
+        departureTime: true,
+        status: true,
+        totalPriceCents: true,
+        distanceMiles: true,
+        originCity: true,
+        destinationCity: true,
       },
     });
 
     const mapped: DashboardRide[] = rides.map((r) => ({
       id: r.id,
       departureTime: r.departureTime.toISOString(),
+      departureTimeMs: r.departureTime.getTime(), // ✅
       status: r.status,
       totalPriceCents: r.totalPriceCents ?? 0,
       distanceMiles: r.distanceMiles ?? 0,
@@ -95,9 +84,6 @@ export default async function handler(
     return res.status(200).json({ ok: true, rides: mapped });
   } catch (err) {
     console.error("Error loading dashboard stats", err);
-    return res.status(500).json({
-      ok: false,
-      error: "Failed to load dashboard stats",
-    });
+    return res.status(500).json({ ok: false, error: "Failed to load dashboard stats" });
   }
 }

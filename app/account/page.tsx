@@ -36,8 +36,8 @@ type NormalizedMe = {
 function normalizeMe(raw: MePayload): NormalizedMe {
   if (!raw || raw.ok !== true) throw new Error((raw as any)?.error || "Could not load account.");
 
-  // IMPORTANT: we’re removing BOTH from the product behavior.
-  // If any stale token says BOTH, treat it as DRIVER to avoid forcing rider setup.
+  // IMPORTANT: we’re removing xxxx from the product behavior.
+  // If any stale token says xxxx, treat it as DRIVER to avoid forcing rider setup.
   const roleRaw = raw.user.role;
   const role: Role = roleRaw === "RIDER" ? "RIDER" : "DRIVER";
 

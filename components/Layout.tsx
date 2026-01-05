@@ -1,15 +1,12 @@
+// components/Layout.tsx
+"use client";
+
 import type { ReactNode } from "react";
-import { Header } from "./Header";
 
-type LayoutProps = {
-  children: ReactNode;
-};
-
-export function Layout({ children }: LayoutProps) {
+export default function Layout({ children }: { children: ReactNode }) {
   return (
-    <>
-      <Header />
+    <div className="min-h-screen bg-slate-50 text-slate-900">
       {children}
-    </>
+    </div>
   );
 }
