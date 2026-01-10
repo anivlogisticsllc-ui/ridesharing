@@ -3,6 +3,7 @@
 
 import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useRef, useState } from "react";
+import Link from "next/link";
 
 type BookingStatus = "PENDING" | "CONFIRMED" | "COMPLETED" | "CANCELLED" | "EXPIRED";
 type PaymentType = "CARD" | "CASH";
@@ -613,7 +614,7 @@ useEffect(() => {
           </p>
         </div>
 
-        import Link from "next/link";
+        
 
         /* ... */
 
