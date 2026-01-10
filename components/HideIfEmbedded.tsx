@@ -1,20 +1,17 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 
 export function HideIfEmbedded({ children }: { children: React.ReactNode }) {
-  const [embedded, setEmbedded] = useState(false);
-
-  useEffect(() => {
+  const [embedded] = useState<boolean>(() => {
+    if (typeof window === "undefined") return false;
     try {
-      if (window.self !== window.top) {
-        setEmbedded(true);
-      }
+      return window.self !== window.top;
     } catch {
       // Cross-origin iframe → assume embedded
-      setEmbedded(true);
+      return true;
     }
-  }, []);
+  });
 
   if (embedded) return null;
   return <>{children}</>;

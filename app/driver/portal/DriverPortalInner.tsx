@@ -1,14 +1,11 @@
+// app/driver/portal/DriverPortalInner.tsx
 "use client";
 
 import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { useSession } from "next-auth/react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { TripMeter } from "@/components/driver/TripMeter";
-import {
-  computeMembershipState,
-  formatDate,
-  type MeMembership,
-} from "@/lib/membership";
+import { computeMembershipState, formatDate, type MeMembership } from "@/lib/membership";
 import { daysUntil } from "@/lib/dateUtils";
 
 type ServiceCity = {
@@ -28,8 +25,7 @@ type DriverProfile = {
 
 type DriverProfileResponse =
   | { ok: true; profile: DriverProfile | null }
-  | { ok: false; error: string }
-  | any;
+  | { ok: false; error: string };
 
 type RideStatusUI = "OPEN" | "ACCEPTED" | "IN_ROUTE" | "COMPLETED" | "CANCELLED";
 
@@ -41,10 +37,12 @@ type DriverRide = {
   destinationCity: string;
   departureTime: string; // ISO
   status: RideStatusUI;
+
   riderName: string | null;
   riderPublicId: string | null;
 
   conversationId: string | null;
+  unreadCount?: number;
 
   tripStartedAt: string | null;
   tripCompletedAt: string | null;
@@ -77,6 +75,11 @@ type MembershipApiResponse =
     }
   | { ok: false; error: string };
 
+type SessionUser = {
+  role?: "RIDER" | "DRIVER" | "BOTH" | "ADMIN";
+  name?: string | null;
+} & Record<string, unknown>;
+
 /* ---------- Helpers ---------- */
 
 function isSameDay(a: Date, b: Date) {
@@ -93,16 +96,63 @@ function safeDate(value: string | null | undefined): Date | null {
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
+function isObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null;
+}
+
+function extractProfilePayload(raw: unknown): DriverProfile | null {
+  if (!isObject(raw)) return null;
+
+  // Accept either { ok:true, profile } or legacy-ish shapes
+  const ok = raw.ok === true;
+  const profileCandidate =
+    (ok && raw.profile) ? raw.profile :
+    raw.driverProfile ? raw.driverProfile :
+    raw.profile ? raw.profile :
+    null;
+
+  if (!isObject(profileCandidate)) return null;
+  if (!Array.isArray(profileCandidate.serviceCities)) return null;
+
+  return profileCandidate as unknown as DriverProfile;
+}
+
 async function readApiError(res: Response): Promise<string> {
   const text = await res.text().catch(() => "");
   if (!text) return `Request failed (HTTP ${res.status}).`;
 
   try {
-    const json = JSON.parse(text);
-    return json?.error || json?.message || `Request failed (HTTP ${res.status}).`;
+    const json: unknown = JSON.parse(text);
+    if (isObject(json)) {
+      const maybeError = json.error ?? json.message;
+      if (typeof maybeError === "string" && maybeError.trim()) return maybeError;
+    }
+    return `Request failed (HTTP ${res.status}).`;
   } catch {
     return text.slice(0, 300) || `Request failed (HTTP ${res.status}).`;
   }
+}
+
+async function markConversationRead(conversationId: string) {
+  await fetch("/api/chat/mark-read", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ conversationId }),
+  }).catch(() => null);
+}
+
+function normalizeRide(raw: DriverRide): DriverRide {
+  const canonicalRideId = String(raw.rideId ?? raw.id ?? "");
+  return {
+    ...raw,
+    id: String(raw.id ?? canonicalRideId),
+    rideId: canonicalRideId,
+    bookingId: raw.bookingId ?? null,
+    tripStartedAt: raw.tripStartedAt ?? null,
+    tripCompletedAt: raw.tripCompletedAt ?? null,
+    conversationId: raw.conversationId ?? null,
+    unreadCount: typeof raw.unreadCount === "number" ? raw.unreadCount : 0,
+  };
 }
 
 /* ---------- Component ---------- */
@@ -129,9 +179,11 @@ export default function DriverPortalInner() {
 
   const [activeChat, setActiveChat] = useState<ActiveChatContext | null>(null);
 
-  // Ride action feedback
   const [rideActionError, setRideActionError] = useState<string | null>(null);
   const [busyRideId, setBusyRideId] = useState<string | null>(null);
+
+  const sessionUser = (session?.user ?? null) as SessionUser | null;
+  const sessionRole = sessionUser?.role;
 
   /* ---------- Session / access control + initial loads ---------- */
 
@@ -143,8 +195,7 @@ export default function DriverPortalInner() {
       return;
     }
 
-    const role = (session.user as any).role as "RIDER" | "DRIVER" | "BOTH" | undefined;
-    if (role !== "DRIVER" && role !== "BOTH") {
+    if (sessionRole !== "DRIVER" && sessionRole !== "BOTH") {
       router.replace("/");
       return;
     }
@@ -152,14 +203,10 @@ export default function DriverPortalInner() {
     async function loadProfile() {
       try {
         const res = await fetch("/api/driver/service-cities", { cache: "no-store" });
-        const data: DriverProfileResponse = await res.json().catch(() => null);
+        const raw = (await res.json().catch(() => null)) as unknown;
 
-        const profile =
-          (data?.ok && data?.profile) || data?.driverProfile || data?.profile || null;
-
-        if (res.ok && profile?.serviceCities) {
-          setServiceCities(profile.serviceCities);
-        }
+        const profile = extractProfilePayload(raw);
+        if (res.ok && profile?.serviceCities) setServiceCities(profile.serviceCities);
       } catch (err) {
         console.error("Error loading driver profile:", err);
       } finally {
@@ -179,7 +226,7 @@ export default function DriverPortalInner() {
         const json = (await res.json().catch(() => null)) as MembershipApiResponse | null;
 
         if (!res.ok || !json?.ok) {
-          console.warn("Membership API error:", (json as any)?.error);
+          // keep silent; membership is optional here
           setMembership(null);
           return;
         }
@@ -196,27 +243,20 @@ export default function DriverPortalInner() {
     async function loadRides() {
       try {
         const res = await fetch("/api/driver/portal-rides", { cache: "no-store" });
-        const data: PortalRidesResponse = await res.json();
+        const data = (await res.json().catch(() => null)) as PortalRidesResponse | null;
 
-        if (!res.ok || !data.ok) {
-          throw new Error((data as any)?.error || "Failed to load rides.");
+        if (!data || !res.ok || !data.ok) {
+          const msg = data && "error" in data ? data.error : "Failed to load rides.";
+          throw new Error(msg);
         }
 
-        const normalize = (r: any): DriverRide => ({
-          ...r,
-          rideId: r.rideId ?? r.id,
-          bookingId: r.bookingId ?? null, // keep it
-          tripStartedAt: r.tripStartedAt ?? null,
-          tripCompletedAt: r.tripCompletedAt ?? null,
-          conversationId: r.conversationId ?? null,
-        });
-
-        setAcceptedRides(data.accepted.map(normalize));
-        setCompletedRides(data.completed.map(normalize));
+        setAcceptedRides(data.accepted.map(normalizeRide));
+        setCompletedRides(data.completed.map(normalizeRide));
         setRidesError(null);
-      } catch (err: any) {
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Could not load rides.";
         console.error("Error loading driver rides:", err);
-        setRidesError(err?.message || "Could not load rides.");
+        setRidesError(message);
       } finally {
         setRidesLoading(false);
       }
@@ -225,7 +265,7 @@ export default function DriverPortalInner() {
     loadProfile();
     loadMembership();
     loadRides();
-  }, [session, status, router]);
+  }, [session, status, router, sessionRole]);
 
   /* ---------- Auto-open chat when arriving with query params ---------- */
 
@@ -262,7 +302,7 @@ export default function DriverPortalInner() {
     }
 
     const riderLabel = ride.riderPublicId || ride.riderName || "there";
-    const driverLabel = (session?.user as any)?.name || "your driver";
+    const driverLabel = sessionUser?.name || "your driver";
 
     const riderFirst = String(riderLabel).trim().split(" ")[0];
     const driverFirst = String(driverLabel).trim().split(" ")[0];
@@ -275,7 +315,7 @@ export default function DriverPortalInner() {
     });
 
     router.replace("/driver/portal");
-  }, [searchParams, activeChat, ridesLoading, acceptedRides, router, session]);
+  }, [searchParams, activeChat, ridesLoading, acceptedRides, router, sessionUser]);
 
   /* ---------- Service cities actions ---------- */
 
@@ -295,14 +335,18 @@ export default function DriverPortalInner() {
 
       if (!res.ok) throw new Error(await readApiError(res));
 
-      const data = await res.json().catch(() => null);
-      if (!data?.ok) throw new Error(data?.error || "Failed to add city");
+      const data = (await res.json().catch(() => null)) as unknown;
+      if (!isObject(data) || data.ok !== true || !isObject(data.city)) {
+        const errMsg = isObject(data) && typeof data.error === "string" ? data.error : "Failed to add city";
+        throw new Error(errMsg);
+      }
 
-      setServiceCities((prev) => [...prev, data.city]);
+      setServiceCities((prev) => [...prev, data.city as unknown as ServiceCity]);
       setCityName("");
-    } catch (err: any) {
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Something went wrong";
       console.error("Error adding service city:", err);
-      setCityError(err?.message || "Something went wrong");
+      setCityError(message);
     } finally {
       setSavingCity(false);
     }
@@ -318,8 +362,11 @@ export default function DriverPortalInner() {
 
       if (!res.ok) throw new Error(await readApiError(res));
 
-      const data = await res.json().catch(() => null);
-      if (!data?.ok) throw new Error(data?.error || "Failed to remove city");
+      const data = (await res.json().catch(() => null)) as unknown;
+      if (!isObject(data) || data.ok !== true) {
+        const errMsg = isObject(data) && typeof data.error === "string" ? data.error : "Failed to remove city";
+        throw new Error(errMsg);
+      }
 
       setServiceCities((prev) => prev.filter((c) => c.id !== id));
     } catch (err) {
@@ -344,8 +391,11 @@ export default function DriverPortalInner() {
 
       if (!res.ok) throw new Error(await readApiError(res));
 
-      const data = await res.json().catch(() => null);
-      if (!data?.ok) throw new Error(data?.error || "Failed to start ride.");
+      const data = (await res.json().catch(() => null)) as unknown;
+      if (!isObject(data) || data.ok !== true) {
+        const errMsg = isObject(data) && typeof data.error === "string" ? data.error : "Failed to start ride.";
+        throw new Error(errMsg);
+      }
 
       const nowIso = new Date().toISOString();
       setAcceptedRides((prev) =>
@@ -355,9 +405,10 @@ export default function DriverPortalInner() {
             : r
         )
       );
-    } catch (err: any) {
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to start ride.";
       console.error("Error starting ride:", err);
-      setRideActionError(err?.message || "Failed to start ride.");
+      setRideActionError(message);
     } finally {
       setBusyRideId(null);
     }
@@ -386,8 +437,11 @@ export default function DriverPortalInner() {
 
       if (!res.ok) throw new Error(await readApiError(res));
 
-      const data = await res.json().catch(() => null);
-      if (!data?.ok) throw new Error(data?.error || "Failed to complete ride.");
+      const data = (await res.json().catch(() => null)) as unknown;
+      if (!isObject(data) || data.ok !== true) {
+        const errMsg = isObject(data) && typeof data.error === "string" ? data.error : "Failed to complete ride.";
+        throw new Error(errMsg);
+      }
 
       const nowIso = new Date().toISOString();
 
@@ -401,6 +455,7 @@ export default function DriverPortalInner() {
           tripCompletedAt: ride.tripCompletedAt ?? nowIso,
           distanceMiles: summary?.distanceMiles ?? ride.distanceMiles ?? null,
           totalPriceCents: summary?.fareCents ?? ride.totalPriceCents ?? null,
+          unreadCount: 0,
         };
 
         setCompletedRides((prevCompleted) => {
@@ -410,9 +465,10 @@ export default function DriverPortalInner() {
 
         return prevAccepted.filter((r) => r.rideId !== rideId);
       });
-    } catch (err: any) {
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to complete ride.";
       console.error("Error completing ride:", err);
-      setRideActionError(err?.message || "Failed to complete ride.");
+      setRideActionError(message);
     } finally {
       setBusyRideId(null);
     }
@@ -442,7 +498,11 @@ export default function DriverPortalInner() {
     }
 
     if (state === "ACTIVE") {
-      return { tone: "good" as const, title: "Driver membership is active.", body: "Thanks — billing is active for your account." };
+      return {
+        tone: "good" as const,
+        title: "Driver membership is active.",
+        body: "Thanks — billing is active for your account.",
+      };
     }
 
     if (state === "EXPIRED") {
@@ -453,7 +513,11 @@ export default function DriverPortalInner() {
       };
     }
 
-    return { tone: "warning" as const, title: "No membership found.", body: "If this is unexpected, open Membership & Billing to fix it." };
+    return {
+      tone: "warning" as const,
+      title: "No membership found.",
+      body: "If this is unexpected, open Membership & Billing to fix it.",
+    };
   }, [membership]);
 
   /* ---------- Derived lists ---------- */
@@ -496,7 +560,7 @@ export default function DriverPortalInner() {
     return <p className="py-10 text-center text-slate-600">Loading…</p>;
   }
 
-  const driverName = (session.user as any)?.name || "your driver";
+  const driverName = sessionUser?.name || "your driver";
 
   return (
     <main className="min-h-[calc(100vh-4rem)] bg-slate-50">
@@ -554,6 +618,7 @@ export default function DriverPortalInner() {
             <ul className="space-y-3">
               {sortedAcceptedRides.map((ride) => {
                 const dt = safeDate(ride.departureTime) ?? new Date(ride.departureTime);
+
                 const meterStatus: "OPEN" | "FULL" | "IN_ROUTE" | "COMPLETED" =
                   ride.status === "IN_ROUTE"
                     ? "IN_ROUTE"
@@ -567,9 +632,11 @@ export default function DriverPortalInner() {
                 const riderLabel = ride.riderPublicId || ride.riderName || "there";
                 const isBusy = busyRideId === ride.rideId;
 
+                const unread = ride.unreadCount ?? 0;
+
                 return (
                   <li
-                    key={ride.id}
+                    key={`${ride.rideId}-${ride.bookingId ?? "nobook"}-${ride.departureTime}`}
                     className="space-y-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm"
                   >
                     <div>
@@ -603,8 +670,16 @@ export default function DriverPortalInner() {
 
                       <button
                         type="button"
-                        onClick={() => {
+                        onClick={async () => {
                           if (chatDisabled || !ride.conversationId) return;
+
+                          await markConversationRead(ride.conversationId);
+
+                          setAcceptedRides((prev) =>
+                            prev.map((r) =>
+                              r.rideId === ride.rideId ? { ...r, unreadCount: 0 } : r
+                            )
+                          );
 
                           const riderFirst = String(riderLabel).trim().split(" ")[0];
                           const driverFirst = String(driverName).trim().split(" ")[0];
@@ -617,13 +692,18 @@ export default function DriverPortalInner() {
                           });
                         }}
                         disabled={chatDisabled || isBusy}
-                        className={`rounded-full px-4 py-2 text-xs font-medium text-white ${
+                        className={`relative rounded-full px-4 py-2 text-xs font-medium text-white ${
                           chatDisabled || isBusy
                             ? "cursor-not-allowed bg-slate-300 opacity-60"
                             : "bg-indigo-600 hover:bg-indigo-700"
                         }`}
                       >
                         View chat
+                        {unread > 0 ? (
+                          <span className="ml-2 inline-flex items-center justify-center rounded-full bg-rose-600 px-2 py-0.5 text-[10px] font-semibold text-white">
+                            {unread > 99 ? "99+" : unread}
+                          </span>
+                        ) : null}
                       </button>
                     </div>
 
@@ -661,7 +741,7 @@ export default function DriverPortalInner() {
 
                 return (
                   <li
-                    key={ride.id}
+                    key={`${ride.bookingId ?? "nobook"}-${ride.rideId}-${ride.tripCompletedAt ?? ride.departureTime}`}
                     className="flex flex-col gap-2 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm md:flex-row md:items-center md:justify-between"
                   >
                     <div>
@@ -688,7 +768,7 @@ export default function DriverPortalInner() {
                       <button
                         type="button"
                         onClick={() => {
-                          if (!ride.bookingId) return; // should be present for completed rides, but safe guard
+                          if (!ride.bookingId) return;
                           router.push(`/receipt/${ride.bookingId}`);
                         }}
                         disabled={!ride.bookingId}
@@ -701,12 +781,19 @@ export default function DriverPortalInner() {
                         View receipt
                       </button>
 
-
-
                       <button
                         type="button"
-                        onClick={() => {
+                        onClick={async () => {
                           if (!canChat || !ride.conversationId) return;
+
+                          await markConversationRead(ride.conversationId);
+
+                          setCompletedRides((prev) =>
+                            prev.map((r) =>
+                              r.rideId === ride.rideId ? { ...r, unreadCount: 0 } : r
+                            )
+                          );
+
                           setActiveChat({
                             conversationId: ride.conversationId,
                             prefill: null,
@@ -809,7 +896,7 @@ function ChatOverlay(props: { context: ActiveChatContext; onClose: () => void })
 
   useEffect(() => {
     function handleMessage(event: MessageEvent) {
-      if (event?.data?.type === "ridechat:close") onClose();
+      if (isObject(event?.data) && event.data.type === "ridechat:close") onClose();
     }
     window.addEventListener("message", handleMessage);
     return () => window.removeEventListener("message", handleMessage);

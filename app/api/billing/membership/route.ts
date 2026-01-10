@@ -3,12 +3,7 @@ import { NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/pages/api/auth/[...nextauth]";
 import { prisma } from "@/lib/prisma";
-import {
-  MembershipStatus,
-  MembershipType,
-  UserRole,
-  type MembershipPlan,
-} from "@prisma/client";
+import { MembershipStatus, MembershipType, UserRole } from "@prisma/client";
 
 const PRICING = {
   RIDER_MONTHLY_CENTS: 299,
@@ -27,6 +22,15 @@ type BillingInfo = {
   } | null;
 };
 
+type MeMembership = {
+  plan: string | null; // display only
+  active: boolean;
+  status: "ACTIVE" | "EXPIRED" | null;
+  trialEndsAt: string | null; // ISO
+  currentPeriodEnd: string | null; // ISO
+  cancelAtPeriodEnd: boolean;
+};
+
 type ApiOk = {
   ok: true;
   user: {
@@ -36,21 +40,7 @@ type ApiOk = {
     role: UserRole;
     onboardingCompleted: boolean;
   };
-  membership: {
-    plan: MembershipPlan | null;
-    kind: "TRIAL" | "PAID" | "NONE";
-    active: boolean;
-    status: MembershipStatus | null;
-
-    trialEndsAt: string | null;
-    currentPeriodEnd: string | null;
-
-    cancelAtPeriodEnd: boolean;
-
-    latestMembershipId: string | null;
-    latestMembershipType: MembershipType;
-    latestMembershipExpiry: string | null;
-  };
+  membership: MeMembership;
   billing: BillingInfo;
 };
 
@@ -60,20 +50,22 @@ function roleToMembershipType(role: UserRole): MembershipType {
   return role === UserRole.DRIVER ? MembershipType.DRIVER : MembershipType.RIDER;
 }
 
-function computeStatusFromExpiry(expiryDate: Date, now: Date): MembershipStatus {
-  return expiryDate.getTime() > now.getTime()
-    ? MembershipStatus.ACTIVE
-    : MembershipStatus.EXPIRED;
-}
-
 function priceForRole(role: UserRole): number {
   return role === UserRole.DRIVER
     ? PRICING.DRIVER_MONTHLY_CENTS
     : PRICING.RIDER_MONTHLY_CENTS;
 }
 
+function statusFromExpiry(expiryDate: Date, now: Date): MembershipStatus {
+  return expiryDate.getTime() > now.getTime()
+    ? MembershipStatus.ACTIVE
+    : MembershipStatus.EXPIRED;
+}
+
 export async function GET() {
   try {
+    // NOTE: This relies on NextAuth being configured to work in App Router with this call.
+    // If you ever see flaky auth here, we’ll switch to NextAuth's App Router helper pattern.
     const session = await getServerSession(authOptions);
     const userId = (session?.user as any)?.id as string | undefined;
 
@@ -109,16 +101,12 @@ export async function GET() {
       where: { userId: user.id, type: expectedType },
       orderBy: { startDate: "desc" },
       select: {
-        id: true,
-        type: true,
         plan: true,
-        startDate: true,
         expiryDate: true,
         amountPaidCents: true,
       },
     });
 
-    // Stripe later: for now, always "no card"
     const billing: BillingInfo = {
       currency: "USD",
       priceCentsPerMonth: priceForRole(user.role),
@@ -126,6 +114,7 @@ export async function GET() {
       defaultPaymentMethod: null,
     };
 
+    // No membership row at all
     if (!latest) {
       const payload: ApiOk = {
         ok: true,
@@ -138,15 +127,11 @@ export async function GET() {
         },
         membership: {
           plan: null,
-          kind: "NONE",
           active: false,
           status: null,
           trialEndsAt: null,
           currentPeriodEnd: null,
           cancelAtPeriodEnd: false,
-          latestMembershipId: null,
-          latestMembershipType: expectedType,
-          latestMembershipExpiry: null,
         },
         billing,
       };
@@ -154,8 +139,35 @@ export async function GET() {
       return NextResponse.json(payload);
     }
 
-    const computedStatus = computeStatusFromExpiry(latest.expiryDate, now);
-    const active = computedStatus === MembershipStatus.ACTIVE;
+    // Fail closed if legacy/bad row
+    if (!latest.expiryDate) {
+      const payload: ApiOk = {
+        ok: true,
+        user: {
+          id: user.id,
+          name: user.name ?? null,
+          email: user.email,
+          role: user.role,
+          onboardingCompleted: Boolean(user.onboardingCompleted),
+        },
+        membership: {
+          plan: latest.plan ?? null,
+          active: false,
+          status: "EXPIRED",
+          trialEndsAt: null,
+          currentPeriodEnd: null,
+          cancelAtPeriodEnd: false,
+        },
+        billing,
+      };
+
+      return NextResponse.json(payload);
+    }
+
+    const computed = statusFromExpiry(latest.expiryDate, now);
+    const active = computed === MembershipStatus.ACTIVE;
+
+    // MVP definition: trial = active + amountPaidCents === 0
     const isTrial = active && (latest.amountPaidCents ?? 0) === 0;
 
     const payload: ApiOk = {
@@ -169,15 +181,11 @@ export async function GET() {
       },
       membership: {
         plan: latest.plan ?? null,
-        kind: isTrial ? "TRIAL" : "PAID",
         active,
-        status: computedStatus,
+        status: computed === MembershipStatus.ACTIVE ? "ACTIVE" : "EXPIRED",
         trialEndsAt: isTrial ? latest.expiryDate.toISOString() : null,
         currentPeriodEnd: latest.expiryDate.toISOString(),
         cancelAtPeriodEnd: false,
-        latestMembershipId: latest.id,
-        latestMembershipType: latest.type,
-        latestMembershipExpiry: latest.expiryDate.toISOString(),
       },
       billing,
     };

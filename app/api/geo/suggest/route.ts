@@ -124,7 +124,7 @@ export async function GET(req: NextRequest) {
 
     const data = await resp.json();
 
-    let suggestions: Suggestion[] = (data.features || []).map((f: any) => {
+    const suggestions: Suggestion[] = (data.features || []).map((f: any) => {
       const context = (f.context || []) as any[];
 
       const getContext = (prefix: string) =>

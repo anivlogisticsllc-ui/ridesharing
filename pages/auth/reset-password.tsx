@@ -94,9 +94,14 @@ export default function ResetPasswordPage() {
           <>
             <p style={{ color: "#16a34a" }}>
               Your password has been updated. You may now{" "}
-              <a href="/auth/login" style={{ color: "#2563eb" }}>
+              import Link from "next/link";
+
+              /* ... */
+
+              <Link href="/auth/login" style={{ color: "#2563eb" }}>
                 sign in
-              </a>
+              </Link>
+
               .
             </p>
             <p style={{ marginTop: 8, fontSize: 13, color: "#666" }}>

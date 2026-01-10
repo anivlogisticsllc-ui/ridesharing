@@ -205,10 +205,16 @@ model Conversation {
   rider     User      @relation("RiderConversations", fields: [riderId], references: [id])
   messages  Message[]
 
+  // NEW: per-user "read cursor"
+driverLastReadAt DateTime?
+riderLastReadAt  DateTime?
+
+
   @@index([rideId])
   @@index([driverId])
   @@index([riderId])
 }
+
 
 model Message {
   id             String       @id @default(cuid())

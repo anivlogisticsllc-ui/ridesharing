@@ -6,27 +6,31 @@ import { prisma } from "../../../lib/prisma";
 
 type ConversationNotification = {
   conversationId: string;
+  unreadCount: number;
+
   latestMessageId: string | null;
   latestMessageCreatedAt: string | null;
   latestMessageSenderId: string | null;
+
   senderType: "RIDER" | "DRIVER" | "UNKNOWN";
 };
 
 type ApiResponse =
-  | { ok: true; notifications: ConversationNotification[] }
+  | { ok: true; totalUnread: number; notifications: ConversationNotification[] }
   | { ok: false; error: string };
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse<ApiResponse>) {
   if (req.method !== "GET") {
+    res.setHeader("Allow", "GET");
     return res.status(405).json({ ok: false, error: "Method not allowed" });
   }
+
+  res.setHeader("Cache-Control", "no-store, max-age=0");
 
   const session = await getServerSession(req, res, authOptions);
   const user = session?.user as { id?: string; role?: "RIDER" | "DRIVER" } | undefined;
 
-  if (!user?.id) {
-    return res.status(401).json({ ok: false, error: "Not authenticated" });
-  }
+  if (!user?.id) return res.status(401).json({ ok: false, error: "Not authenticated" });
 
   const driverId = user.id;
 
@@ -36,46 +40,64 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       orderBy: { updatedAt: "desc" },
       select: {
         id: true,
+        createdAt: true,
         riderId: true,
         driverId: true,
+        driverLastReadAt: true, // NEW COLUMN
         messages: {
           orderBy: { createdAt: "desc" },
           take: 1,
           select: { id: true, createdAt: true, senderId: true },
         },
       },
+      take: 50,
     });
 
-    const notifications: ConversationNotification[] = conversations.map((c) => {
-      const latest = c.messages[0] ?? null;
+    if (!conversations.length) {
+      return res.status(200).json({ ok: true, totalUnread: 0, notifications: [] });
+    }
 
-      if (!latest) {
-        return {
+    // IMPORTANT: avoid Promise.all counts if your DB connection limit is tiny
+    // This sequential loop is slower but prevents melting your DB.
+    const rows: ConversationNotification[] = [];
+    let totalUnread = 0;
+
+    for (const c of conversations) {
+      const latest = c.messages[0] ?? null;
+      const since = c.driverLastReadAt ?? c.createdAt;
+
+      const unreadCount = await prisma.message.count({
+        where: {
           conversationId: c.id,
-          latestMessageId: null,
-          latestMessageCreatedAt: null,
-          latestMessageSenderId: null,
-          senderType: "UNKNOWN",
-        };
-      }
+          createdAt: { gt: since },
+          senderId: { not: driverId },
+        },
+      });
+
+      totalUnread += unreadCount;
 
       let senderType: "RIDER" | "DRIVER" | "UNKNOWN" = "UNKNOWN";
-      if (latest.senderId === c.riderId) senderType = "RIDER";
-      else if (latest.senderId === c.driverId) senderType = "DRIVER";
+      if (latest) {
+        if (latest.senderId === c.riderId) senderType = "RIDER";
+        else if (latest.senderId === c.driverId) senderType = "DRIVER";
+      }
 
-      return {
+      rows.push({
         conversationId: c.id,
-        latestMessageId: latest.id,
-        latestMessageCreatedAt: latest.createdAt.toISOString(),
-        latestMessageSenderId: latest.senderId,
+        unreadCount,
+        latestMessageId: latest?.id ?? null,
+        latestMessageCreatedAt: latest?.createdAt?.toISOString() ?? null,
+        latestMessageSenderId: latest?.senderId ?? null,
         senderType,
-      };
-    });
+      });
+    }
 
-    return res.status(200).json({ ok: true, notifications });
+    // If you only want “with unread” in the list, filter here.
+    const notifications = rows.filter((r) => r.unreadCount > 0);
+
+    return res.status(200).json({ ok: true, totalUnread, notifications });
   } catch (err) {
     console.error("Error loading driver chat notifications:", err);
     return res.status(500).json({ ok: false, error: "Failed to load notifications" });
   }
 }
-

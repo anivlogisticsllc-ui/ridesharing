@@ -46,13 +46,7 @@ function StatCard({
   );
 }
 
-function TabLink({
-  href,
-  children,
-}: {
-  href: string;
-  children: React.ReactNode;
-}) {
+function TabLink({ href, children }: { href: string; children: React.ReactNode }) {
   return (
     <Link
       href={href}
@@ -62,6 +56,19 @@ function TabLink({
     </Link>
   );
 }
+
+async function readApiError(res: Response) {
+  const text = await res.text().catch(() => "");
+  if (!text) return `Request failed (HTTP ${res.status}).`;
+  try {
+    const json = JSON.parse(text);
+    return json?.error || json?.message || `Request failed (HTTP ${res.status}).`;
+  } catch {
+    return text.slice(0, 300) || `Request failed (HTTP ${res.status}).`;
+  }
+}
+
+type ExtendType = "RIDER" | "DRIVER";
 
 export default function AdminDashboardPage() {
   const router = useRouter();
@@ -75,6 +82,13 @@ export default function AdminDashboardPage() {
 
   const callbackUrl = useMemo(() => encodeURIComponent("/admin"), []);
 
+  // --- Membership extend UI state ---
+  const [targetEmail, setTargetEmail] = useState("");
+  const [extendDays, setExtendDays] = useState(30);
+  const [extendType, setExtendType] = useState<ExtendType>("DRIVER");
+  const [extendBusy, setExtendBusy] = useState(false);
+  const [extendMsg, setExtendMsg] = useState<string | null>(null);
+
   async function load() {
     try {
       setError(null);
@@ -82,7 +96,6 @@ export default function AdminDashboardPage() {
 
       const res = await fetch("/api/admin/metrics", { cache: "no-store" });
 
-      // Hard auth failures: bounce to login (keeps behavior consistent)
       if (res.status === 401) {
         router.replace(`/auth/login?callbackUrl=${callbackUrl}`);
         return;
@@ -112,7 +125,6 @@ export default function AdminDashboardPage() {
     }
   }
 
-  // Gate: must be authenticated + ADMIN
   useEffect(() => {
     if (status === "loading") return;
 
@@ -122,7 +134,6 @@ export default function AdminDashboardPage() {
     }
 
     if (role !== "ADMIN") {
-      // Don’t auto-redirect silently; show Forbidden so it’s obvious what’s happening
       setLoading(false);
       setMetrics(null);
       setError("Forbidden");
@@ -146,13 +157,59 @@ export default function AdminDashboardPage() {
     ];
   }, [metrics]);
 
-  // Loading screen while NextAuth is figuring out session
+  async function handleExtendMembership() {
+    const email = targetEmail.trim().toLowerCase();
+
+    if (!email || !email.includes("@")) {
+      setExtendMsg("Enter a valid email address first.");
+      return;
+    }
+
+    const days = Number(extendDays);
+    if (!Number.isFinite(days) || days < 1 || days > 3650) {
+      setExtendMsg("Days must be between 1 and 3650.");
+      return;
+    }
+
+    setExtendBusy(true);
+    setExtendMsg(null);
+
+    try {
+      // Keep YOUR endpoint path (you said B is complete)
+      const res = await fetch("/api/admin/membership/extend-membership", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, days, type: extendType }),
+      });
+
+      if (!res.ok) throw new Error(await readApiError(res));
+
+      const json = await res.json().catch(() => null);
+      if (!json?.ok) throw new Error(json?.error || "Failed to extend membership.");
+
+      // Support both payload styles (in case your route returns `updated` array or single newExpiry)
+      const updated = json?.updated as Array<{ type: string; expiryDate: string }> | undefined;
+      const newExpiry = json?.newExpiry as string | undefined;
+
+      const detail =
+        updated?.length
+          ? updated
+              .map((u) => `${u.type} → ${new Date(u.expiryDate).toLocaleString()}`)
+              .join(" | ")
+          : newExpiry
+          ? `${extendType} → ${new Date(newExpiry).toLocaleString()}`
+          : "Updated.";
+
+      setExtendMsg(`Done. ${detail}`);
+    } catch (e: any) {
+      setExtendMsg(e?.message || "Failed to extend membership.");
+    } finally {
+      setExtendBusy(false);
+    }
+  }
+
   if (status === "loading") {
-    return (
-      <main className="p-8 text-sm text-slate-600">
-        Loading…
-      </main>
-    );
+    return <main className="p-8 text-sm text-slate-600">Loading…</main>;
   }
 
   return (
@@ -161,9 +218,7 @@ export default function AdminDashboardPage() {
         <header className="flex items-start justify-between gap-4">
           <div>
             <h1 className="text-3xl font-semibold text-slate-900">Admin</h1>
-            <p className="mt-1 text-sm text-slate-600">
-              Basic dashboard + user management.
-            </p>
+            <p className="mt-1 text-sm text-slate-600">Basic dashboard + user management.</p>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
@@ -180,6 +235,69 @@ export default function AdminDashboardPage() {
             </button>
           </div>
         </header>
+
+        {/* Membership tools */}
+        <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+          <h2 className="text-sm font-semibold text-slate-900">Membership tools</h2>
+          <p className="mt-1 text-xs text-slate-500">
+            Extends free access by updating <span className="font-medium">Membership.expiryDate</span>.
+          </p>
+
+          <div className="mt-4 grid gap-3 md:grid-cols-6">
+            <div className="md:col-span-3">
+              <label className="block text-[11px] font-medium uppercase tracking-wide text-slate-500">
+                Target email
+              </label>
+              <input
+                value={targetEmail}
+                onChange={(e) => setTargetEmail(e.target.value)}
+                placeholder="user@example.com"
+                className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+              />
+            </div>
+
+            <div className="md:col-span-1">
+              <label className="block text-[11px] font-medium uppercase tracking-wide text-slate-500">
+                Days
+              </label>
+              <input
+                type="number"
+                min={1}
+                max={3650}
+                value={extendDays}
+                onChange={(e) => setExtendDays(Number(e.target.value || 30))}
+                className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+              />
+            </div>
+
+            <div className="md:col-span-2">
+              <label className="block text-[11px] font-medium uppercase tracking-wide text-slate-500">
+                Type
+              </label>
+              <select
+                value={extendType}
+                onChange={(e) => setExtendType(e.target.value as ExtendType)}
+                className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+              >
+                <option value="DRIVER">DRIVER</option>
+                <option value="RIDER">RIDER</option>
+              </select>
+            </div>
+          </div>
+
+          <div className="mt-4 flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              onClick={handleExtendMembership}
+              disabled={extendBusy}
+              className="rounded-full bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-700 disabled:opacity-60"
+            >
+              {extendBusy ? "Extending…" : "Extend membership"}
+            </button>
+
+            {extendMsg ? <p className="text-sm text-slate-700">{extendMsg}</p> : null}
+          </div>
+        </section>
 
         {loading ? (
           <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
@@ -207,13 +325,6 @@ export default function AdminDashboardPage() {
                 Back home
               </Link>
             </div>
-
-            {error === "Forbidden" ? (
-              <p className="mt-3 text-xs text-rose-700/90">
-                If you expected admin access, your session role or the /api/admin/* routes are still
-                gating you as non-admin. Fix the API guards to check <code>role === "ADMIN"</code>.
-              </p>
-            ) : null}
           </div>
         ) : metrics ? (
           <>

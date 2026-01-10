@@ -1,9 +1,19 @@
 // pages/auth/register.tsx
-import { useState, useEffect, type FormEvent } from "react";
+import { useState, type FormEvent } from "react";
 import { useRouter } from "next/router";
 import { PasswordField } from "@/components/PasswordField";
 
 type RegisterError = string | null;
+type Plan = "rider" | "driver" | "both";
+
+function getInitialPlanFromUrl(): Plan {
+  if (typeof window === "undefined") return "rider";
+  const role = new URLSearchParams(window.location.search).get("role");
+  const upper = String(role || "").toUpperCase();
+  if (upper === "DRIVER") return "driver";
+  if (upper === "RIDER") return "rider";
+  return "rider";
+}
 
 export default function RegisterPage() {
   const router = useRouter();
@@ -17,22 +27,7 @@ export default function RegisterPage() {
   const [error, setError] = useState<RegisterError>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
-  // plan = "rider" | "driver" | "both"
-  const [plan, setPlan] = useState<"rider" | "driver" | "both">("rider");
-
-  // Initialize plan from ?role=RIDER / ?role=DRIVER in the URL
-  useEffect(() => {
-    if (!router.isReady) return;
-
-    const qRole =
-      typeof router.query.role === "string" ? router.query.role : "";
-
-    if (qRole.toUpperCase() === "DRIVER") {
-      setPlan("driver");
-    } else if (qRole.toUpperCase() === "RIDER") {
-      setPlan("rider");
-    }
-  }, [router.isReady, router.query.role]);
+  const [plan, setPlan] = useState<Plan>(() => getInitialPlanFromUrl());
 
   async function handleSubmit(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
@@ -64,28 +59,23 @@ export default function RegisterPage() {
           email: email.trim(),
           phone: phone.trim() || undefined,
           password,
-          plan, // becomes the role in the API
+          plan,
         }),
       });
 
       if (!res.ok) {
         let msg = "Could not create account.";
-
         try {
           const data = await res.json();
-          if (data?.error && typeof data.error === "string") {
-            msg = data.error;
-          }
+          if (data?.error && typeof data.error === "string") msg = data.error;
         } catch {
-          // ignore JSON parse error
+          // ignore
         }
-
         setError(msg);
         setIsSubmitting(false);
         return;
       }
 
-      // Registration OK → go to "check your email" page
       await router.push("/auth/check-email");
     } catch {
       setError("Network error. Please try again.");
@@ -114,21 +104,11 @@ export default function RegisterPage() {
           boxShadow: "0 2px 6px rgba(0,0,0,0.06)",
         }}
       >
-        <h1
-          style={{
-            fontSize: 24,
-            fontWeight: 600,
-            marginBottom: 8,
-          }}
-        >
-          Create an account
-        </h1>
+        <h1 style={{ fontSize: 24, fontWeight: 600, marginBottom: 8 }}>Create an account</h1>
         <p style={{ fontSize: 14, marginBottom: 16 }}>
-          Choose whether you want to ride or drive. You can adjust your plan
-          later.
+          Choose whether you want to ride or drive. You can adjust your plan later.
         </p>
 
-        {/* Error message */}
         {error && (
           <div
             style={{
@@ -144,7 +124,6 @@ export default function RegisterPage() {
           </div>
         )}
 
-        {/* Plan selector */}
         <div style={{ marginBottom: 16 }}>
           <div style={{ fontSize: 13, marginBottom: 6 }}>Account type</div>
           <div style={{ display: "flex", gap: 8 }}>
@@ -155,8 +134,7 @@ export default function RegisterPage() {
                 flex: 1,
                 padding: "8px 10px",
                 borderRadius: 6,
-                border:
-                  plan === "rider" ? "2px solid #4f46e5" : "1px solid #ccc",
+                border: plan === "rider" ? "2px solid #4f46e5" : "1px solid #ccc",
                 background: plan === "rider" ? "#eef2ff" : "#fff",
                 fontSize: 13,
                 fontWeight: plan === "rider" ? 600 : 500,
@@ -172,8 +150,7 @@ export default function RegisterPage() {
                 flex: 1,
                 padding: "8px 10px",
                 borderRadius: 6,
-                border:
-                  plan === "driver" ? "2px solid #4f46e5" : "1px solid #ccc",
+                border: plan === "driver" ? "2px solid #4f46e5" : "1px solid #ccc",
                 background: plan === "driver" ? "#eef2ff" : "#fff",
                 fontSize: 13,
                 fontWeight: plan === "driver" ? 600 : 500,
@@ -185,12 +162,8 @@ export default function RegisterPage() {
           </div>
         </div>
 
-        {/* Name */}
         <div style={{ marginBottom: 12 }}>
-          <label
-            htmlFor="name"
-            style={{ display: "block", fontSize: 13, marginBottom: 4 }}
-          >
+          <label htmlFor="name" style={{ display: "block", fontSize: 13, marginBottom: 4 }}>
             Full name
           </label>
           <input
@@ -209,12 +182,8 @@ export default function RegisterPage() {
           />
         </div>
 
-        {/* Email */}
         <div style={{ marginBottom: 12 }}>
-          <label
-            htmlFor="email"
-            style={{ display: "block", fontSize: 13, marginBottom: 4 }}
-          >
+          <label htmlFor="email" style={{ display: "block", fontSize: 13, marginBottom: 4 }}>
             Email
           </label>
           <input
@@ -233,12 +202,8 @@ export default function RegisterPage() {
           />
         </div>
 
-        {/* Phone (optional) */}
         <div style={{ marginBottom: 12 }}>
-          <label
-            htmlFor="phone"
-            style={{ display: "block", fontSize: 13, marginBottom: 4 }}
-          >
+          <label htmlFor="phone" style={{ display: "block", fontSize: 13, marginBottom: 4 }}>
             Phone (optional)
           </label>
           <input
@@ -256,7 +221,6 @@ export default function RegisterPage() {
           />
         </div>
 
-        {/* Password + confirm password */}
         <div style={{ marginBottom: 12 }}>
           <PasswordField
             label="Password"
@@ -266,8 +230,7 @@ export default function RegisterPage() {
             onChange={(e) => setPassword(e.target.value)}
           />
           <p style={{ fontSize: 11, color: "#777", marginTop: 4 }}>
-            At least 8 characters, ideally with a mix of letters, numbers, and
-            symbols.
+            At least 8 characters, ideally with a mix of letters, numbers, and symbols.
           </p>
         </div>
 
@@ -280,7 +243,6 @@ export default function RegisterPage() {
           />
         </div>
 
-        {/* Submit */}
         <button
           type="submit"
           disabled={isSubmitting}

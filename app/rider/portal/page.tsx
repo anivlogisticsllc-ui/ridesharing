@@ -613,7 +613,11 @@ useEffect(() => {
           </p>
         </div>
 
-        <a href="/">
+        import Link from "next/link";
+
+        /* ... */
+
+        <Link href="/">
           <button
             type="button"
             style={{
@@ -630,7 +634,8 @@ useEffect(() => {
           >
             Request a new ride
           </button>
-        </a>
+        </Link>
+
       </header>
 
       <section

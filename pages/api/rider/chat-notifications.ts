@@ -6,18 +6,17 @@ import { prisma } from "../../../lib/prisma";
 
 type ConversationNotification = {
   conversationId: string;
+  unreadCount: number;
 
-  // Latest message info (null if no messages yet)
   latestMessageId: string | null;
   latestMessageCreatedAt: string | null;
   latestMessageSenderId: string | null;
 
-  // Convenience classification based on conversation participants
   senderType: "RIDER" | "DRIVER" | "UNKNOWN";
 };
 
 type ApiResponse =
-  | { ok: true; notifications: ConversationNotification[] }
+  | { ok: true; totalUnread: number; notifications: ConversationNotification[] }
   | { ok: false; error: string };
 
 export default async function handler(
@@ -29,11 +28,10 @@ export default async function handler(
     return res.status(405).json({ ok: false, error: "Method not allowed" });
   }
 
-  // Don’t allow caching of polling responses
   res.setHeader("Cache-Control", "no-store, max-age=0");
 
   const session = await getServerSession(req, res, authOptions);
-  const user = session?.user as { id?: string; role?: "RIDER" | "DRIVER"} | undefined;
+  const user = session?.user as { id?: string; role?: "RIDER" | "DRIVER" } | undefined;
 
   if (!user?.id) {
     return res.status(401).json({ ok: false, error: "Not authenticated" });
@@ -45,53 +43,61 @@ export default async function handler(
     const conversations = await prisma.conversation.findMany({
       where: { riderId },
       orderBy: { updatedAt: "desc" },
+      take: 50,
       select: {
         id: true,
+        createdAt: true,
         riderId: true,
         driverId: true,
+        riderLastReadAt: true,
         messages: {
           orderBy: { createdAt: "desc" },
           take: 1,
-          select: {
-            id: true,
-            createdAt: true,
-            senderId: true,
-          },
+          select: { id: true, createdAt: true, senderId: true },
         },
       },
     });
 
     if (!conversations.length) {
-      return res.status(200).json({ ok: true, notifications: [] });
+      return res.status(200).json({ ok: true, totalUnread: 0, notifications: [] });
     }
 
-    const notifications: ConversationNotification[] = conversations.map((c) => {
-      const latest = c.messages[0] ?? null;
+    const rows: ConversationNotification[] = [];
+    let totalUnread = 0;
 
-      if (!latest) {
-        return {
+    // IMPORTANT: sequential (avoids connection pool explosion)
+    for (const c of conversations) {
+      const latest = c.messages[0] ?? null;
+      const since = c.riderLastReadAt ?? c.createdAt;
+
+      const unreadCount = await prisma.message.count({
+        where: {
           conversationId: c.id,
-          latestMessageId: null,
-          latestMessageCreatedAt: null,
-          latestMessageSenderId: null,
-          senderType: "UNKNOWN",
-        };
-      }
+          createdAt: { gt: since },
+          senderId: { not: riderId }, // don't count my own messages
+        },
+      });
+
+      totalUnread += unreadCount;
 
       let senderType: "RIDER" | "DRIVER" | "UNKNOWN" = "UNKNOWN";
-      if (latest.senderId === c.riderId) senderType = "RIDER";
-      else if (latest.senderId === c.driverId) senderType = "DRIVER";
+      if (latest) {
+        if (latest.senderId === c.riderId) senderType = "RIDER";
+        else if (latest.senderId === c.driverId) senderType = "DRIVER";
+      }
 
-      return {
+      rows.push({
         conversationId: c.id,
-        latestMessageId: latest.id,
-        latestMessageCreatedAt: latest.createdAt.toISOString(),
-        latestMessageSenderId: latest.senderId,
+        unreadCount,
+        latestMessageId: latest?.id ?? null,
+        latestMessageCreatedAt: latest?.createdAt?.toISOString() ?? null,
+        latestMessageSenderId: latest?.senderId ?? null,
         senderType,
-      };
-    });
+      });
+    }
 
-    return res.status(200).json({ ok: true, notifications });
+    const notifications = rows.filter((r) => r.unreadCount > 0);
+    return res.status(200).json({ ok: true, totalUnread, notifications });
   } catch (err) {
     console.error("Error loading rider chat notifications:", err);
     return res.status(500).json({ ok: false, error: "Failed to load notifications" });

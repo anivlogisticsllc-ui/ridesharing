@@ -3,7 +3,7 @@ import { NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/pages/api/auth/[...nextauth]";
 import { prisma } from "@/lib/prisma";
-import type { UserRole } from "@prisma/client";
+import type { Prisma, UserRole } from "@prisma/client";
 
 function isDriverRole(role: UserRole | undefined) {
   return role === "DRIVER";
@@ -38,17 +38,80 @@ function computeFareCents(args: {
   return receipt.finalAmountCents;
 }
 
+type RideWithIncludes = Prisma.RideGetPayload<{
+  include: {
+    bookings: {
+      where: { status: { in: ["ACCEPTED"] } } | { status: { in: ["COMPLETED", "ACCEPTED"] } };
+      orderBy: { createdAt: "desc" };
+      take: 1;
+      select: {
+        id: true;
+        paymentType: true;
+        paymentMethodId?: true;
+        cashDiscountBps: true;
+        finalAmountCents: true;
+        baseAmountCents: true;
+        discountCents: true;
+        currency: true;
+      };
+    };
+    conversations: {
+      orderBy: { createdAt: "desc" };
+      take: 1;
+      select: { id: true };
+    };
+    rider: { select: { name: true; publicId: true } };
+  };
+}>;
+
+type PortalRide = {
+  rideId: string;
+  originCity: string;
+  destinationCity: string;
+  departureTime: string; // ISO
+  status: string;
+
+  riderName: string | null;
+  riderPublicId: string | null;
+
+  conversationId: string | null;
+  unreadCount: number;
+
+  bookingId: string | null;
+  paymentType: string | null;
+  cashDiscountBps: number | null;
+
+  tripStartedAt: string | null;
+  tripCompletedAt: string | null;
+  distanceMiles: number | null;
+
+  fareCents: number;
+  totalPriceCents: number; // keep legacy
+};
+
+type ApiResponse =
+  | { ok: true; accepted: PortalRide[]; completed: PortalRide[] }
+  | { ok: false; error: string };
+
+type SessionUser = { id?: string; role?: UserRole } & Record<string, unknown>;
+
 export async function GET() {
   try {
     const session = await getServerSession(authOptions);
-    const userId = session?.user?.id as string | undefined;
-    const role = (session?.user?.role as UserRole | undefined) ?? undefined;
+    const user = (session?.user ?? null) as SessionUser | null;
+
+    const userId = user?.id;
+    const role = user?.role;
 
     if (!userId) {
-      return NextResponse.json({ ok: false, error: "Not authenticated" }, { status: 401 });
+      return NextResponse.json({ ok: false, error: "Not authenticated" } satisfies ApiResponse, {
+        status: 401,
+      });
     }
     if (!isDriverRole(role)) {
-      return NextResponse.json({ ok: false, error: "Not a driver" }, { status: 403 });
+      return NextResponse.json({ ok: false, error: "Not a driver" } satisfies ApiResponse, {
+        status: 403,
+      });
     }
 
     const accepted = await prisma.ride.findMany({
@@ -106,7 +169,41 @@ export async function GET() {
       },
     });
 
-    const mapRide = (r: any) => {
+    // --- Unread counts (driver side) ---
+    const allRides: RideWithIncludes[] = [...accepted, ...completed];
+
+    const conversationIds = Array.from(
+      new Set(
+        allRides
+          .map((r) => r.conversations?.[0]?.id ?? null)
+          .filter((v): v is string => typeof v === "string" && v.length > 0)
+      )
+    );
+
+    const unreadByConversationId: Record<string, number> = {};
+
+    if (conversationIds.length) {
+      const convs = await prisma.conversation.findMany({
+        where: { id: { in: conversationIds }, driverId: userId },
+        select: { id: true, createdAt: true, driverLastReadAt: true },
+      });
+
+      for (const c of convs) {
+        const since = c.driverLastReadAt ?? c.createdAt;
+
+        const unreadCount = await prisma.message.count({
+          where: {
+            conversationId: c.id,
+            createdAt: { gt: since },
+            senderId: { not: userId },
+          },
+        });
+
+        unreadByConversationId[c.id] = unreadCount;
+      }
+    }
+
+    const mapRide = (r: RideWithIncludes): PortalRide => {
       const b = r.bookings?.[0] ?? null;
 
       const fareCents = computeFareCents({
@@ -115,6 +212,8 @@ export async function GET() {
         cashDiscountBps: b?.cashDiscountBps ?? null,
         bookingFinalAmountCents: b?.finalAmountCents ?? null,
       });
+
+      const conversationId = r.conversations?.[0]?.id ?? null;
 
       return {
         rideId: r.id,
@@ -126,7 +225,8 @@ export async function GET() {
         riderName: r.rider?.name ?? null,
         riderPublicId: r.rider?.publicId ?? null,
 
-        conversationId: r.conversations?.[0]?.id ?? null,
+        conversationId,
+        unreadCount: conversationId ? unreadByConversationId[conversationId] ?? 0 : 0,
 
         bookingId: b?.id ?? null,
         paymentType: b?.paymentType ?? null,
@@ -136,18 +236,19 @@ export async function GET() {
         tripCompletedAt: r.tripCompletedAt ? r.tripCompletedAt.toISOString() : null,
         distanceMiles: r.distanceMiles ?? null,
 
-        // expose both so older UI keeps working
         fareCents,
         totalPriceCents: fareCents,
       };
     };
 
     return NextResponse.json(
-      { ok: true, accepted: accepted.map(mapRide), completed: completed.map(mapRide) },
+      { ok: true, accepted: accepted.map(mapRide), completed: completed.map(mapRide) } satisfies ApiResponse,
       { status: 200 }
     );
   } catch (err) {
     console.error("GET /api/driver/portal-rides error:", err);
-    return NextResponse.json({ ok: false, error: "Internal server error" }, { status: 500 });
+    return NextResponse.json({ ok: false, error: "Internal server error" } satisfies ApiResponse, {
+      status: 500,
+    });
   }
 }
