@@ -54,6 +54,8 @@ model User {
   riderRides              Ride[]                   @relation("RiderRides")
   ridePayments            RidePayment[]
   transactions            Transaction[]            @relation("DriverTransactions")
+  adminGrantEndsAt        DateTime?
+
 }
 
 model DriverProfile {
