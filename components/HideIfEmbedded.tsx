@@ -1,17 +1,26 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 export function HideIfEmbedded({ children }: { children: React.ReactNode }) {
-  const [embedded] = useState<boolean>(() => {
-    if (typeof window === "undefined") return false;
+  // SSR + first client render MUST match.
+  // So we render children until we've mounted and can safely check window.top.
+  const [mounted, setMounted] = useState(false);
+  const [embedded, setEmbedded] = useState(false);
+
+  useEffect(() => {
+    setMounted(true);
+
     try {
-      return window.self !== window.top;
+      setEmbedded(window.self !== window.top);
     } catch {
       // Cross-origin iframe → assume embedded
-      return true;
+      setEmbedded(true);
     }
-  });
+  }, []);
+
+  // Important: during SSR and first client render, render children.
+  if (!mounted) return <>{children}</>;
 
   if (embedded) return null;
   return <>{children}</>;

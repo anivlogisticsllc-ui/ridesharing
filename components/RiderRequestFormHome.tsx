@@ -56,12 +56,8 @@ function buildAddress(parts: {
   state: string;
   zip: string;
 }) {
-  const street = [parts.streetNumber.trim(), parts.streetName.trim()]
-    .filter(Boolean)
-    .join(" ");
-  const cityState = [parts.city.trim(), parts.state.trim().toUpperCase()]
-    .filter(Boolean)
-    .join(", ");
+  const street = [parts.streetNumber.trim(), parts.streetName.trim()].filter(Boolean).join(" ");
+  const cityState = [parts.city.trim(), parts.state.trim().toUpperCase()].filter(Boolean).join(", ");
   const zip = parts.zip.trim();
 
   if (!street || !cityState || !zip) return "";
@@ -78,6 +74,11 @@ function safeUuid() {
 export function RiderRequestFormHome() {
   const { data: session, status } = useSession();
   const router = useRouter();
+
+  // Top-level UI state (declare ONCE)
+  const [message, setMessage] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [outstandingOcId, setOutstandingOcId] = useState<string | null>(null);
 
   // Visible address search box values
   const [originQuery, setOriginQuery] = useState("");
@@ -108,9 +109,6 @@ export function RiderRequestFormHome() {
   const [estimating, setEstimating] = useState(false);
   const [clientRequestId, setClientRequestId] = useState<string>(() => safeUuid());
 
-  const [message, setMessage] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
   const originAddress = useMemo(
     () =>
       buildAddress({
@@ -135,13 +133,9 @@ export function RiderRequestFormHome() {
     [destStreetNumber, destStreetName, destCity, destStateVal, destZip]
   );
 
-  async function estimateDistanceOnce(opts?: {
-    showUserError?: boolean;
-  }): Promise<DistanceResult | null> {
+  async function estimateDistanceOnce(opts?: { showUserError?: boolean }): Promise<DistanceResult | null> {
     if (!originAddress || !destinationAddress) {
-      if (opts?.showUserError) {
-        setError("Please fill out all address fields for From and To.");
-      }
+      if (opts?.showUserError) setError("Please fill out all address fields for From and To.");
       return null;
     }
 
@@ -175,9 +169,7 @@ export function RiderRequestFormHome() {
       };
     } catch (err) {
       console.error("[estimateDistanceOnce] error", err);
-      if (opts?.showUserError) {
-        setError("Failed to estimate distance. Try again or enter it manually.");
-      }
+      if (opts?.showUserError) setError("Failed to estimate distance. Try again or enter it manually.");
       return null;
     } finally {
       setEstimating(false);
@@ -213,8 +205,8 @@ export function RiderRequestFormHome() {
     e.preventDefault();
     setError(null);
     setMessage(null);
+    setOutstandingOcId(null);
 
-    // Soft gate: require login on submit (not on page load)
     if (!session) {
       router.push("/auth/login?callbackUrl=/");
       return;
@@ -230,31 +222,16 @@ export function RiderRequestFormHome() {
       return;
     }
 
-    if (paymentType !== "CARD" && paymentType !== "CASH") {
-      setError("Please choose CASH or CARD.");
-      return;
-    }
-
-    const passengersNumber =
-      typeof passengerCount === "number" ? passengerCount : Number(passengerCount || 1);
-
+    const passengersNumber = typeof passengerCount === "number" ? passengerCount : Number(passengerCount || 1);
     if (!passengersNumber || passengersNumber < 1 || passengersNumber > 6) {
       setError("Passenger count must be between 1 and 6.");
       return;
     }
 
     let distanceToSend =
-      typeof distanceMiles === "number"
-        ? distanceMiles
-        : distanceMiles === ""
-        ? null
-        : Number(distanceMiles);
+      typeof distanceMiles === "number" ? distanceMiles : distanceMiles === "" ? null : Number(distanceMiles);
+    if (distanceToSend != null && Number.isNaN(distanceToSend)) distanceToSend = null;
 
-    if (distanceToSend != null && Number.isNaN(distanceToSend)) {
-      distanceToSend = null;
-    }
-
-    // Ensure coordinates exist
     const geo = await estimateDistanceOnce({ showUserError: true });
     if (!geo) return;
 
@@ -305,9 +282,19 @@ export function RiderRequestFormHome() {
         }),
       });
 
-      const data = await res.json();
-      if (!res.ok || !data.ok) {
-        throw new Error(data.error || "Failed to post ride request");
+      type PostRideResponse =
+        | { ok: true }
+        | { ok: false; error: string; outstandingChargeId?: string };
+
+      const data = (await res.json().catch(() => null)) as PostRideResponse | null;
+
+      if (!res.ok || !data || !data.ok) {
+        const msg = data && "error" in data ? data.error : "Failed to post ride request";
+        setError(msg);
+
+        const oc = data && "outstandingChargeId" in data ? data.outstandingChargeId : undefined;
+        setOutstandingOcId(typeof oc === "string" && oc.trim() ? oc : null);
+        return;
       }
 
       setMessage("Ride request posted. You can see it in your Rider portal.");
@@ -351,10 +338,7 @@ export function RiderRequestFormHome() {
         </div>
       </div>
 
-      <form
-        onSubmit={handleSubmit}
-        className="space-y-3 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm"
-      >
+      <form onSubmit={handleSubmit} className="space-y-3 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
         <div className="space-y-2">
           <span className="block text-sm font-medium text-slate-800">Payment method</span>
 
@@ -594,9 +578,7 @@ export function RiderRequestFormHome() {
         {/* Distance + passengers */}
         <div className="grid gap-3 md:grid-cols-2">
           <div>
-            <label className="mb-1 block text-sm font-medium text-slate-800">
-              Distance (miles)
-            </label>
+            <label className="mb-1 block text-sm font-medium text-slate-800">Distance (miles)</label>
             <input
               type="number"
               min={1}
@@ -621,9 +603,7 @@ export function RiderRequestFormHome() {
           </div>
 
           <div>
-            <label className="mb-1 block text-sm font-medium text-slate-800">
-              Number of passengers
-            </label>
+            <label className="mb-1 block text-sm font-medium text-slate-800">Number of passengers</label>
             <input
               type="number"
               min={1}
@@ -641,9 +621,20 @@ export function RiderRequestFormHome() {
             {message}
           </div>
         )}
+
         {error && (
           <div className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-800">
-            {error}
+            <div>{error}</div>
+
+            {outstandingOcId ? (
+              <button
+                type="button"
+                onClick={() => router.push(`/rider/outstanding?oc=${encodeURIComponent(outstandingOcId)}`)}
+                className="mt-2 inline-flex rounded-full bg-slate-900 px-3 py-1.5 text-[11px] font-medium text-white hover:bg-slate-800"
+              >
+                Pay now
+              </button>
+            ) : null}
           </div>
         )}
 
@@ -689,10 +680,7 @@ function AddressSearchBox(props: {
     try {
       setLoading(true);
 
-      const res = await fetch(
-        `/api/geo/suggest?q=${encodeURIComponent(trimmed)}&limit=5`
-      );
-
+      const res = await fetch(`/api/geo/suggest?q=${encodeURIComponent(trimmed)}&limit=5`);
       const data = (await res.json()) as GeoSuggestSuccess | GeoSuggestError;
 
       if (!res.ok || !data.ok) {
@@ -742,17 +730,11 @@ function AddressSearchBox(props: {
     if (e.key === "ArrowDown") {
       e.preventDefault();
       setOpen(true);
-      setActiveIndex((prev) => {
-        const next = prev + 1;
-        return next >= suggestions.length ? 0 : next;
-      });
+      setActiveIndex((prev) => (prev + 1 >= suggestions.length ? 0 : prev + 1));
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
       setOpen(true);
-      setActiveIndex((prev) => {
-        const next = prev - 1;
-        return next < 0 ? suggestions.length - 1 : next;
-      });
+      setActiveIndex((prev) => (prev - 1 < 0 ? suggestions.length - 1 : prev - 1));
     } else if (e.key === "Enter") {
       if (activeIndex >= 0 && activeIndex < suggestions.length) {
         e.preventDefault();
@@ -781,10 +763,7 @@ function AddressSearchBox(props: {
         className="w-full rounded-lg border border-slate-300 px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
       />
 
-      {loading && (
-        <div className="mt-1 text-[11px] text-slate-400">Looking up suggestions…</div>
-      )}
-
+      {loading && <div className="mt-1 text-[11px] text-slate-400">Looking up suggestions…</div>}
       {localError && <div className="mt-1 text-[11px] text-rose-500">{localError}</div>}
 
       {open && suggestions.length > 0 && (
@@ -793,9 +772,7 @@ function AddressSearchBox(props: {
             <li
               key={s.id}
               className={`cursor-pointer px-2 py-1.5 ${
-                index === activeIndex
-                  ? "bg-slate-100 text-slate-900"
-                  : "text-slate-700 hover:bg-slate-50"
+                index === activeIndex ? "bg-slate-100 text-slate-900" : "text-slate-700 hover:bg-slate-50"
               }`}
               onMouseDown={(e) => {
                 e.preventDefault();

@@ -17,6 +17,26 @@ function computeReceipt(baseCents: number, cashDiscountBps: number) {
   return { baseAmountCents: baseCents, discountCents, finalAmountCents };
 }
 
+async function authorizeBookingAfterAccept(req: NextApiRequest, bookingId: string) {
+  const baseUrl = process.env.NEXTAUTH_URL || `http://${req.headers.host}`;
+
+  const r = await fetch(`${baseUrl}/api/billing/authorize-booking`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      cookie: req.headers.cookie || "",
+    },
+    body: JSON.stringify({ bookingId }),
+  });
+
+  const json = await r.json().catch(() => null);
+  if (!r.ok) {
+    console.error("authorize-booking failed:", r.status, json);
+    return { ok: false as const, error: json?.error || `authorize-booking failed (${r.status})` };
+  }
+  return { ok: true as const, json };
+}
+
 export default async function handler(req: NextApiRequest, res: NextApiResponse<ApiResponse>) {
   try {
     if (req.method !== "POST") {

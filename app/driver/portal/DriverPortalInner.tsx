@@ -23,11 +23,10 @@ type DriverProfile = {
   serviceCities: ServiceCity[];
 };
 
-type DriverProfileResponse =
-  | { ok: true; profile: DriverProfile | null }
-  | { ok: false; error: string };
-
 type RideStatusUI = "OPEN" | "ACCEPTED" | "IN_ROUTE" | "COMPLETED" | "CANCELLED";
+type PaymentType = "CARD" | "CASH";
+
+type OutstandingChargeStatusUI = "OPEN" | "DISPUTED" | "PAID" | "CANCELLED" | null;
 
 type DriverRide = {
   id: string;
@@ -44,10 +43,18 @@ type DriverRide = {
   conversationId: string | null;
   unreadCount?: number;
 
+  paymentType?: PaymentType | null;
+  cashDiscountBps?: number | null;
+
   tripStartedAt: string | null;
   tripCompletedAt: string | null;
+
   distanceMiles?: number | null;
   totalPriceCents?: number | null;
+
+  hasOutstandingCharge?: boolean;
+  outstandingChargeId?: string | null;
+  outstandingChargeStatus?: OutstandingChargeStatusUI;
 };
 
 type PortalRidesResponse =
@@ -80,14 +87,12 @@ type SessionUser = {
   name?: string | null;
 } & Record<string, unknown>;
 
+const REPORT_WINDOW_MS = 10 * 60 * 1000;
+
 /* ---------- Helpers ---------- */
 
 function isSameDay(a: Date, b: Date) {
-  return (
-    a.getFullYear() === b.getFullYear() &&
-    a.getMonth() === b.getMonth() &&
-    a.getDate() === b.getDate()
-  );
+  return a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
 }
 
 function safeDate(value: string | null | undefined): Date | null {
@@ -103,18 +108,18 @@ function isObject(v: unknown): v is Record<string, unknown> {
 function extractProfilePayload(raw: unknown): DriverProfile | null {
   if (!isObject(raw)) return null;
 
-  // Accept either { ok:true, profile } or legacy-ish shapes
   const ok = raw.ok === true;
   const profileCandidate =
-    (ok && raw.profile) ? raw.profile :
-    raw.driverProfile ? raw.driverProfile :
-    raw.profile ? raw.profile :
-    null;
+    ok && (raw as any).profile
+      ? (raw as any).profile
+      : (raw as any).driverProfile
+      ? (raw as any).driverProfile
+      : null;
 
   if (!isObject(profileCandidate)) return null;
-  if (!Array.isArray(profileCandidate.serviceCities)) return null;
+  if (!Array.isArray((profileCandidate as any).serviceCities)) return null;
 
-  return profileCandidate as unknown as DriverProfile;
+  return profileCandidate as DriverProfile;
 }
 
 async function readApiError(res: Response): Promise<string> {
@@ -124,7 +129,7 @@ async function readApiError(res: Response): Promise<string> {
   try {
     const json: unknown = JSON.parse(text);
     if (isObject(json)) {
-      const maybeError = json.error ?? json.message;
+      const maybeError = (json as any).error ?? (json as any).message;
       if (typeof maybeError === "string" && maybeError.trim()) return maybeError;
     }
     return `Request failed (HTTP ${res.status}).`;
@@ -142,17 +147,97 @@ async function markConversationRead(conversationId: string) {
 }
 
 function normalizeRide(raw: DriverRide): DriverRide {
-  const canonicalRideId = String(raw.rideId ?? raw.id ?? "");
+  const canonicalRideId = String((raw as any).rideId ?? (raw as any).id ?? "");
+
+  const ptRaw = (raw as any).paymentType;
+  const paymentType: PaymentType | null = ptRaw === "CARD" || ptRaw === "CASH" ? ptRaw : null;
+
+  const cashDiscountBps =
+    typeof (raw as any).cashDiscountBps === "number" ? (raw as any).cashDiscountBps : null;
+
   return {
     ...raw,
-    id: String(raw.id ?? canonicalRideId),
+    id: String((raw as any).id ?? canonicalRideId),
     rideId: canonicalRideId,
-    bookingId: raw.bookingId ?? null,
-    tripStartedAt: raw.tripStartedAt ?? null,
-    tripCompletedAt: raw.tripCompletedAt ?? null,
-    conversationId: raw.conversationId ?? null,
-    unreadCount: typeof raw.unreadCount === "number" ? raw.unreadCount : 0,
+    bookingId: (raw as any).bookingId ?? null,
+    tripStartedAt: (raw as any).tripStartedAt ?? null,
+    tripCompletedAt: (raw as any).tripCompletedAt ?? null,
+    conversationId: (raw as any).conversationId ?? null,
+    unreadCount: typeof (raw as any).unreadCount === "number" ? (raw as any).unreadCount : 0,
+    paymentType,
+    cashDiscountBps,
+    hasOutstandingCharge: Boolean((raw as any).hasOutstandingCharge),
+    outstandingChargeId: (raw as any).outstandingChargeId ?? null,
+    outstandingChargeStatus: (raw as any).outstandingChargeStatus ?? null,
   };
+}
+
+function formatCountdown(msLeft: number) {
+  const s = Math.max(0, Math.floor(msLeft / 1000));
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return `${m}:${String(r).padStart(2, "0")}`;
+}
+
+function reportWindowState(ride: DriverRide): { canReport: boolean; msLeft: number; alreadyReported: boolean } {
+  const alreadyReported =
+    ride.paymentType === "CASH" &&
+    (!!ride.outstandingChargeId ||
+      ride.outstandingChargeStatus === "OPEN" ||
+      ride.outstandingChargeStatus === "DISPUTED" ||
+      ride.hasOutstandingCharge === true);
+
+  if (ride.status !== "COMPLETED") return { canReport: false, msLeft: 0, alreadyReported };
+  if (ride.paymentType !== "CASH") return { canReport: false, msLeft: 0, alreadyReported };
+  if (alreadyReported) return { canReport: false, msLeft: 0, alreadyReported };
+
+  const completed = safeDate(ride.tripCompletedAt);
+  if (!completed) return { canReport: false, msLeft: 0, alreadyReported };
+
+  const elapsed = Date.now() - completed.getTime();
+  const msLeft = REPORT_WINDOW_MS - elapsed;
+  return { canReport: msLeft > 0, msLeft: Math.max(0, msLeft), alreadyReported };
+}
+
+function PaymentBadge(props: { paymentType?: PaymentType | null; cashDiscountBps?: number | null }) {
+  const pt = props.paymentType ?? null;
+  const bps = props.cashDiscountBps ?? 0;
+  if (!pt) return null;
+
+  const isCash = pt === "CASH";
+  const percent = isCash && bps ? Math.round(bps / 100) : 0;
+
+  return (
+    <span
+      className={`mt-2 inline-flex items-center gap-2 rounded-full border px-2 py-0.5 text-[11px] font-semibold ${
+        isCash ? "border-emerald-200 bg-emerald-50 text-emerald-900" : "border-slate-200 bg-slate-50 text-slate-900"
+      }`}
+      title={isCash ? "Cash payment (discount applies)" : "Card payment"}
+    >
+      {pt}
+      {isCash && percent > 0 ? <span className="text-emerald-900">{percent}% off</span> : null}
+    </span>
+  );
+}
+
+function OutstandingChargeBadge(props: { status?: OutstandingChargeStatusUI; id?: string | null }) {
+  const status = props.status ?? null;
+  if (!status || !props.id) return null;
+
+  const tone =
+    status === "PAID"
+      ? "border-emerald-200 bg-emerald-50 text-emerald-900"
+      : status === "OPEN"
+      ? "border-amber-200 bg-amber-50 text-amber-900"
+      : status === "DISPUTED"
+      ? "border-rose-200 bg-rose-50 text-rose-900"
+      : "border-slate-200 bg-slate-50 text-slate-800";
+
+  return (
+    <span className={`mt-2 inline-flex items-center rounded-full border px-2 py-0.5 text-[11px] font-semibold ${tone}`}>
+      Outstanding charge: {status}
+    </span>
+  );
 }
 
 /* ---------- Component ---------- */
@@ -182,8 +267,45 @@ export default function DriverPortalInner() {
   const [rideActionError, setRideActionError] = useState<string | null>(null);
   const [busyRideId, setBusyRideId] = useState<string | null>(null);
 
+  // Report unpaid UI state
+  const [reportingRideId, setReportingRideId] = useState<string | null>(null);
+  const [reportModal, setReportModal] = useState<{ rideId: string; riderLabel: string } | null>(null);
+  const [reportReason, setReportReason] = useState<"RIDER_REFUSED_CASH" | "RIDER_NO_CASH" | "OTHER">("RIDER_REFUSED_CASH");
+  const [reportNote, setReportNote] = useState("");
+  const [reportError, setReportError] = useState<string | null>(null);
+
+  // Tick every second (countdown redraw)
+  const [nowTick, setNowTick] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => setNowTick((x) => x + 1), 1000);
+    return () => clearInterval(t);
+  }, []);
+
   const sessionUser = (session?.user ?? null) as SessionUser | null;
   const sessionRole = sessionUser?.role;
+
+  async function loadRides() {
+    try {
+      setRidesLoading(true);
+      const res = await fetch("/api/driver/portal-rides", { cache: "no-store" });
+      const data = (await res.json().catch(() => null)) as PortalRidesResponse | null;
+
+      if (!data || !res.ok || !data.ok) {
+        const msg = data && "error" in data ? data.error : "Failed to load rides.";
+        throw new Error(msg);
+      }
+
+      setAcceptedRides(data.accepted.map(normalizeRide));
+      setCompletedRides(data.completed.map(normalizeRide));
+      setRidesError(null);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Could not load rides.";
+      console.error("Error loading driver rides:", err);
+      setRidesError(message);
+    } finally {
+      setRidesLoading(false);
+    }
+  }
 
   /* ---------- Session / access control + initial loads ---------- */
 
@@ -204,7 +326,6 @@ export default function DriverPortalInner() {
       try {
         const res = await fetch("/api/driver/service-cities", { cache: "no-store" });
         const raw = (await res.json().catch(() => null)) as unknown;
-
         const profile = extractProfilePayload(raw);
         if (res.ok && profile?.serviceCities) setServiceCities(profile.serviceCities);
       } catch (err) {
@@ -224,9 +345,7 @@ export default function DriverPortalInner() {
         }
 
         const json = (await res.json().catch(() => null)) as MembershipApiResponse | null;
-
         if (!res.ok || !json?.ok) {
-          // keep silent; membership is optional here
           setMembership(null);
           return;
         }
@@ -240,34 +359,12 @@ export default function DriverPortalInner() {
       }
     }
 
-    async function loadRides() {
-      try {
-        const res = await fetch("/api/driver/portal-rides", { cache: "no-store" });
-        const data = (await res.json().catch(() => null)) as PortalRidesResponse | null;
-
-        if (!data || !res.ok || !data.ok) {
-          const msg = data && "error" in data ? data.error : "Failed to load rides.";
-          throw new Error(msg);
-        }
-
-        setAcceptedRides(data.accepted.map(normalizeRide));
-        setCompletedRides(data.completed.map(normalizeRide));
-        setRidesError(null);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : "Could not load rides.";
-        console.error("Error loading driver rides:", err);
-        setRidesError(message);
-      } finally {
-        setRidesLoading(false);
-      }
-    }
-
     loadProfile();
     loadMembership();
     loadRides();
   }, [session, status, router, sessionRole]);
 
-  /* ---------- Auto-open chat when arriving with query params ---------- */
+  /* ---------- Auto-open chat from query params ---------- */
 
   useEffect(() => {
     if (activeChat) return;
@@ -336,12 +433,13 @@ export default function DriverPortalInner() {
       if (!res.ok) throw new Error(await readApiError(res));
 
       const data = (await res.json().catch(() => null)) as unknown;
-      if (!isObject(data) || data.ok !== true || !isObject(data.city)) {
-        const errMsg = isObject(data) && typeof data.error === "string" ? data.error : "Failed to add city";
+      if (!isObject(data) || (data as any).ok !== true || !isObject((data as any).city)) {
+        const errMsg =
+          isObject(data) && typeof (data as any).error === "string" ? (data as any).error : "Failed to add city";
         throw new Error(errMsg);
       }
 
-      setServiceCities((prev) => [...prev, data.city as unknown as ServiceCity]);
+      setServiceCities((prev) => [...prev, (data as any).city as ServiceCity]);
       setCityName("");
     } catch (err) {
       const message = err instanceof Error ? err.message : "Something went wrong";
@@ -363,8 +461,9 @@ export default function DriverPortalInner() {
       if (!res.ok) throw new Error(await readApiError(res));
 
       const data = (await res.json().catch(() => null)) as unknown;
-      if (!isObject(data) || data.ok !== true) {
-        const errMsg = isObject(data) && typeof data.error === "string" ? data.error : "Failed to remove city";
+      if (!isObject(data) || (data as any).ok !== true) {
+        const errMsg =
+          isObject(data) && typeof (data as any).error === "string" ? (data as any).error : "Failed to remove city";
         throw new Error(errMsg);
       }
 
@@ -392,18 +491,15 @@ export default function DriverPortalInner() {
       if (!res.ok) throw new Error(await readApiError(res));
 
       const data = (await res.json().catch(() => null)) as unknown;
-      if (!isObject(data) || data.ok !== true) {
-        const errMsg = isObject(data) && typeof data.error === "string" ? data.error : "Failed to start ride.";
+      if (!isObject(data) || (data as any).ok !== true) {
+        const errMsg =
+          isObject(data) && typeof (data as any).error === "string" ? (data as any).error : "Failed to start ride.";
         throw new Error(errMsg);
       }
 
       const nowIso = new Date().toISOString();
       setAcceptedRides((prev) =>
-        prev.map((r) =>
-          r.rideId === rideId
-            ? { ...r, status: "IN_ROUTE", tripStartedAt: r.tripStartedAt ?? nowIso }
-            : r
-        )
+        prev.map((r) => (r.rideId === rideId ? { ...r, status: "IN_ROUTE", tripStartedAt: r.tripStartedAt ?? nowIso } : r))
       );
     } catch (err) {
       const message = err instanceof Error ? err.message : "Failed to start ride.";
@@ -438,8 +534,9 @@ export default function DriverPortalInner() {
       if (!res.ok) throw new Error(await readApiError(res));
 
       const data = (await res.json().catch(() => null)) as unknown;
-      if (!isObject(data) || data.ok !== true) {
-        const errMsg = isObject(data) && typeof data.error === "string" ? data.error : "Failed to complete ride.";
+      if (!isObject(data) || (data as any).ok !== true) {
+        const errMsg =
+          isObject(data) && typeof (data as any).error === "string" ? (data as any).error : "Failed to complete ride.";
         throw new Error(errMsg);
       }
 
@@ -474,6 +571,45 @@ export default function DriverPortalInner() {
     }
   }
 
+  /* ---------- Report unpaid ---------- */
+
+  function openReportModal(ride: DriverRide) {
+    const riderLabel = ride.riderPublicId || ride.riderName || "Rider";
+    setReportError(null);
+    setReportReason("RIDER_REFUSED_CASH");
+    setReportNote("");
+    setReportModal({ rideId: ride.rideId, riderLabel });
+  }
+
+  async function submitReportUnpaid() {
+    if (!reportModal) return;
+
+    setReportError(null);
+    setReportingRideId(reportModal.rideId);
+
+    try {
+      const res = await fetch("/api/driver/report-unpaid", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          rideId: reportModal.rideId,
+          reason: reportReason,
+          note: reportNote.trim().slice(0, 500),
+        }),
+      });
+
+      if (!res.ok) throw new Error(await readApiError(res));
+
+      setReportModal(null);
+      await loadRides();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : "Failed to report unpaid.";
+      setReportError(msg);
+    } finally {
+      setReportingRideId(null);
+    }
+  }
+
   /* ---------- Membership banner ---------- */
 
   const membershipBanner = useMemo(() => {
@@ -487,9 +623,7 @@ export default function DriverPortalInner() {
     const daysLeft = daysUntil(trialEndsAt);
 
     if (state === "TRIAL") {
-      const daysText =
-        daysLeft === null ? "" : daysLeft === 1 ? "1 day left" : `${daysLeft} days left`;
-
+      const daysText = daysLeft === null ? "" : daysLeft === 1 ? "1 day left" : `${daysLeft} days left`;
       return {
         tone: "warning" as const,
         title: `Free trial${daysText ? `: ${daysText}` : ""}.`,
@@ -498,11 +632,7 @@ export default function DriverPortalInner() {
     }
 
     if (state === "ACTIVE") {
-      return {
-        tone: "good" as const,
-        title: "Driver membership is active.",
-        body: "Thanks — billing is active for your account.",
-      };
+      return { tone: "good" as const, title: "Driver membership is active.", body: "Thanks — billing is active for your account." };
     }
 
     if (state === "EXPIRED") {
@@ -513,11 +643,7 @@ export default function DriverPortalInner() {
       };
     }
 
-    return {
-      tone: "warning" as const,
-      title: "No membership found.",
-      body: "If this is unexpected, open Membership & Billing to fix it.",
-    };
+    return { tone: "warning" as const, title: "No membership found.", body: "If this is unexpected, open Membership & Billing to fix it." };
   }, [membership]);
 
   /* ---------- Derived lists ---------- */
@@ -554,7 +680,7 @@ export default function DriverPortalInner() {
       return db - da;
     });
     return unique;
-  }, [completedRides, today]);
+  }, [completedRides, today, nowTick]);
 
   if (status === "loading" || !session) {
     return <p className="py-10 text-center text-slate-600">Loading…</p>;
@@ -603,6 +729,7 @@ export default function DriverPortalInner() {
           </section>
         ) : null}
 
+        {/* Accepted rides */}
         <section className="space-y-3">
           <h2 className="text-sm font-semibold text-slate-800">My accepted rides</h2>
 
@@ -611,20 +738,14 @@ export default function DriverPortalInner() {
           ) : ridesError ? (
             <p className="text-sm text-rose-600">{ridesError}</p>
           ) : sortedAcceptedRides.length === 0 ? (
-            <p className="text-sm text-slate-500">
-              You haven&apos;t accepted any rides yet. Book one from the home page.
-            </p>
+            <p className="text-sm text-slate-500">You haven&apos;t accepted any rides yet. Book one from the home page.</p>
           ) : (
             <ul className="space-y-3">
               {sortedAcceptedRides.map((ride) => {
                 const dt = safeDate(ride.departureTime) ?? new Date(ride.departureTime);
 
                 const meterStatus: "OPEN" | "FULL" | "IN_ROUTE" | "COMPLETED" =
-                  ride.status === "IN_ROUTE"
-                    ? "IN_ROUTE"
-                    : ride.status === "COMPLETED"
-                    ? "COMPLETED"
-                    : "OPEN";
+                  ride.status === "IN_ROUTE" ? "IN_ROUTE" : ride.status === "COMPLETED" ? "COMPLETED" : "OPEN";
 
                 const isInRoute = ride.status === "IN_ROUTE";
                 const canChat = !!ride.conversationId?.trim();
@@ -649,6 +770,8 @@ export default function DriverPortalInner() {
                       <p className="mt-1 text-xs text-slate-500">
                         Rider: <span className="font-medium text-slate-800">{riderLabel}</span>
                       </p>
+
+                      <PaymentBadge paymentType={ride.paymentType ?? null} cashDiscountBps={ride.cashDiscountBps ?? null} />
                     </div>
 
                     <div className="flex flex-wrap items-center gap-3">
@@ -660,9 +783,7 @@ export default function DriverPortalInner() {
                         }}
                         disabled={isInRoute || isBusy}
                         className={`rounded-full px-4 py-2 text-xs font-medium text-white ${
-                          isInRoute || isBusy
-                            ? "cursor-not-allowed bg-slate-400 opacity-60"
-                            : "bg-slate-900 hover:bg-slate-800"
+                          isInRoute || isBusy ? "cursor-not-allowed bg-slate-400 opacity-60" : "bg-slate-900 hover:bg-slate-800"
                         }`}
                       >
                         View trip details
@@ -675,11 +796,7 @@ export default function DriverPortalInner() {
 
                           await markConversationRead(ride.conversationId);
 
-                          setAcceptedRides((prev) =>
-                            prev.map((r) =>
-                              r.rideId === ride.rideId ? { ...r, unreadCount: 0 } : r
-                            )
-                          );
+                          setAcceptedRides((prev) => prev.map((r) => (r.rideId === ride.rideId ? { ...r, unreadCount: 0 } : r)));
 
                           const riderFirst = String(riderLabel).trim().split(" ")[0];
                           const driverFirst = String(driverName).trim().split(" ")[0];
@@ -693,9 +810,7 @@ export default function DriverPortalInner() {
                         }}
                         disabled={chatDisabled || isBusy}
                         className={`relative rounded-full px-4 py-2 text-xs font-medium text-white ${
-                          chatDisabled || isBusy
-                            ? "cursor-not-allowed bg-slate-300 opacity-60"
-                            : "bg-indigo-600 hover:bg-indigo-700"
+                          chatDisabled || isBusy ? "cursor-not-allowed bg-slate-300 opacity-60" : "bg-indigo-600 hover:bg-indigo-700"
                         }`}
                       >
                         View chat
@@ -711,6 +826,8 @@ export default function DriverPortalInner() {
                       status={meterStatus}
                       tripStartedAt={ride.tripStartedAt}
                       tripCompletedAt={ride.tripCompletedAt}
+                      paymentType={ride.paymentType ?? null}
+                      cashDiscountBps={ride.cashDiscountBps ?? null}
                       onStartRide={() => handleStartRide(ride.rideId)}
                       onCompleteRide={(summary) => handleCompleteRide(ride.rideId, summary)}
                     />
@@ -721,6 +838,7 @@ export default function DriverPortalInner() {
           )}
         </section>
 
+        {/* Completed rides */}
         <section className="space-y-3">
           <h2 className="text-sm font-semibold text-slate-800">Rides completed today</h2>
 
@@ -731,13 +849,16 @@ export default function DriverPortalInner() {
           ) : (
             <ul className="space-y-3">
               {dedupedTodayCompletedRides.map((ride) => {
-                const dt =
-                  safeDate(ride.tripCompletedAt) ??
-                  safeDate(ride.departureTime) ??
-                  new Date(ride.departureTime);
+                const dt = safeDate(ride.tripCompletedAt) ?? safeDate(ride.departureTime) ?? new Date(ride.departureTime);
 
                 const canChat = !!ride.conversationId?.trim();
                 const riderLabel = ride.riderPublicId || ride.riderName || "there";
+
+                const { canReport, msLeft, alreadyReported } = reportWindowState(ride);
+                const reportDisabled = alreadyReported || !canReport || reportingRideId === ride.rideId;
+
+                // Only show report for CASH rides that have not been reported
+                const showReport = ride.paymentType === "CASH" && !ride.outstandingChargeId;
 
                 return (
                   <li
@@ -754,6 +875,15 @@ export default function DriverPortalInner() {
                       <p className="mt-1 text-xs text-slate-500">
                         Rider: <span className="font-medium text-slate-800">{riderLabel}</span>
                       </p>
+
+                      <PaymentBadge paymentType={ride.paymentType ?? null} cashDiscountBps={ride.cashDiscountBps ?? null} />
+                      <OutstandingChargeBadge status={ride.outstandingChargeStatus ?? null} id={ride.outstandingChargeId ?? null} />
+
+                      {ride.paymentType === "CASH" ? (
+                        <p className="mt-1 text-[11px] text-slate-500">
+                          {alreadyReported ? "Already reported" : canReport ? `Report window: ${formatCountdown(msLeft)} left` : "Report window expired"}
+                        </p>
+                      ) : null}
                     </div>
 
                     <div className="flex flex-wrap items-center gap-2">
@@ -789,9 +919,7 @@ export default function DriverPortalInner() {
                           await markConversationRead(ride.conversationId);
 
                           setCompletedRides((prev) =>
-                            prev.map((r) =>
-                              r.rideId === ride.rideId ? { ...r, unreadCount: 0 } : r
-                            )
+                            prev.map((r) => (r.rideId === ride.rideId ? { ...r, unreadCount: 0 } : r))
                           );
 
                           setActiveChat({
@@ -803,13 +931,27 @@ export default function DriverPortalInner() {
                         }}
                         disabled={!canChat}
                         className={`rounded-full border px-4 py-2 text-xs font-medium ${
-                          canChat
-                            ? "border-slate-300 text-slate-800 hover:bg-slate-50"
-                            : "cursor-not-allowed border-slate-200 text-slate-400"
+                          canChat ? "border-slate-300 text-slate-800 hover:bg-slate-50" : "cursor-not-allowed border-slate-200 text-slate-400"
                         }`}
                       >
                         View chat
                       </button>
+
+                      {showReport ? (
+                        <button
+                          type="button"
+                          onClick={() => openReportModal(ride)}
+                          disabled={reportDisabled}
+                          className={`rounded-full border px-4 py-2 text-xs font-medium ${
+                            reportDisabled
+                              ? "cursor-not-allowed border-rose-200 bg-rose-50 text-rose-300"
+                              : "border-rose-300 bg-white text-rose-700 hover:bg-rose-50"
+                          }`}
+                          title={canReport ? "Report unpaid (cash rides only)" : "Disabled after 10 minutes from completion"}
+                        >
+                          {reportingRideId === ride.rideId ? "Reporting…" : "Report unpaid"}
+                        </button>
+                      ) : null}
                     </div>
                   </li>
                 );
@@ -818,12 +960,12 @@ export default function DriverPortalInner() {
           )}
         </section>
 
-        {/* Service area UI left as-is */}
+        {/* Service area UI */}
         <header className="space-y-1">
           <h1 className="text-2xl font-semibold text-slate-900">Driver service area</h1>
           <p className="text-sm text-slate-600">
-            Add the cities where you regularly work. For now, keep your area local (within about 10 miles). Later
-            we&apos;ll automatically enforce distance limits and use these cities to match you with rider requests.
+            Add the cities where you regularly work. For now, keep your area local (within about 10 miles). Later we&apos;ll automatically
+            enforce distance limits and use these cities to match you with rider requests.
           </p>
         </header>
 
@@ -884,11 +1026,89 @@ export default function DriverPortalInner() {
       </div>
 
       {activeChat ? <ChatOverlay context={activeChat} onClose={() => setActiveChat(null)} /> : null}
+
+      {reportModal ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 px-4">
+          <div className="w-full max-w-lg rounded-2xl bg-white p-5 shadow-2xl">
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-semibold text-slate-900">Report unpaid (cash ride)</h3>
+              <button
+                type="button"
+                onClick={() => setReportModal(null)}
+                className="text-lg leading-none text-slate-500 hover:text-slate-800"
+                aria-label="Close"
+                disabled={!!reportingRideId}
+              >
+                ×
+              </button>
+            </div>
+
+            <p className="mt-2 text-xs text-slate-600">
+              Rider: <span className="font-medium text-slate-800">{reportModal.riderLabel}</span>
+            </p>
+
+            <div className="mt-4 space-y-3">
+              <div>
+                <label className="block text-xs font-medium text-slate-700">Reason</label>
+                <select
+                  value={reportReason}
+                  onChange={(e) => setReportReason(e.target.value as any)}
+                  className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                  disabled={!!reportingRideId}
+                >
+                  <option value="RIDER_REFUSED_CASH">Rider refused to pay cash</option>
+                  <option value="RIDER_NO_CASH">Rider had no cash</option>
+                  <option value="OTHER">Other</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-700">Note (optional)</label>
+                <textarea
+                  value={reportNote}
+                  onChange={(e) => setReportNote(e.target.value)}
+                  className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                  rows={3}
+                  maxLength={500}
+                  disabled={!!reportingRideId}
+                  placeholder="Short details (max 500 chars)"
+                />
+              </div>
+
+              {reportError ? (
+                <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-800">
+                  {reportError}
+                </div>
+              ) : null}
+
+              <div className="flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setReportModal(null)}
+                  className="rounded-full border border-slate-300 bg-white px-4 py-2 text-xs font-medium text-slate-800 hover:bg-slate-50"
+                  disabled={!!reportingRideId}
+                >
+                  Cancel
+                </button>
+
+                <button
+                  type="button"
+                  onClick={submitReportUnpaid}
+                  className="rounded-full bg-rose-600 px-4 py-2 text-xs font-medium text-white hover:bg-rose-700 disabled:opacity-60"
+                  disabled={!!reportingRideId}
+                >
+                  {reportingRideId ? "Submitting…" : "Submit report"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </main>
   );
 }
 
-/* ---------- Chat overlay (driver side) ---------- */
+/* ---------- Chat overlay ---------- */
 
 function ChatOverlay(props: { context: ActiveChatContext; onClose: () => void }) {
   const { context, onClose } = props;
@@ -896,7 +1116,7 @@ function ChatOverlay(props: { context: ActiveChatContext; onClose: () => void })
 
   useEffect(() => {
     function handleMessage(event: MessageEvent) {
-      if (isObject(event?.data) && event.data.type === "ridechat:close") onClose();
+      if (typeof event?.data === "object" && event.data && (event.data as any).type === "ridechat:close") onClose();
     }
     window.addEventListener("message", handleMessage);
     return () => window.removeEventListener("message", handleMessage);
@@ -905,7 +1125,6 @@ function ChatOverlay(props: { context: ActiveChatContext; onClose: () => void })
   const params = new URLSearchParams();
   params.set("embed", "1");
   params.set("role", "driver");
-
   if (readOnly) params.set("readonly", "1");
   if (autoClose) params.set("autoClose", "1");
   if (prefill) params.set("prefill", prefill);
@@ -917,12 +1136,7 @@ function ChatOverlay(props: { context: ActiveChatContext; onClose: () => void })
       <div className="flex h-[min(650px,100%)] w-[min(900px,100%)] flex-col overflow-hidden rounded-2xl bg-white shadow-2xl">
         <div className="flex items-center justify-between border-b border-slate-200 px-4 py-2 text-sm">
           <span className="font-semibold">Chat with rider</span>
-          <button
-            type="button"
-            onClick={onClose}
-            aria-label="Close chat"
-            className="text-lg leading-none text-slate-500 hover:text-slate-800"
-          >
+          <button type="button" onClick={onClose} aria-label="Close chat" className="text-lg leading-none text-slate-500 hover:text-slate-800">
             ×
           </button>
         </div>

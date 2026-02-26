@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 
 type RideStatus = "OPEN" | "FULL" | "IN_ROUTE" | "COMPLETED";
+type PaymentType = "CARD" | "CASH";
 
 type TripMeterProps = {
   status: RideStatus;
@@ -15,19 +16,21 @@ type TripMeterProps = {
     fareCents: number;
   }) => Promise<void> | void;
 
+  // NEW: show payment mode in header
+  paymentType?: PaymentType | null;
+  cashDiscountBps?: number | null;
+
   // Fake pricing knobs (in USD)
-  baseFare?: number;   // dollars
-  perMinute?: number;  // dollars per minute
-  perMile?: number;    // dollars per mile
+  baseFare?: number; // dollars
+  perMinute?: number; // dollars per minute
+  perMile?: number; // dollars per mile
 };
 
 /* ---------- Helpers ---------- */
 
 function parseDate(value: string | Date | null): Date | null {
   if (!value) return null;
-  if (value instanceof Date) {
-    return Number.isNaN(value.getTime()) ? null : value;
-  }
+  if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value;
   const d = new Date(value);
   return Number.isNaN(d.getTime()) ? null : d;
 }
@@ -40,12 +43,16 @@ function formatDuration(ms: number): string {
   const seconds = totalSeconds % 60;
 
   const pad = (n: number) => n.toString().padStart(2, "0");
-
-  if (hours > 0) {
-    return `${pad(hours)}:${pad(minutes)}:${pad(seconds)}`;
-  }
-
+  if (hours > 0) return `${pad(hours)}:${pad(minutes)}:${pad(seconds)}`;
   return `${pad(minutes)}:${pad(seconds)}`;
+}
+
+function bpsToPercentLabel(bps: number) {
+  // 250 bps => 2.5%
+  const pct = bps / 100;
+  // keep one decimal only when needed
+  const label = Number.isInteger(pct) ? String(pct) : pct.toFixed(1);
+  return `${label}%`;
 }
 
 /* ---------- Component ---------- */
@@ -56,15 +63,14 @@ export function TripMeter({
   tripCompletedAt,
   onStartRide,
   onCompleteRide,
+  paymentType = null,
+  cashDiscountBps = null,
   baseFare = 3.0,
   perMinute = 0.5,
   perMile = 1.2,
 }: TripMeterProps) {
   const startedAt = useMemo(() => parseDate(tripStartedAt), [tripStartedAt]);
-  const completedAt = useMemo(
-    () => parseDate(tripCompletedAt),
-    [tripCompletedAt]
-  );
+  const completedAt = useMemo(() => parseDate(tripCompletedAt), [tripCompletedAt]);
 
   const [now, setNow] = useState<Date>(() => new Date());
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -75,30 +81,21 @@ export function TripMeter({
   // Tick only while the trip is in route
   useEffect(() => {
     if (!isActive) return;
-
-    const id = setInterval(() => {
-      setNow(new Date());
-    }, 1000);
-
+    const id = setInterval(() => setNow(new Date()), 1000);
     return () => clearInterval(id);
   }, [isActive]);
 
   /* ---------- Elapsed time ---------- */
 
   const elapsedMs = useMemo(() => {
-    if (!startedAt) {
-      // If the backend never gave us a start time, treat as 0
-      return 0;
-    }
+    if (!startedAt) return 0;
 
     if (isCompleted && completedAt) {
       return Math.max(0, completedAt.getTime() - startedAt.getTime());
     }
-
     if (isActive) {
       return Math.max(0, now.getTime() - startedAt.getTime());
     }
-
     return 0;
   }, [startedAt, completedAt, isCompleted, isActive, now]);
 
@@ -109,14 +106,10 @@ export function TripMeter({
 
   // Assume ~25 mph ≈ 0.416 miles / minute
   const distanceMilesRaw = Math.max(0, elapsedMinutes * 0.416);
-  const distanceMiles = Number.isFinite(distanceMilesRaw)
-    ? distanceMilesRaw
-    : 0;
+  const distanceMiles = Number.isFinite(distanceMilesRaw) ? distanceMilesRaw : 0;
 
   const estimatedFareDollarsRaw =
-    baseFare +
-    Math.max(0, elapsedMinutes * perMinute) +
-    distanceMiles * perMile;
+    baseFare + Math.max(0, elapsedMinutes * perMinute) + distanceMiles * perMile;
 
   const estimatedFareDollars = Number.isFinite(estimatedFareDollarsRaw)
     ? estimatedFareDollarsRaw
@@ -127,10 +120,7 @@ export function TripMeter({
   /* ---------- Button handlers ---------- */
 
   const handleStartClick = async () => {
-    if (isSubmitting || status === "IN_ROUTE" || status === "COMPLETED") {
-      return;
-    }
-
+    if (isSubmitting || status === "IN_ROUTE" || status === "COMPLETED") return;
     try {
       setIsSubmitting(true);
       await onStartRide();
@@ -140,10 +130,8 @@ export function TripMeter({
   };
 
   const handleCompleteClick = async () => {
-    // ✅ NEW: gate completion on backend status, not local timer state
-    if (isSubmitting || status !== "IN_ROUTE") {
-      return;
-    }
+    // gate completion on backend status, not local timer state
+    if (isSubmitting || status !== "IN_ROUTE") return;
 
     try {
       setIsSubmitting(true);
@@ -156,6 +144,15 @@ export function TripMeter({
       setIsSubmitting(false);
     }
   };
+
+  /* ---------- Payment badge ---------- */
+
+  const showCash = paymentType === "CASH";
+  const showCard = paymentType === "CARD";
+  const discountLabel =
+    showCash && typeof cashDiscountBps === "number" && cashDiscountBps > 0
+      ? ` (-${bpsToPercentLabel(cashDiscountBps)})`
+      : "";
 
   /* ---------- Render ---------- */
 
@@ -171,7 +168,7 @@ export function TripMeter({
         background: "#f9fafb",
       }}
     >
-      {/* Header row: status + timer */}
+      {/* Header row: title + payment badge + timer */}
       <div
         style={{
           display: "flex",
@@ -180,16 +177,36 @@ export function TripMeter({
           gap: 8,
         }}
       >
-        <div
-          style={{
-            fontSize: 12,
-            fontWeight: 500,
-            textTransform: "uppercase",
-            letterSpacing: 0.5,
-            color: "#4b5563",
-          }}
-        >
-          Trip meter
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <div
+            style={{
+              fontSize: 12,
+              fontWeight: 500,
+              textTransform: "uppercase",
+              letterSpacing: 0.5,
+              color: "#4b5563",
+            }}
+          >
+            Trip meter
+          </div>
+
+          {(showCard || showCash) && (
+            <span
+              style={{
+                fontSize: 11,
+                fontWeight: 700,
+                padding: "2px 8px",
+                borderRadius: 999,
+                border: "1px solid #e5e7eb",
+                background: "#ffffff",
+                color: "#111827",
+                whiteSpace: "nowrap",
+              }}
+              title={showCash ? "Cash payment" : "Card payment"}
+            >
+              {showCash ? `CASH${discountLabel}` : "CARD"}
+            </span>
+          )}
         </div>
 
         <div
@@ -205,14 +222,7 @@ export function TripMeter({
       </div>
 
       {/* Metrics row */}
-      <div
-        style={{
-          display: "flex",
-          gap: 12,
-          fontSize: 12,
-          color: "#4b5563",
-        }}
-      >
+      <div style={{ display: "flex", gap: 12, fontSize: 12, color: "#4b5563" }}>
         <div
           style={{
             flex: 1,
@@ -255,14 +265,7 @@ export function TripMeter({
       </div>
 
       {/* Footer: primary action button + status pill */}
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 8,
-          marginTop: 4,
-        }}
-      >
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 4 }}>
         {(status === "OPEN" || status === "FULL") && (
           <button
             type="button"
@@ -324,7 +327,7 @@ export function TripMeter({
               style={{
                 width: 8,
                 height: 8,
-                borderRadius: "999px",
+                borderRadius: 999,
                 background: "#22c55e",
               }}
             />

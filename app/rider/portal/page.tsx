@@ -616,7 +616,7 @@ useEffect(() => {
 
         
 
-        /* ... */
+
 
         <Link href="/">
           <button

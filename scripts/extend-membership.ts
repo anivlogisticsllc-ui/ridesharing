@@ -1,63 +1,69 @@
-// scripts/extend-memberships.js
-require("dotenv").config();
-
-const { PrismaClient } = require("@prisma/client");
-const prisma = new PrismaClient();
+// scripts/extend-membership.ts
+import "dotenv/config";
+import { PrismaClient, MembershipType, MembershipStatus } from "@prisma/client";
 
 /**
- * Usage examples:
- *   node scripts/extend-memberships.js --days 30
- *   node scripts/extend-memberships.js --userId <USER_ID> --days 60
- *   node scripts/extend-memberships.js --type RIDER --days 30
- *   node scripts/extend-memberships.js --type BOTH --days 30
+ * Examples:
+ *   npx tsx scripts/extend-membership.ts --days 30
+ *   npx tsx scripts/extend-membership.ts --userId <USER_ID> --days 60
+ *   npx tsx scripts/extend-membership.ts --type RIDER --days 30
+ *   npx tsx scripts/extend-membership.ts --type DRIVER --days 30
  *
  * Notes:
- * - Extends expiryDate forward from "now" if already expired, otherwise extends from current expiryDate.
+ * - If membership is expired, extends from "now"; otherwise extends from current expiryDate.
  * - Sets status to ACTIVE.
- * - amountPaidCents is left as-is.
+ * - Does NOT use or accept BOTH.
  */
 
-function getArg(name) {
+const prisma = new PrismaClient();
+
+type ExtendType = "RIDER" | "DRIVER";
+
+function getArg(name: string): string | null {
   const idx = process.argv.indexOf(`--${name}`);
   if (idx === -1) return null;
-  return process.argv[idx + 1] ?? null;
+  const v = process.argv[idx + 1];
+  return typeof v === "string" ? v : null;
 }
 
-function parseDays(v) {
-  const n = Number(v);
-  if (!Number.isFinite(n) || n <= 0 || n > 3650) return null;
+function parseDays(v: string | null): number {
+  const n = Number(v ?? "");
+  if (!Number.isFinite(n) || n <= 0 || n > 3650) {
+    throw new Error('Invalid --days (must be 1..3650). Example: --days 30');
+  }
   return Math.floor(n);
 }
 
-function addDays(date, days) {
+function addDays(date: Date, days: number): Date {
   return new Date(date.getTime() + days * 24 * 60 * 60 * 1000);
 }
 
-async function main() {
-  const userId = getArg("userId");
-  const typeRaw = (getArg("type") || "BOTH").toUpperCase(); // RIDER | DRIVER | BOTH
-  const days = parseDays(getArg("days") || "30");
+function parseType(raw: string | null): MembershipType | null {
+  if (!raw) return null; // null => no filter, update all types
 
-  if (!days) {
-    throw new Error("Invalid --days (must be 1..3650). Example: --days 30");
+  const t = raw.trim().toUpperCase();
+
+  // hard block legacy keyword
+  if (t === "BOTH") {
+    throw new Error('Invalid --type "BOTH". Use no --type to update all, or --type RIDER / --type DRIVER.');
   }
 
-  const typeFilter =
-    typeRaw === "RIDER" || typeRaw === "DRIVER"
-      ? typeRaw
-      : typeRaw === "BOTH"
-      ? null
-      : null;
+  if (t === "RIDER") return MembershipType.RIDER;
+  if (t === "DRIVER") return MembershipType.DRIVER;
 
-  // Find latest membership per (userId,type) or for one user
-  // If userId is provided, update that user's memberships; otherwise, update all.
+  throw new Error('Invalid --type. Use RIDER or DRIVER (or omit --type).');
+}
+
+async function main(): Promise<void> {
+  const userId = (getArg("userId") ?? "").trim() || null;
+  const days = parseDays(getArg("days") ?? "30");
+  const type = parseType(getArg("type"));
+
   const where = {
     ...(userId ? { userId } : {}),
-    ...(typeFilter ? { type: typeFilter } : {}),
+    ...(type ? { type } : {}),
   };
 
-  // We'll update *all matching memberships* (simple + predictable).
-  // If you prefer "latest only", tell me and I’ll adjust.
   const rows = await prisma.membership.findMany({
     where,
     select: {
@@ -66,7 +72,6 @@ async function main() {
       type: true,
       expiryDate: true,
       status: true,
-      amountPaidCents: true,
     },
     orderBy: [{ userId: "asc" }, { type: "asc" }, { startDate: "desc" }],
   });
@@ -83,46 +88,21 @@ async function main() {
 
     await prisma.membership.update({
       where: { id: m.id },
-      data: {
-        expiryDate: next,
-        status: "ACTIVE",
-      },
+      data: { expiryDate: next, status: MembershipStatus.ACTIVE },
     });
 
     updated++;
     console.log(
-      `✓ ${m.userId} ${m.type} : ${m.expiryDate.toISOString()} -> ${next.toISOString()} (was ${m.status})`
+      `✓ ${m.userId} ${m.type}: ${m.expiryDate.toISOString()} -> ${next.toISOString()} (was ${m.status})`
     );
   }
 
   console.log(`Done. Updated: ${updated}`);
-
-  // Optional: keep legacy User fields aligned for MVP UI
-  // (Does NOT affect guardMembership, but helps any legacy screens.)
-  if (userId) {
-    const maxExpiry = await prisma.membership.findFirst({
-      where: { userId },
-      orderBy: { expiryDate: "desc" },
-      select: { expiryDate: true },
-    });
-
-    if (maxExpiry?.expiryDate) {
-      await prisma.user.update({
-        where: { id: userId },
-        data: {
-          membershipActive: true,
-          membershipPlan: "STANDARD",
-          trialEndsAt: maxExpiry.expiryDate,
-        },
-      });
-      console.log(`✓ Synced User legacy fields trialEndsAt -> ${maxExpiry.expiryDate.toISOString()}`);
-    }
-  }
 }
 
 main()
   .catch((e) => {
-    console.error("Extend memberships failed:", e);
+    console.error("Extend membership failed:", e);
     process.exitCode = 1;
   })
   .finally(async () => {

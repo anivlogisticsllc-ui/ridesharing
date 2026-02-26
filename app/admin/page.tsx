@@ -46,7 +46,13 @@ function StatCard({
   );
 }
 
-function TabLink({ href, children }: { href: string; children: React.ReactNode }) {
+function TabLink({
+  href,
+  children,
+}: {
+  href: string;
+  children: React.ReactNode;
+}) {
   return (
     <Link
       href={href}
@@ -56,19 +62,6 @@ function TabLink({ href, children }: { href: string; children: React.ReactNode }
     </Link>
   );
 }
-
-async function readApiError(res: Response) {
-  const text = await res.text().catch(() => "");
-  if (!text) return `Request failed (HTTP ${res.status}).`;
-  try {
-    const json = JSON.parse(text);
-    return json?.error || json?.message || `Request failed (HTTP ${res.status}).`;
-  } catch {
-    return text.slice(0, 300) || `Request failed (HTTP ${res.status}).`;
-  }
-}
-
-type ExtendType = "RIDER" | "DRIVER";
 
 export default function AdminDashboardPage() {
   const router = useRouter();
@@ -81,13 +74,6 @@ export default function AdminDashboardPage() {
   const [error, setError] = useState<string | null>(null);
 
   const callbackUrl = useMemo(() => encodeURIComponent("/admin"), []);
-
-  // --- Membership extend UI state ---
-  const [targetEmail, setTargetEmail] = useState("");
-  const [extendDays, setExtendDays] = useState(30);
-  const [extendType, setExtendType] = useState<ExtendType>("DRIVER");
-  const [extendBusy, setExtendBusy] = useState(false);
-  const [extendMsg, setExtendMsg] = useState<string | null>(null);
 
   async function load() {
     try {
@@ -111,7 +97,9 @@ export default function AdminDashboardPage() {
 
       if (!res.ok || !data || !("ok" in data) || !data.ok) {
         setMetrics(null);
-        setError((data as any)?.error || `Failed to load metrics (HTTP ${res.status})`);
+        setError(
+          (data as any)?.error || `Failed to load metrics (HTTP ${res.status})`
+        );
         return;
       }
 
@@ -157,57 +145,6 @@ export default function AdminDashboardPage() {
     ];
   }, [metrics]);
 
-  async function handleExtendMembership() {
-    const email = targetEmail.trim().toLowerCase();
-
-    if (!email || !email.includes("@")) {
-      setExtendMsg("Enter a valid email address first.");
-      return;
-    }
-
-    const days = Number(extendDays);
-    if (!Number.isFinite(days) || days < 1 || days > 3650) {
-      setExtendMsg("Days must be between 1 and 3650.");
-      return;
-    }
-
-    setExtendBusy(true);
-    setExtendMsg(null);
-
-    try {
-      // Keep YOUR endpoint path (you said B is complete)
-      const res = await fetch("/api/admin/membership/extend-membership", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, days, type: extendType }),
-      });
-
-      if (!res.ok) throw new Error(await readApiError(res));
-
-      const json = await res.json().catch(() => null);
-      if (!json?.ok) throw new Error(json?.error || "Failed to extend membership.");
-
-      // Support both payload styles (in case your route returns `updated` array or single newExpiry)
-      const updated = json?.updated as Array<{ type: string; expiryDate: string }> | undefined;
-      const newExpiry = json?.newExpiry as string | undefined;
-
-      const detail =
-        updated?.length
-          ? updated
-              .map((u) => `${u.type} → ${new Date(u.expiryDate).toLocaleString()}`)
-              .join(" | ")
-          : newExpiry
-          ? `${extendType} → ${new Date(newExpiry).toLocaleString()}`
-          : "Updated.";
-
-      setExtendMsg(`Done. ${detail}`);
-    } catch (e: any) {
-      setExtendMsg(e?.message || "Failed to extend membership.");
-    } finally {
-      setExtendBusy(false);
-    }
-  }
-
   if (status === "loading") {
     return <main className="p-8 text-sm text-slate-600">Loading…</main>;
   }
@@ -218,11 +155,14 @@ export default function AdminDashboardPage() {
         <header className="flex items-start justify-between gap-4">
           <div>
             <h1 className="text-3xl font-semibold text-slate-900">Admin</h1>
-            <p className="mt-1 text-sm text-slate-600">Basic dashboard + user management.</p>
+            <p className="mt-1 text-sm text-slate-600">
+              Dashboard + links to admin tools.
+            </p>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
             <TabLink href="/admin/users">Users</TabLink>
+            <TabLink href="/admin/drivers">Drivers</TabLink>
             <TabLink href="/admin/riders">Riders</TabLink>
             <TabLink href="/admin/metrics">Metrics</TabLink>
 
@@ -235,69 +175,6 @@ export default function AdminDashboardPage() {
             </button>
           </div>
         </header>
-
-        {/* Membership tools */}
-        <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-          <h2 className="text-sm font-semibold text-slate-900">Membership tools</h2>
-          <p className="mt-1 text-xs text-slate-500">
-            Extends free access by updating <span className="font-medium">Membership.expiryDate</span>.
-          </p>
-
-          <div className="mt-4 grid gap-3 md:grid-cols-6">
-            <div className="md:col-span-3">
-              <label className="block text-[11px] font-medium uppercase tracking-wide text-slate-500">
-                Target email
-              </label>
-              <input
-                value={targetEmail}
-                onChange={(e) => setTargetEmail(e.target.value)}
-                placeholder="user@example.com"
-                className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
-              />
-            </div>
-
-            <div className="md:col-span-1">
-              <label className="block text-[11px] font-medium uppercase tracking-wide text-slate-500">
-                Days
-              </label>
-              <input
-                type="number"
-                min={1}
-                max={3650}
-                value={extendDays}
-                onChange={(e) => setExtendDays(Number(e.target.value || 30))}
-                className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
-              />
-            </div>
-
-            <div className="md:col-span-2">
-              <label className="block text-[11px] font-medium uppercase tracking-wide text-slate-500">
-                Type
-              </label>
-              <select
-                value={extendType}
-                onChange={(e) => setExtendType(e.target.value as ExtendType)}
-                className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
-              >
-                <option value="DRIVER">DRIVER</option>
-                <option value="RIDER">RIDER</option>
-              </select>
-            </div>
-          </div>
-
-          <div className="mt-4 flex flex-wrap items-center gap-2">
-            <button
-              type="button"
-              onClick={handleExtendMembership}
-              disabled={extendBusy}
-              className="rounded-full bg-indigo-600 px-4 py-2 text-sm font-medium text-white hover:bg-indigo-700 disabled:opacity-60"
-            >
-              {extendBusy ? "Extending…" : "Extend membership"}
-            </button>
-
-            {extendMsg ? <p className="text-sm text-slate-700">{extendMsg}</p> : null}
-          </div>
-        </section>
 
         {loading ? (
           <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
@@ -335,22 +212,25 @@ export default function AdminDashboardPage() {
             </section>
 
             <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-              <h2 className="text-sm font-semibold text-slate-900">Quick links</h2>
+              <h2 className="text-sm font-semibold text-slate-900">Next actions</h2>
               <ul className="mt-3 list-disc space-y-1 pl-5 text-sm text-slate-700">
                 <li>
+                  Go to{" "}
                   <Link className="underline" href="/admin/users">
-                    Manage users
-                  </Link>
+                    Users
+                  </Link>{" "}
+                  to manage role/status/admin grants and view full user details.
                 </li>
                 <li>
+                  Go to{" "}
+                  <Link className="underline" href="/admin/drivers">
+                    Drivers
+                  </Link>{" "}
+                  or{" "}
                   <Link className="underline" href="/admin/riders">
-                    View riders
-                  </Link>
-                </li>
-                <li>
-                  <Link className="underline" href="/admin/metrics">
-                    View metrics
-                  </Link>
+                    Riders
+                  </Link>{" "}
+                  for role-specific lists.
                 </li>
               </ul>
             </section>

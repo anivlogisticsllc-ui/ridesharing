@@ -21,7 +21,7 @@ type MeOkResponse = {
     id: string;
     name: string | null;
     email: string;
-    role: "RIDER" | "DRIVER";
+    role: "RIDER" | "DRIVER" | "ADMIN";
     onboardingCompleted: boolean;
   };
   membership: MembershipSummary;
@@ -33,8 +33,10 @@ function toIso(d: Date | null | undefined) {
   return d ? d.toISOString() : null;
 }
 
-function roleToMembershipType(role: UserRole): MembershipType {
-  return role === UserRole.DRIVER ? MembershipType.DRIVER : MembershipType.RIDER;
+function roleToMembershipType(role: UserRole): MembershipType | null {
+  if (role === UserRole.DRIVER) return MembershipType.DRIVER;
+  if (role === UserRole.RIDER) return MembershipType.RIDER;
+  return null; // ADMIN (or anything else) => no membership lookup
 }
 
 function isTransientDbError(err: unknown) {
@@ -98,6 +100,29 @@ export default async function handler(
 
     const expectedType = roleToMembershipType(user.role);
 
+    // ADMIN: return user + no membership
+    if (!expectedType) {
+      return res.status(200).json({
+        ok: true,
+        user: {
+          id: user.id,
+          name: user.name,
+          email: user.email,
+          role: user.role,
+          onboardingCompleted: user.onboardingCompleted,
+        },
+        membership: {
+          plan: null,
+          kind: "NONE",
+          status: "none",
+          active: false,
+          trialEndsAt: null,
+          currentPeriodEnd: null,
+          cancelAtPeriodEnd: false,
+        },
+      });
+    }
+
     const latest = await withRetry(() =>
       prisma.membership.findFirst({
         where: { userId: user.id, type: expectedType },
@@ -107,6 +132,7 @@ export default async function handler(
           plan: true,
           amountPaidCents: true,
           expiryDate: true,
+          status: true,
         },
       })
     );
@@ -136,8 +162,9 @@ export default async function handler(
     const now = Date.now();
     const periodEndIso = toIso(latest.expiryDate);
     const isActiveByDate = latest.expiryDate.getTime() > now;
+    const paid = (latest.amountPaidCents ?? 0) > 0;
 
-    if (!isActiveByDate) {
+    if (!isActiveByDate || latest.status !== MembershipStatus.ACTIVE) {
       return res.status(200).json({
         ok: true,
         user: {
@@ -159,7 +186,6 @@ export default async function handler(
       });
     }
 
-    const paid = (latest.amountPaidCents ?? 0) > 0;
     const kind: MembershipSummary["kind"] = paid ? "PAID" : "TRIAL";
 
     return res.status(200).json({

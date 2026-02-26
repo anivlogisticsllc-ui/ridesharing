@@ -2,9 +2,18 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { prisma } from "@/lib/prisma";
-import { BookingStatus, RideStatus } from "@prisma/client";
+import { BookingStatus, RideStatus, PaymentType } from "@prisma/client";
 
 type Props = { params: Promise<{ id: string }> };
+
+function money(cents: number | null | undefined) {
+  const v = typeof cents === "number" && Number.isFinite(cents) ? cents : 0;
+  return (v / 100).toFixed(2);
+}
+
+function normalizeCents(v: number | null | undefined): number {
+  return typeof v === "number" && Number.isFinite(v) ? Math.max(0, Math.round(v)) : 0;
+}
 
 export default async function RideDetailPage({ params }: Props) {
   const { id } = await params;
@@ -25,14 +34,21 @@ export default async function RideDetailPage({ params }: Props) {
 
   if (!ride) notFound();
 
-  // Find booking explicitly (don’t rely on ride.bookings shape)
+  // ✅ ONLY fields that exist on your Booking model
   const booking = await prisma.booking.findFirst({
     where: {
       rideId: id,
       status: { in: [BookingStatus.ACCEPTED, BookingStatus.COMPLETED] },
     },
     orderBy: { createdAt: "asc" },
-    select: { id: true },
+    select: {
+      id: true,
+      paymentType: true,
+      cashDiscountBps: true,
+      baseAmountCents: true,
+      discountCents: true,
+      finalAmountCents: true,
+    },
   });
 
   const conversationId = ride.conversations?.[0]?.id ?? null;
@@ -44,12 +60,10 @@ export default async function RideDetailPage({ params }: Props) {
     ? `/chat/${conversationId}?role=driver${isCompletedOrCancelled ? "&readonly=1" : ""}`
     : null;
 
-  // IMPORTANT: receipt page expects bookingId
   const receiptHref =
     ride.status === RideStatus.COMPLETED && booking?.id
       ? `/receipt/${booking.id}?autoprint=1`
       : null;
-
 
   const startedAt = ride.tripStartedAt ?? ride.departureTime;
   const completedAt = ride.tripCompletedAt ?? ride.updatedAt;
@@ -71,8 +85,27 @@ export default async function RideDetailPage({ params }: Props) {
   }
 
   const distanceMiles = ride.distanceMiles ?? 0;
-  const totalPriceOfferCents = ride.totalPriceCents ?? 0;
-  const totalPriceDollars = (totalPriceOfferCents / 100).toFixed(2);
+
+  // ---------- Money (truth source = booking.finalAmountCents if present) ----------
+  const rideEstimateCents = normalizeCents((ride as any).totalPriceCents);
+
+  const baseCents = normalizeCents(booking?.baseAmountCents ?? rideEstimateCents);
+  const discountCents = normalizeCents(booking?.discountCents ?? 0);
+
+  const finalCents =
+    normalizeCents(booking?.finalAmountCents) ||
+    Math.max(0, baseCents - discountCents) ||
+    rideEstimateCents;
+
+  // No fee column exists -> best effort derived fee
+  const convenienceFeeCents = Math.max(0, finalCents - Math.max(0, baseCents - discountCents));
+
+  const paymentLabel =
+    booking?.paymentType === PaymentType.CARD
+      ? "CARD"
+      : booking?.paymentType === PaymentType.CASH
+      ? "CASH"
+      : "n/a";
 
   return (
     <main className="min-h-[calc(100vh-4rem)] bg-slate-50">
@@ -122,60 +155,72 @@ export default async function RideDetailPage({ params }: Props) {
                 Receipt not available
               </span>
             )}
-
           </div>
         </header>
 
         <section className="space-y-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
-              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
-                Trip status
-              </p>
+              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Trip status</p>
               <p className="text-sm font-semibold text-slate-900">{ride.status}</p>
             </div>
 
             <div className="text-right">
-              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
-                Total fare
+              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Total fare</p>
+              <p className="text-lg font-semibold text-slate-900">${money(finalCents)}</p>
+              <p className="text-[11px] text-slate-500">Stored as {finalCents} cents</p>
+            </div>
+          </div>
+
+          {/* Breakdown */}
+          <div className="grid gap-2 text-sm text-slate-700 sm:grid-cols-4">
+            <div>
+              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Payment</p>
+              <p className="mt-1 font-semibold">{paymentLabel}</p>
+            </div>
+
+            <div>
+              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Base fare</p>
+              <p className="mt-1 font-semibold">${money(baseCents)}</p>
+            </div>
+
+            <div>
+              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Discount</p>
+              <p className="mt-1 font-semibold">
+                {discountCents > 0 ? `-$${money(discountCents)}` : "$0.00"}
               </p>
-              <p className="text-lg font-semibold text-slate-900">${totalPriceDollars}</p>
-              <p className="text-[11px] text-slate-500">
-                Stored as {totalPriceOfferCents} cents
+            </div>
+
+            <div>
+              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Convenience fee</p>
+              <p className="mt-1 font-semibold">
+                {convenienceFeeCents > 0 ? `$${money(convenienceFeeCents)}` : "$0.00"}
               </p>
             </div>
           </div>
 
-          <div className="grid gap-4 text-sm text-slate-700 sm:grid-cols-3">
+          <div className="grid gap-4 text-sm text-slate-700 sm:grid-cols-3 pt-2">
             <div>
-              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
-                Distance
-              </p>
+              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Distance</p>
               <p className="mt-1 font-semibold">
                 {distanceMiles > 0 ? `${distanceMiles.toFixed(2)} miles` : "n/a"}
               </p>
             </div>
 
             <div>
-              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
-                Duration
-              </p>
+              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Duration</p>
               <p className="mt-1 font-semibold">{formatDuration(durationMinutes)}</p>
             </div>
 
             <div>
-              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
-                Passenger count
-              </p>
+              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Passenger count</p>
               <p className="mt-1 font-semibold">{ride.passengerCount}</p>
             </div>
           </div>
         </section>
 
         <section className="space-y-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm text-sm text-slate-700">
-          <h2 className="text-xs font-semibold uppercase tracking-wide text-slate-500">
-            Timing
-          </h2>
+          <h2 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Timing</h2>
           <div className="grid gap-3 sm:grid-cols-2">
             <div>
               <p className="text-xs text-slate-500">Scheduled departure</p>
@@ -187,9 +232,7 @@ export default async function RideDetailPage({ params }: Props) {
             </div>
             <div>
               <p className="text-xs text-slate-500">Trip completed</p>
-              <p className="mt-1 font-medium">
-                {completedAt ? completedAt.toLocaleString() : "n/a"}
-              </p>
+              <p className="mt-1 font-medium">{completedAt ? completedAt.toLocaleString() : "n/a"}</p>
             </div>
           </div>
         </section>
