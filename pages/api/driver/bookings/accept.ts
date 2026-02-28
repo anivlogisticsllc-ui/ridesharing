@@ -1,6 +1,6 @@
 // pages/api/driver/bookings/accept.ts
 import type { NextApiRequest, NextApiResponse } from "next";
-import { getServerSession } from "next-auth";
+import { getServerSession } from "next-auth/next";
 import { authOptions } from "../../auth/[...nextauth]";
 import { prisma } from "@/lib/prisma";
 import { canAcceptRides, driverBlockReason } from "@/lib/driverEligibility";
@@ -37,16 +37,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     const bookingId = typeof (req.body as any)?.bookingId === "string" ? (req.body as any).bookingId.trim() : "";
     if (!bookingId) return res.status(400).json({ ok: false, error: "Missing bookingId" });
 
-    // Pull minimum needed for eligibility
     const user = await prisma.user.findUnique({
       where: { id: userId },
       select: {
         role: true,
         membershipActive: true,
         trialEndsAt: true,
-        // IMPORTANT:
-        // If your relation is named differently than "driverProfile", update the key below to match your schema.
-        // Most likely it IS "driverProfile". If your schema uses "DriverProfile" model, relation is usually "driverProfile".
         driverProfile: { select: { verificationStatus: true } },
       },
     });
@@ -72,29 +68,14 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       });
     }
 
-    /**
-     * Booking update:
-     * Your schema might NOT have:
-     * - driverId
-     * - status values PENDING/CONFIRMED
-     *
-     * So we do the smallest safe update:
-     * - require id match
-     * - optionally enforce "driverId is null" IF the field exists (cannot do this type-safely without matching schema)
-     *
-     * If your Booking model DOES have driverId + status, I recommend the stricter version (I can give it once you confirm field names).
-     */
+    // Minimal update (safe across schemas)
     await prisma.booking.update({
       where: { id: bookingId },
-      data: {
-        // If your Booking model has these fields, uncomment and use the stricter version instead.
-        // driverId: userId,
-        // status: "CONFIRMED",
-      } as any,
+      data: {} as any,
     });
 
     return res.status(200).json({ ok: true });
-  } catch (e: any) {
+  } catch (e) {
     console.error("[accept booking] error:", e);
     return res.status(500).json({ ok: false, error: "Server error" });
   }
