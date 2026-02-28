@@ -2,7 +2,7 @@
 
 import { useSession } from "next-auth/react";
 import { useRouter } from "next/navigation";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 type DepartureMode = "ASAP" | "SCHEDULED";
 type PaymentType = "CARD" | "CASH";
@@ -25,6 +25,7 @@ type DistanceResult = {
   originLng: number;
   destLat: number;
   destLng: number;
+  
 };
 
 type GeoEstimateSuccess = {
@@ -49,6 +50,15 @@ type GeoSuggestError = {
   error: string;
 };
 
+type PaymentMethodStatus =
+  | {
+      ok: true;
+      hasPaymentMethod: boolean;
+      customerId: string | null;
+      defaultPaymentMethod: any | null;
+    }
+  | { ok: false; error: string };
+
 function buildAddress(parts: {
   streetNumber: string;
   streetName: string;
@@ -56,8 +66,12 @@ function buildAddress(parts: {
   state: string;
   zip: string;
 }) {
-  const street = [parts.streetNumber.trim(), parts.streetName.trim()].filter(Boolean).join(" ");
-  const cityState = [parts.city.trim(), parts.state.trim().toUpperCase()].filter(Boolean).join(", ");
+  const street = [parts.streetNumber.trim(), parts.streetName.trim()]
+    .filter(Boolean)
+    .join(" ");
+  const cityState = [parts.city.trim(), parts.state.trim().toUpperCase()]
+    .filter(Boolean)
+    .join(", ");
   const zip = parts.zip.trim();
 
   if (!street || !cityState || !zip) return "";
@@ -75,10 +89,15 @@ export function RiderRequestFormHome() {
   const { data: session, status } = useSession();
   const router = useRouter();
 
-  // Top-level UI state (declare ONCE)
+  // Top-level UI state
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [outstandingOcId, setOutstandingOcId] = useState<string | null>(null);
+
+  // Card-on-file status
+  const [pmLoading, setPmLoading] = useState(false);
+  const [hasCardOnFile, setHasCardOnFile] = useState<boolean>(false);
+  const [pmChecked, setPmChecked] = useState<boolean>(false);
 
   // Visible address search box values
   const [originQuery, setOriginQuery] = useState("");
@@ -132,6 +151,43 @@ export function RiderRequestFormHome() {
       }),
     [destStreetNumber, destStreetName, destCity, destStateVal, destZip]
   );
+
+  async function loadPaymentMethodStatus(opts?: { silent?: boolean }) {
+    if (!session) return;
+
+    setPmLoading(true);
+    try {
+      const res = await fetch("/api/billing/payment-method", { cache: "no-store" });
+
+      if (res.status === 401) {
+        router.push("/auth/login?callbackUrl=/");
+        return;
+      }
+
+      const json = (await res.json().catch(() => null)) as PaymentMethodStatus | null;
+
+      if (!res.ok || !json || !("ok" in json) || !json.ok) {
+        setHasCardOnFile(false);
+        if (!opts?.silent) {
+          setError((json as any)?.error || `Failed to load payment method status (HTTP ${res.status}).`);
+        }
+        return;
+      }
+
+      setHasCardOnFile(Boolean(json.hasPaymentMethod));
+      if (!opts?.silent) setError(null);
+    } finally {
+      setPmChecked(true);
+      setPmLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    if (status === "loading") return;
+    if (!session) return;
+    void loadPaymentMethodStatus({ silent: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status, session]);
 
   async function estimateDistanceOnce(opts?: { showUserError?: boolean }): Promise<DistanceResult | null> {
     if (!originAddress || !destinationAddress) {
@@ -201,6 +257,24 @@ export function RiderRequestFormHome() {
     setPaymentType("CASH");
   }
 
+  function goAddCard() {
+    router.push("/account/billing/payment-method");
+  }
+
+  function requireCardGate(): boolean {
+    if (!pmChecked) {
+      setError("Checking your payment method status… please try again in a moment.");
+      return false;
+    }
+
+    if (!hasCardOnFile) {
+      setError("Please add a card on file before booking.");
+      return false;
+    }
+
+    return true;
+  }
+
   async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
     setError(null);
@@ -211,6 +285,9 @@ export function RiderRequestFormHome() {
       router.push("/auth/login?callbackUrl=/");
       return;
     }
+
+    await loadPaymentMethodStatus({ silent: true });
+    if (!requireCardGate()) return;
 
     if (!originAddress || !destinationAddress) {
       setError("Please fill out all address fields for From and To.");
@@ -327,14 +404,20 @@ export function RiderRequestFormHome() {
     );
   }
 
+  const bookingBlockedNoCard = pmChecked && !hasCardOnFile;
+
   return (
     <section className="space-y-3">
       <h2 className="text-lg font-semibold text-slate-900">Request a ride</h2>
 
-      <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-900">
-        <div className="font-medium">CASH promo</div>
-        <div className="text-emerald-800">
-          Pay with cash and get an automatic <b>10% discount</b> on the final fare.
+      {/* Cash promo / warning */}
+      <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+        <div className="font-medium">Cash rides</div>
+        <div className="mt-1 text-amber-900">
+          Cash rides can receive a <b>10% discount</b> only if cash is paid in-person.
+        </div>
+        <div className="mt-2 text-amber-800">
+          If a cash ride isn’t paid in cash, we may charge the card on file and the cash discount will not apply.
         </div>
       </div>
 
@@ -352,7 +435,7 @@ export function RiderRequestFormHome() {
                 onChange={() => setPaymentType("CASH")}
               />
               <span>
-                CASH <span className="text-emerald-700">(10% off)</span>
+                CASH <span className="text-emerald-700">(10% off if paid in cash)</span>
               </span>
             </label>
 
@@ -368,6 +451,29 @@ export function RiderRequestFormHome() {
             </label>
           </div>
         </div>
+
+        {bookingBlockedNoCard ? (
+          <div className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-800">
+            You need to add a card before booking a ride.
+            <div className="mt-2">
+              <button
+                type="button"
+                onClick={goAddCard}
+                className="inline-flex rounded-full bg-slate-900 px-3 py-1.5 text-[11px] font-medium text-white hover:bg-slate-800"
+              >
+                Add a card
+              </button>
+              <button
+                type="button"
+                onClick={() => void loadPaymentMethodStatus({ silent: false })}
+                disabled={pmLoading}
+                className="ml-2 inline-flex rounded-full border border-slate-300 bg-white px-3 py-1.5 text-[11px] font-medium text-slate-800 hover:bg-slate-50 disabled:opacity-60"
+              >
+                {pmLoading ? "Checking…" : "Refresh"}
+              </button>
+            </div>
+          </div>
+        ) : null}
 
         <div className="grid gap-4 md:grid-cols-2">
           {/* FROM */}
@@ -640,10 +746,10 @@ export function RiderRequestFormHome() {
 
         <button
           type="submit"
-          disabled={submitting || estimating}
+          disabled={submitting || estimating || bookingBlockedNoCard || pmLoading}
           className="rounded-full bg-indigo-600 px-4 py-2 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-60"
         >
-          {submitting ? "Posting…" : "Post ride request"}
+          {submitting ? "Posting…" : bookingBlockedNoCard ? "Add a card to book" : "Post ride request"}
         </button>
       </form>
     </section>

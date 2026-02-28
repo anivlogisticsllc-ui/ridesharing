@@ -42,9 +42,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     const user = session?.user as any;
 
     if (!user?.id) return res.status(401).json({ ok: false, error: "Not authenticated" });
-    if (user.role !== UserRole.DRIVER) {
-      return res.status(403).json({ ok: false, error: "Only drivers can report unpaid rides." });
-    }
+    if (user.role !== UserRole.DRIVER) return res.status(403).json({ ok: false, error: "Only drivers can report unpaid rides." });
 
     const driverId = String(user.id);
 
@@ -56,27 +54,21 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     const rideId = typeof body.rideId === "string" ? body.rideId.trim() : "";
     if (!rideId) return res.status(400).json({ ok: false, error: "rideId is required" });
 
-    if (!isValidReason(body.reason)) {
-      return res.status(400).json({ ok: false, error: "reason is required" });
-    }
+    if (!isValidReason(body.reason)) return res.status(400).json({ ok: false, error: "reason is required" });
 
-    const note = typeof body.note === "string" ? body.note.trim().slice(0, 500) : null;
+    const note = typeof body.note === "string" ? body.note.trim().slice(0, 500) : "";
+    const reason = body.reason;
 
     const ride = await prisma.ride.findFirst({
       where: { id: rideId, driverId },
       select: {
         id: true,
         status: true,
-        departureTime: true,
         tripCompletedAt: true,
         totalPriceCents: true,
-        originCity: true,
-        destinationCity: true,
         rider: {
           select: {
             id: true,
-            name: true,
-            email: true,
             stripeCustomerId: true,
             stripeDefaultPaymentId: true,
           },
@@ -90,9 +82,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
             riderId: true,
             paymentType: true,
             baseAmountCents: true,
-            discountCents: true,
-            finalAmountCents: true,
-            cashDiscountBps: true,
           },
         },
       },
@@ -100,7 +89,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
     if (!ride) return res.status(404).json({ ok: false, error: "Ride not found for this driver." });
     if (ride.status !== RideStatus.COMPLETED) return res.status(400).json({ ok: false, error: "Ride must be COMPLETED." });
-
     if (!ride.tripCompletedAt) return res.status(400).json({ ok: false, error: "Ride missing tripCompletedAt." });
 
     const completedMs = new Date(ride.tripCompletedAt).getTime();
@@ -128,32 +116,25 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
     const customerId = rider.stripeCustomerId ?? null;
     if (!customerId) {
-      return res.status(409).json({
-        ok: false,
-        error: "Rider has no backup card on file. Cannot charge. (This should not happen after Step A/B.)",
-      });
+      return res.status(409).json({ ok: false, error: "Rider has no backup card on file. Cannot charge." });
     }
 
-    // Get Stripe default PM (prefer DB hint, fallback to Stripe customer)
+    // Resolve default PM
     let defaultPm: string | null = rider.stripeDefaultPaymentId ?? null;
 
     if (!defaultPm) {
       const customer = await stripe.customers.retrieve(customerId);
-      if (!customer || (customer as any).deleted) {
-        return res.status(409).json({ ok: false, error: "Billing customer missing." });
-      }
+      if (!customer || (customer as any).deleted) return res.status(409).json({ ok: false, error: "Billing customer missing." });
       defaultPm = (customer as any)?.invoice_settings?.default_payment_method ?? null;
     }
 
-    if (!defaultPm) {
-      return res.status(409).json({
-        ok: false,
-        error: "Rider has no default payment method. Cannot charge. (This should not happen after Step A/B.)",
-      });
-    }
+    if (!defaultPm) return res.status(409).json({ ok: false, error: "Rider has no default payment method. Cannot charge." });
 
-    // Create + confirm off-session payment
+    const now = new Date();
+
+    // Stripe charge
     let piId = "";
+    let piStatus = "";
     try {
       const pi = await stripe.paymentIntents.create({
         amount: chargeCents,
@@ -167,26 +148,43 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
           rideId: ride.id,
           bookingId: booking.id,
           driverId,
-          reason: body.reason ?? "",
+          reason,
           note: note ?? "",
         },
       });
       piId = pi.id;
+      piStatus = String(pi.status ?? "");
     } catch (e: any) {
-      // Stripe error: card declined, authentication required, etc.
       const msg = e?.message ? String(e.message) : "Card charge failed.";
       return res.status(402).json({ ok: false, error: msg });
     }
 
-    // Update booking: convert to CARD and remove discount
+    // ✅ Update booking with full audit trail
     await prisma.booking.update({
       where: { id: booking.id },
       data: {
+        // keep original intent unchanged
+        // originalPaymentType / originalCashDiscountBps should remain as-is
+
+        cashNotPaidAt: now,
+        cashNotPaidByUserId: driverId,           // legacy field you already display
+        cashNotPaidNote: note || null,           // NEW
+        cashNotPaidReportedById: driverId,       // NEW (for richer UI)
+
+        cashDiscountRevokedAt: now,
+        cashDiscountRevokedReason: `Driver reported unpaid cash (${reason})`,
+
+        fallbackCardChargedAt: now,
+
+        stripePaymentIntentId: piId,
+        stripePaymentIntentStatus: piStatus || "unknown",
+
+        // Final state: CARD and no discount
         paymentType: PaymentType.CARD,
         cashDiscountBps: 0,
         discountCents: 0,
+        baseAmountCents: chargeCents,
         finalAmountCents: chargeCents,
-        baseAmountCents: chargeCents, // keep base consistent for receipt
       },
     });
 

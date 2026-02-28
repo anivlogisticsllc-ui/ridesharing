@@ -20,21 +20,26 @@ type Booking = {
   driverName: string | null;
   driverPublicId: string | null;
   conversationId: string | null;
-  isRideOnly?: boolean;
 
   distanceMiles?: number | null;
   passengerCount?: number | null;
   tripStartedAt?: string | null;
   tripCompletedAt?: string | null;
 
-  // ✅ new fields already coming from /api/rider/bookings
+  // pricing / payment
   paymentType?: PaymentType | null;
   cashDiscountBps?: number | null;
   baseTotalPriceCents?: number | null;
   effectiveTotalPriceCents?: number | null;
-
-  // legacy fallback
   totalPriceCents?: number | null;
+
+  // cash override / audit trail (make sure your API returns these if you want them shown)
+  originalPaymentType?: PaymentType | null;
+  originalCashDiscountBps?: number | null;
+  cashNotPaidAt?: string | null;
+  cashDiscountRevokedAt?: string | null;
+  cashDiscountRevokedReason?: string | null;
+  fallbackCardChargedAt?: string | null;
 };
 
 type ApiResponse = { ok: true; bookings: Booking[] } | { ok: false; error: string };
@@ -62,9 +67,15 @@ function getEffectiveFareCents(b: Booking): number | null {
   return null;
 }
 
+function pctFromBps(bps: number | null | undefined): number {
+  const n = typeof bps === "number" && Number.isFinite(bps) ? bps : 0;
+  return Math.round(n / 100); // 1000 bps => 10
+}
+
 export default function RiderTripPage() {
   const router = useRouter();
   const params = useParams();
+
   const rawRideId = params?.rideId;
   const rideId = typeof rawRideId === "string" ? decodeURIComponent(rawRideId) : null;
 
@@ -190,7 +201,15 @@ export default function RiderTripPage() {
 
   const base = typeof booking.baseTotalPriceCents === "number" ? booking.baseTotalPriceCents : null;
   const effective = getEffectiveFareCents(booking);
-  const hasDiscount = base != null && effective != null && effective < base;
+
+  const hasDiscount =
+    base != null && effective != null && Number.isFinite(base) && Number.isFinite(effective) && effective < base;
+
+  const showCashOverrideAudit =
+    booking.originalPaymentType != null ||
+    booking.cashNotPaidAt != null ||
+    booking.cashDiscountRevokedAt != null ||
+    booking.fallbackCardChargedAt != null;
 
   return (
     <main style={{ maxWidth: 900, margin: "0 auto", padding: 24, fontFamily: "system-ui, sans-serif" }}>
@@ -214,10 +233,11 @@ export default function RiderTripPage() {
             <button
               type="button"
               onClick={() => {
-                const url = `/receipt/${encodeURIComponent(booking.bookingId)}?autoprint=1`;
+                const id = booking.bookingId;
+                if (!id) return; // satisfies TS and protects runtime
+                const url = `/receipt/${encodeURIComponent(id)}?autoprint=1`;
                 window.open(url, "_blank", "noopener,noreferrer");
               }}
-
               style={{
                 padding: "6px 12px",
                 borderRadius: 999,
@@ -293,14 +313,13 @@ export default function RiderTripPage() {
             </div>
           )}
 
-          {/* ✅ Fare block: show base + final if discounted */}
           {effective != null && (
             <div>
               <strong>Fare:</strong>{" "}
-              {hasDiscount ? (
+              {hasDiscount && base != null ? (
                 <>
                   <span style={{ textDecoration: "line-through", color: "#6b7280", marginRight: 8 }}>
-                    ${formatMoney(base!)}
+                    ${formatMoney(base)}
                   </span>
                   <span style={{ fontWeight: 700 }}>${formatMoney(effective)}</span>
                   <span style={{ marginLeft: 8, color: "#166534", fontWeight: 600 }}>
@@ -318,7 +337,7 @@ export default function RiderTripPage() {
               <strong>Payment:</strong> {booking.paymentType}
               {booking.paymentType === "CASH" && (booking.cashDiscountBps ?? 0) > 0 ? (
                 <span style={{ marginLeft: 8, color: "#166534", fontWeight: 600 }}>
-                  ({Math.round((booking.cashDiscountBps ?? 0) / 100)}% off)
+                  ({pctFromBps(booking.cashDiscountBps)}% off)
                 </span>
               ) : null}
             </div>
@@ -343,6 +362,57 @@ export default function RiderTripPage() {
           )}
         </div>
       </div>
+
+      {showCashOverrideAudit && (
+        <div
+          style={{
+            marginTop: 14,
+            border: "1px solid #e5e7eb",
+            borderRadius: 12,
+            padding: 14,
+            background: "#fff",
+          }}
+        >
+          <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 8 }}>Cash override audit</div>
+
+          <div style={{ fontSize: 13, color: "#374151", display: "grid", gap: 6 }}>
+            {booking.originalPaymentType && (
+              <div>
+                <strong>Original booking payment:</strong> {booking.originalPaymentType}
+                {booking.originalPaymentType === "CASH" && (booking.originalCashDiscountBps ?? 0) > 0 ? (
+                  <span style={{ marginLeft: 8, color: "#166534", fontWeight: 600 }}>
+                    ({pctFromBps(booking.originalCashDiscountBps)}% off)
+                  </span>
+                ) : null}
+              </div>
+            )}
+
+            {booking.cashNotPaidAt && (
+              <div>
+                <strong>Cash not paid reported at:</strong> {new Date(booking.cashNotPaidAt).toLocaleString()}
+              </div>
+            )}
+
+            {booking.cashDiscountRevokedAt && (
+              <div>
+                <strong>Cash discount revoked at:</strong> {new Date(booking.cashDiscountRevokedAt).toLocaleString()}
+              </div>
+            )}
+
+            {booking.cashDiscountRevokedReason && (
+              <div>
+                <strong>Revocation reason:</strong> {booking.cashDiscountRevokedReason}
+              </div>
+            )}
+
+            {booking.fallbackCardChargedAt && (
+              <div>
+                <strong>Fallback card charged at:</strong> {new Date(booking.fallbackCardChargedAt).toLocaleString()}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {activeChat && (
         <ChatOverlay

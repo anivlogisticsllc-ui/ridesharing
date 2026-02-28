@@ -57,6 +57,29 @@ model User {
   transactions               Transaction[]            @relation("DriverTransactions")
   outstandingCharges         OutstandingCharge[]      @relation("UserOutstandingCharges")
   reportedOutstandingCharges OutstandingCharge[]      @relation("DriverReportedOutstandingCharges")
+  pmStripeProbeFailedAt      DateTime?
+  pmStripeProbeFailCount     Int                      @default(0)
+  pmStripeLastVerifiedAt     DateTime?
+  // What rider selected at booking time
+  requestedPaymentType       PaymentType? // "CASH" | "CARD"
+
+  // What we actually collected at the end (may differ)
+  finalPaymentType PaymentType? // "CASH" | "CARD"
+
+  // Cash discount bookkeeping
+  cashDiscountEligible    Boolean @default(false)
+  cashDiscountApplied     Boolean @default(false)
+  cashDiscountAmountCents Int     @default(0)
+
+  // If discount was removed because cash wasn’t paid
+  cashDiscountRevoked   Boolean   @default(false)
+  cashDiscountRevokedAt DateTime?
+  cashNotPaid           Boolean   @default(false)
+  cashNotPaidReason     String?
+
+  // “Evidence” / audit metadata
+  cashReceivedMarkedAt   DateTime?
+  cashReceivedMarkedById String? // userId (driver/admin) if you want
 }
 
 model DriverProfile {
@@ -169,37 +192,57 @@ model Ride {
 }
 
 model Booking {
-  id                      String             @id @default(cuid())
-  rideId                   String
-  status                   BookingStatus      @default(PENDING)
-  createdAt                DateTime           @default(now())
-  updatedAt                DateTime           @updatedAt
+  id        String        @id @default(cuid())
+  rideId    String
+  status    BookingStatus @default(PENDING)
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
 
-  riderEmail               String?
-  riderName                String?
-  riderId                  String?
+  riderEmail String?
+  riderName  String?
+  riderId    String?
 
-  cashDiscountBps          Int?               @default(0)
-  paymentMethodId          String?
-  paymentType              PaymentType?       @default(CARD)
+  cashDiscountBps Int?         @default(0)
+  paymentMethodId String?
+  paymentType     PaymentType? @default(CARD)
 
-  baseAmountCents          Int?
-  discountCents            Int?
-  finalAmountCents         Int?
-  currency                 String?            @default("USD")
+  baseAmountCents  Int?
+  discountCents    Int?
+  finalAmountCents Int?
+  currency         String? @default("USD")
 
-  // NEW: Stripe charge tracking for “backup card charge” / card payments
-  stripePaymentIntentId    String?            @unique
+  stripePaymentIntentId     String? @unique
   stripePaymentIntentStatus String?
 
-  ride                     Ride               @relation(fields: [rideId], references: [id])
-  rider                    User?              @relation("RiderBookings", fields: [riderId], references: [id])
-  conversation             Conversation?
-  outstandingCharge        OutstandingCharge?
+  // ---------- NEW: original intent + override audit ----------
+  originalPaymentType     PaymentType?
+  originalCashDiscountBps Int?         @default(0)
+
+  cashNotPaidAt             DateTime?
+  cashNotPaidByUserId       String?
+  cashDiscountRevokedAt     DateTime?
+  cashDiscountRevokedReason String?
+
+  // optional: when you actually charged the backup card
+  fallbackCardChargedAt DateTime?
+
+  // relations...
+  ride              Ride               @relation(fields: [rideId], references: [id])
+  rider             User?              @relation("RiderBookings", fields: [riderId], references: [id])
+  conversation      Conversation?
+  outstandingCharge OutstandingCharge?
+  rideAuditLogs     RideAuditLog[]
+  
+  cashNotPaidNote          String?   // NEW: driver/admin note
+  cashNotPaidReportedById  String?   // NEW: who wrote the note (driver or admin)
+  cashNotPaidReason String?  // e.g. RIDER_REFUSED_CASH | RIDER_NO_CASH | OTHER
 
   @@index([rideId])
   @@index([riderId])
   @@index([status])
+  @@index([originalPaymentType])
+  @@index([cashNotPaidAt])
+  @@index([cashNotPaidReason])
 }
 
 model Conversation {
@@ -347,6 +390,21 @@ model Payout {
   driver      User         @relation(fields: [driverId], references: [id])
 
   @@index([driverId])
+}
+
+model RideAuditLog {
+  id        String  @id @default(cuid())
+  bookingId String
+  booking   Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+
+  type    String // e.g. "CASH_SELECTED", "CASH_NOT_PAID", "DISCOUNT_REVOKED", "CARD_CHARGED"
+  message String?
+  meta    Json?
+
+  actorUserId String? // driver/admin/system user id
+  createdAt   DateTime @default(now())
+
+  @@index([bookingId, createdAt])
 }
 
 enum UserRole {

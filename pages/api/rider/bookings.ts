@@ -33,6 +33,16 @@ type ApiBooking = {
 
   baseTotalPriceCents?: number | null;
   effectiveTotalPriceCents?: number | null;
+    // --- cash override audit (NEW) ---
+  originalPaymentType?: PaymentType | null;
+  originalCashDiscountBps?: number | null;
+
+  cashNotPaidAt?: string | null;
+  cashNotPaidByUserId?: string | null;
+  cashDiscountRevokedAt?: string | null;
+  cashDiscountRevokedReason?: string | null;
+
+  fallbackCardChargedAt?: string | null;
 };
 
 type ApiResponse =
@@ -165,6 +175,16 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
         baseTotalPriceCents: base,
         effectiveTotalPriceCents: effective,
+        
+        originalPaymentType: b.originalPaymentType ?? null,
+        originalCashDiscountBps: bps(b.originalCashDiscountBps),
+
+        cashNotPaidAt: toIsoOrNull(b.cashNotPaidAt),
+        cashNotPaidByUserId: b.cashNotPaidByUserId ?? null,
+        cashDiscountRevokedAt: toIsoOrNull(b.cashDiscountRevokedAt),
+        cashDiscountRevokedReason: b.cashDiscountRevokedReason ?? null,
+
+        fallbackCardChargedAt: toIsoOrNull(b.fallbackCardChargedAt),
       };
     });
 

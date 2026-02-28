@@ -1,3 +1,4 @@
+// app/api/billing/setup-intent/route.ts
 import { NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/pages/api/auth/[...nextauth]";
@@ -5,6 +6,7 @@ import { prisma } from "@/lib/prisma";
 import { stripe } from "@/lib/stripe";
 
 export const dynamic = "force-dynamic";
+export const revalidate = 0;
 
 function jsonError(status: number, error: string) {
   return NextResponse.json({ ok: false, error }, { status });
@@ -42,13 +44,18 @@ export async function POST() {
       where: { id: user.id },
       data: { stripeCustomerId: customerId },
     });
+  } else {
+    // keep metadata in sync (helps debugging)
+    await stripe.customers.update(customerId, {
+      metadata: { userId: user.id },
+    });
   }
 
   const si = await stripe.setupIntents.create({
     customer: customerId,
     usage: "off_session",
-    automatic_payment_methods: { enabled: true },
-    metadata: { userId: user.id }, // add this
+    payment_method_types: ["card"], // <-- card only (prevents Link / other types)
+    metadata: { userId: user.id },
   });
 
   return NextResponse.json({

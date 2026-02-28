@@ -3,17 +3,27 @@ import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/pages/api/auth/[...nextauth]";
 import { prisma } from "@/lib/prisma";
-import { BookingStatus, UserRole } from "@prisma/client";
+import { BookingStatus, UserRole, RideStatus } from "@prisma/client";
 
 type CompleteRideBody = {
   rideId?: string;
-  elapsedSeconds?: number | null;
-  distanceMiles?: number | null;
-  fareCents?: number | null; // meter-computed final fare
+  elapsedSeconds?: number | null; // currently unused, but OK to accept
+  distanceMiles?: number | string | null; // accept number OR string from client
+  fareCents?: number | string | null; // accept number OR string from client
 };
 
+function asNumber(v: unknown): number | null {
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "string" && v.trim() !== "") {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
 function asInt(v: unknown): number | null {
-  return typeof v === "number" && Number.isFinite(v) ? Math.round(v) : null;
+  const n = asNumber(v);
+  return typeof n === "number" ? Math.round(n) : null;
 }
 
 export async function POST(req: NextRequest) {
@@ -33,12 +43,12 @@ export async function POST(req: NextRequest) {
 
     const body = (await req.json().catch(() => ({}))) as CompleteRideBody;
     const rideId = typeof body.rideId === "string" ? body.rideId.trim() : "";
-
     if (!rideId) {
       return NextResponse.json({ ok: false, error: "Missing rideId" }, { status: 400 });
     }
 
-    const distanceMiles = asInt(body.distanceMiles);
+    // IMPORTANT: keep miles as a decimal, only round cents
+    const distanceMiles = asNumber(body.distanceMiles);
     const fareCents = asInt(body.fareCents);
 
     // Load the ride + most relevant booking
@@ -64,7 +74,7 @@ export async function POST(req: NextRequest) {
     }
 
     // Don’t allow completing from invalid states
-    if (ride.status !== "ACCEPTED" && ride.status !== "IN_ROUTE") {
+    if (ride.status !== RideStatus.ACCEPTED && ride.status !== RideStatus.IN_ROUTE) {
       return NextResponse.json(
         { ok: false, error: `Ride cannot be completed from status ${ride.status}.` },
         { status: 400 }
@@ -79,22 +89,23 @@ export async function POST(req: NextRequest) {
     const tripCompletedAt = new Date();
 
     await prisma.$transaction(async (tx) => {
-      // Update ride
       await tx.ride.update({
         where: { id: rideId },
         data: {
-          status: "COMPLETED",
-          tripStartedAt: ride.tripStartedAt ?? undefined, // preserve if already set
+          status: RideStatus.COMPLETED,
+          // preserve if already set
+          tripStartedAt: ride.tripStartedAt ?? undefined,
           tripCompletedAt,
+          // only set if provided
           distanceMiles: typeof distanceMiles === "number" ? distanceMiles : undefined,
         },
       });
 
-      // Update booking to COMPLETED and store meter fare as finalAmountCents (if provided)
       await tx.booking.update({
         where: { id: booking.id },
         data: {
           status: BookingStatus.COMPLETED,
+          // meter-computed final fare (if provided)
           finalAmountCents: typeof fareCents === "number" ? fareCents : undefined,
         },
       });

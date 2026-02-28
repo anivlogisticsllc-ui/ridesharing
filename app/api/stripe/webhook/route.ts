@@ -4,7 +4,7 @@ import Stripe from "stripe";
 import { stripe } from "@/lib/stripe";
 import { prisma } from "@/lib/prisma";
 
-export const runtime = "nodejs"; // important for raw body + signature verification
+export const runtime = "nodejs"; // needed for raw body signature verification
 export const dynamic = "force-dynamic";
 
 function envOrThrow(name: string) {
@@ -13,11 +13,47 @@ function envOrThrow(name: string) {
   return v;
 }
 
+function asStringId(x: unknown): string | null {
+  if (typeof x === "string" && x.trim()) return x.trim();
+  if (x && typeof x === "object" && "id" in x) {
+    const id = (x as any).id;
+    return typeof id === "string" && id.trim() ? id.trim() : null;
+  }
+  return null;
+}
+
+async function resolveUserIdFromSetupIntent(si: Stripe.SetupIntent): Promise<string | null> {
+  // 1) Preferred: metadata on SetupIntent (you should set this when creating SI)
+  const metaUserId = (si.metadata?.userId || "").trim();
+  if (metaUserId) return metaUserId;
+
+  // 2) Fallback: lookup by stripeCustomerId in your DB
+  const customerId = asStringId(si.customer);
+  if (customerId) {
+    const u = await prisma.user.findUnique({
+      where: { stripeCustomerId: customerId },
+      select: { id: true },
+    });
+    if (u?.id) return u.id;
+  }
+
+  // 3) Last resort: customer.metadata.userId (works only if you set it)
+  if (customerId) {
+    const customer = (await stripe.customers.retrieve(customerId)) as Stripe.Customer;
+    const userId = (customer.metadata?.userId || "").trim();
+    if (userId) return userId;
+  }
+
+  return null;
+}
+
 export async function POST(req: Request) {
   const webhookSecret = envOrThrow("STRIPE_WEBHOOK_SECRET");
 
   const sig = req.headers.get("stripe-signature");
-  if (!sig) return NextResponse.json({ ok: false, error: "Missing stripe-signature" }, { status: 400 });
+  if (!sig) {
+    return NextResponse.json({ ok: false, error: "Missing stripe-signature" }, { status: 400 });
+  }
 
   const body = await req.text();
 
@@ -33,42 +69,55 @@ export async function POST(req: Request) {
 
   try {
     switch (event.type) {
-      // This is the “card saved” moment
       case "setup_intent.succeeded": {
         const si = event.data.object as Stripe.SetupIntent;
 
-        const customerId = typeof si.customer === "string" ? si.customer : si.customer?.id;
-        const paymentMethodId =
-          typeof si.payment_method === "string" ? si.payment_method : si.payment_method?.id;
+        const customerId = asStringId(si.customer);
+        const paymentMethodId = asStringId(si.payment_method);
 
-        if (!customerId || !paymentMethodId) break;
+        if (!customerId || !paymentMethodId) {
+          console.warn("[stripe webhook] setup_intent.succeeded missing ids", {
+            hasCustomer: !!customerId,
+            hasPaymentMethod: !!paymentMethodId,
+            setupIntentId: si.id,
+          });
+          break;
+        }
 
-        // Map Stripe customer -> your userId (you set metadata.userId on customer in setup-intent route)
-        const customer = (await stripe.customers.retrieve(customerId)) as Stripe.Customer;
-        const userId = (customer.metadata?.userId || "").trim();
-        if (!userId) break;
+        const userId = await resolveUserIdFromSetupIntent(si);
+        if (!userId) {
+          console.warn("[stripe webhook] could not map setup_intent to user", {
+            setupIntentId: si.id,
+            customerId,
+          });
+          break;
+        }
 
-        // Pull card details
         const pm = await stripe.paymentMethods.retrieve(paymentMethodId);
-
-        // We only persist cards here (PaymentElement can support others; add cases later if needed)
         const card = pm.card;
-        if (!card) break;
 
-        // Make it default on Stripe customer (useful later for subscriptions)
+        if (!card) {
+          console.warn("[stripe webhook] payment method is not a card; ignoring", {
+            setupIntentId: si.id,
+            paymentMethodId,
+            type: pm.type,
+          });
+          break;
+        }
+
+        // Set default on Stripe customer (useful for subscriptions + future charges)
         await stripe.customers.update(customerId, {
           invoice_settings: { default_payment_method: paymentMethodId },
         });
 
-        // Persist locally
         await prisma.$transaction(async (tx) => {
-          // Turn off old defaults
+          // Clear existing defaults
           await tx.paymentMethod.updateMany({
             where: { userId },
             data: { isDefault: false },
           });
 
-          // Upsert the new/default card
+          // Upsert the saved card
           await tx.paymentMethod.upsert({
             where: { stripePaymentMethodId: paymentMethodId },
             create: {
@@ -94,6 +143,7 @@ export async function POST(req: Request) {
             },
           });
 
+          // Keep user pointers current
           await tx.user.update({
             where: { id: userId },
             data: {
@@ -107,13 +157,13 @@ export async function POST(req: Request) {
       }
 
       default:
-        // ignore other events for now
+        // ignore other events
         break;
     }
 
     return NextResponse.json({ ok: true });
   } catch (err: any) {
-    console.error("[stripe webhook]", event.type, err);
+    console.error("[stripe webhook] handler failed", { type: event.type, err });
     return NextResponse.json(
       { ok: false, error: err?.message || "Webhook handler failed" },
       { status: 500 }

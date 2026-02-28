@@ -2,7 +2,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useRouter } from "next/navigation";
 import { useSession } from "next-auth/react";
 
@@ -26,33 +26,19 @@ function asRole(v: unknown): Role | null {
   return v === "RIDER" || v === "DRIVER" || v === "ADMIN" ? v : null;
 }
 
-function StatCard({
-  label,
-  value,
-  hint,
-}: {
-  label: string;
-  value: number | string;
-  hint?: string;
-}) {
+function StatCard(props: { label: string; value: number | string; hint?: string }) {
+  const { label, value, hint } = props;
   return (
     <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-      <div className="text-[11px] font-medium uppercase tracking-wide text-slate-500">
-        {label}
-      </div>
+      <div className="text-[11px] font-medium uppercase tracking-wide text-slate-500">{label}</div>
       <div className="mt-2 text-2xl font-semibold text-slate-900">{value}</div>
       {hint ? <div className="mt-2 text-xs text-slate-500">{hint}</div> : null}
     </div>
   );
 }
 
-function TabLink({
-  href,
-  children,
-}: {
-  href: string;
-  children: React.ReactNode;
-}) {
+function TabLink(props: { href: string; children: ReactNode }) {
+  const { href, children } = props;
   return (
     <Link
       href={href}
@@ -97,17 +83,15 @@ export default function AdminDashboardPage() {
 
       if (!res.ok || !data || !("ok" in data) || !data.ok) {
         setMetrics(null);
-        setError(
-          (data as any)?.error || `Failed to load metrics (HTTP ${res.status})`
-        );
+        setError((data as any)?.error || `Failed to load metrics (HTTP ${res.status})`);
         return;
       }
 
       setMetrics(data.metrics);
     } catch (e) {
       console.error(e);
-      setError("Failed to load metrics.");
       setMetrics(null);
+      setError("Failed to load metrics.");
     } finally {
       setLoading(false);
     }
@@ -128,7 +112,7 @@ export default function AdminDashboardPage() {
       return;
     }
 
-    load();
+    void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status, session, role, router, callbackUrl]);
 
@@ -155,9 +139,7 @@ export default function AdminDashboardPage() {
         <header className="flex items-start justify-between gap-4">
           <div>
             <h1 className="text-3xl font-semibold text-slate-900">Admin</h1>
-            <p className="mt-1 text-sm text-slate-600">
-              Dashboard + links to admin tools.
-            </p>
+            <p className="mt-1 text-sm text-slate-600">Dashboard + links to admin tools.</p>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
@@ -165,6 +147,7 @@ export default function AdminDashboardPage() {
             <TabLink href="/admin/drivers">Drivers</TabLink>
             <TabLink href="/admin/riders">Riders</TabLink>
             <TabLink href="/admin/metrics">Metrics</TabLink>
+            <TabLink href="/admin/rides">Rides</TabLink>
 
             <button
               type="button"
@@ -231,6 +214,13 @@ export default function AdminDashboardPage() {
                     Riders
                   </Link>{" "}
                   for role-specific lists.
+                </li>
+                <li>
+                  Go to{" "}
+                  <Link className="underline" href="/admin/rides">
+                    Rides
+                  </Link>{" "}
+                  to search and inspect ride history.
                 </li>
               </ul>
             </section>

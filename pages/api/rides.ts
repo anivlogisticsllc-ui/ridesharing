@@ -262,54 +262,69 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
           },
         });
 
-        const existingBooking = await tx.booking.findFirst({
-          where: { rideId: ride.id, riderId },
-          orderBy: { createdAt: "asc" as any },
-          select: { id: true },
-        });
+          // inside prisma.$transaction(async (tx) => { ... })
 
-        if (!existingBooking) {
-          const booking = await tx.booking.create({
-            data: {
-              rideId: ride.id,
+          const existingBooking = await tx.booking.findFirst({
+            where: { rideId: ride.id, riderId },
+            orderBy: { createdAt: "asc" as any },
+            select: { id: true },
+          });
+
+          if (!existingBooking) {
+            const booking = await tx.booking.create({
+              data: {
+                rideId: ride.id,
+                riderId,
+                status: BookingStatus.PENDING,
+
+                // "current" values (can change before trip starts)
+                paymentType,
+                cashDiscountBps,
+
+                // "original" values (immutable audit trail)
+                originalPaymentType: paymentType,
+                originalCashDiscountBps: cashDiscountBps,
+
+                paymentMethodId: null,
+                currency: "usd",
+
+                // receipt snapshot for THIS selection
+                baseAmountCents: receipt.baseAmountCents,
+                discountCents: receipt.discountCents,
+                finalAmountCents: receipt.finalAmountCents,
+              } as any,
+            });
+
+            return { ride, booking };
+          }
+
+          // Only allow changes if the trip hasn't started.
+          // IMPORTANT: do NOT overwrite originalPaymentType/originalCashDiscountBps here.
+          const updated = await tx.booking.updateMany({
+            where: {
+              id: existingBooking.id,
               riderId,
-              status: BookingStatus.PENDING,
+              ride: { tripStartedAt: null, status: { not: RideStatus.IN_ROUTE } },
+            },
+            data: {
               paymentType,
               cashDiscountBps,
-              paymentMethodId: null, // will be filled when CARD is authorized OR used as backup for CASH later
               currency: "usd",
+
               baseAmountCents: receipt.baseAmountCents,
               discountCents: receipt.discountCents,
               finalAmountCents: receipt.finalAmountCents,
             } as any,
           });
+
+          if (updated.count === 0) {
+            const e = new Error("Payment can’t be changed after the trip has started.");
+            (e as any).httpStatus = 409;
+            throw e;
+          }
+
+          const booking = await tx.booking.findUnique({ where: { id: existingBooking.id } });
           return { ride, booking };
-        }
-
-        const updated = await tx.booking.updateMany({
-          where: {
-            id: existingBooking.id,
-            riderId,
-            ride: { tripStartedAt: null, status: { not: RideStatus.IN_ROUTE } },
-          },
-          data: {
-            paymentType,
-            cashDiscountBps,
-            currency: "usd",
-            baseAmountCents: receipt.baseAmountCents,
-            discountCents: receipt.discountCents,
-            finalAmountCents: receipt.finalAmountCents,
-          } as any,
-        });
-
-        if (updated.count === 0) {
-          const e = new Error("Payment can’t be changed after the trip has started.");
-          (e as any).httpStatus = 409;
-          throw e;
-        }
-
-        const booking = await tx.booking.findUnique({ where: { id: existingBooking.id } });
-        return { ride, booking };
       });
 
       return res.status(201).json({ ok: true, ride, booking });
