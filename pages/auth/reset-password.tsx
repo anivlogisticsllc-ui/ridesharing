@@ -1,6 +1,7 @@
 // pages/auth/reset-password.tsx
 import { useState, useEffect } from "react";
 import { useRouter } from "next/router";
+import Link from "next/link";
 
 export default function ResetPasswordPage() {
   const router = useRouter();
@@ -94,14 +95,9 @@ export default function ResetPasswordPage() {
           <>
             <p style={{ color: "#16a34a" }}>
               Your password has been updated. You may now{" "}
-              import Link from "next/link";
-
-              /* ... */
-
               <Link href="/auth/login" style={{ color: "#2563eb" }}>
                 sign in
               </Link>
-
               .
             </p>
             <p style={{ marginTop: 8, fontSize: 13, color: "#666" }}>
@@ -119,12 +115,7 @@ export default function ResetPasswordPage() {
               <label style={{ display: "block", marginBottom: 8 }}>
                 New password
               </label>
-              <div
-                style={{
-                  position: "relative",
-                  marginBottom: 16,
-                }}
-              >
+              <div style={{ position: "relative", marginBottom: 16 }}>
                 <input
                   type={showPassword ? "text" : "password"}
                   required
@@ -152,23 +143,11 @@ export default function ResetPasswordPage() {
                     border: "none",
                     background: "transparent",
                     cursor: "pointer",
-                    padding: 0,
-                    margin: 0,
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
                     width: 20,
                     height: 20,
-                    outline: "none",
                   }}
                 >
-                  <span
-                    style={{
-                      fontSize: 14,
-                      lineHeight: 1,
-                      color: "#555",
-                    }}
-                  >
+                  <span style={{ fontSize: 14, color: "#555" }}>
                     {showPassword ? "🙈" : "👁️"}
                   </span>
                 </button>
@@ -178,12 +157,7 @@ export default function ResetPasswordPage() {
               <label style={{ display: "block", marginBottom: 8 }}>
                 Confirm new password
               </label>
-              <div
-                style={{
-                  position: "relative",
-                  marginBottom: 16,
-                }}
-              >
+              <div style={{ position: "relative", marginBottom: 16 }}>
                 <input
                   type={showConfirmPassword ? "text" : "password"}
                   required
@@ -215,23 +189,11 @@ export default function ResetPasswordPage() {
                     border: "none",
                     background: "transparent",
                     cursor: "pointer",
-                    padding: 0,
-                    margin: 0,
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
                     width: 20,
                     height: 20,
-                    outline: "none",
                   }}
                 >
-                  <span
-                    style={{
-                      fontSize: 14,
-                      lineHeight: 1,
-                      color: "#555",
-                    }}
-                  >
+                  <span style={{ fontSize: 14, color: "#555" }}>
                     {showConfirmPassword ? "🙈" : "👁️"}
                   </span>
                 </button>

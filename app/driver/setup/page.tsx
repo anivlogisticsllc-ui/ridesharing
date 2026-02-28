@@ -1,7 +1,7 @@
 // app/driver/setup/page.tsx
 "use client";
 
-import { useEffect, useMemo, useState, type FormEvent } from "react";
+import React, { Suspense, useEffect, useMemo, useState, type FormEvent } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 
 type DriverProfileResponse =
@@ -52,12 +52,13 @@ type ProfileUpdateBody = {
   plateState?: string;
 };
 
-export default function DriverSetupPage() {
+function DriverSetupInner() {
   const router = useRouter();
   const searchParams = useSearchParams();
 
   const forcedStep = useMemo(() => {
-    const raw = searchParams.get("step");
+    const sp = searchParams ?? new URLSearchParams();
+    const raw = sp.get("step");
     const n = raw ? Number(raw) : NaN;
     return n === 1 || n === 2 || n === 3 ? n : null;
   }, [searchParams]);
@@ -235,10 +236,7 @@ export default function DriverSetupPage() {
 
         {error ? <p className="mt-4 text-xs text-rose-600">{error}</p> : null}
 
-        <form
-          onSubmit={handleSubmit}
-          className="mt-6 space-y-4 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm"
-        >
+        <form onSubmit={handleSubmit} className="mt-6 space-y-4 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
           {step === 1 && (
             <>
               <h2 className="text-sm font-semibold text-slate-800">Step 1 – Identity</h2>
@@ -410,5 +408,19 @@ export default function DriverSetupPage() {
         </form>
       </div>
     </main>
+  );
+}
+
+export default function DriverSetupPage() {
+  return (
+    <Suspense
+      fallback={
+        <main className="flex min-h-screen items-center justify-center bg-slate-50">
+          <p className="text-sm text-slate-500">Loading driver setup…</p>
+        </main>
+      }
+    >
+      <DriverSetupInner />
+    </Suspense>
   );
 }

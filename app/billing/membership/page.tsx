@@ -30,11 +30,14 @@ type BillingInfo = {
   } | null;
 };
 
+// Match what computeMembershipState expects (or at least don't fight it)
+type MembershipStatus = "ACTIVE" | "EXPIRED" | "TRIAL" | "CANCELLED" | "NONE";
+
 type MembershipSummary = {
   plan: string | null;
   kind?: "TRIAL" | "PAID" | "NONE";
   active: boolean;
-  status?: string | null;
+  status?: MembershipStatus | null; // <-- tighten this
   trialEndsAt: string | null;
   currentPeriodEnd: string | null;
   cancelAtPeriodEnd: boolean;
@@ -57,6 +60,12 @@ function LabelRow({ label, value }: { label: string; value: React.ReactNode }) {
       <div style={{ color: "#111827" }}>{value}</div>
     </div>
   );
+}
+
+// Defensive: normalize any unknown status coming from API
+function normalizeStatus(s: unknown): MembershipStatus | null {
+  if (s === "ACTIVE" || s === "EXPIRED" || s === "TRIAL" || s === "CANCELLED" || s === "NONE") return s;
+  return null;
 }
 
 /* ---------- Page ---------- */
@@ -84,6 +93,11 @@ export default function MembershipPage() {
       if (!json) {
         setData({ ok: false, error: "Invalid server response." });
         return;
+      }
+
+      // normalize status defensively in case API returns a plain string
+      if (json.ok) {
+        (json.membership as any).status = normalizeStatus((json.membership as any).status);
       }
 
       setData(json);
@@ -139,8 +153,15 @@ export default function MembershipPage() {
   const ui = useMemo(() => {
     if (!data || data.ok === false) return null;
 
-    const { user, membership, billing } = data;
-    const { state, label, endsAtLabel } = computeMembershipState(membership);
+    const { user, membership: rawMembership, billing } = data;
+
+    // extra safety: ensure status is in the allowed union
+    const membership: MembershipSummary = {
+      ...rawMembership,
+      status: normalizeStatus((rawMembership as any).status),
+    };
+
+    const { state, label, endsAtLabel } = computeMembershipState(membership as any);
 
     const plan = membership.plan ?? "STANDARD";
     const profileHref = getProfileHref(user);
@@ -230,9 +251,7 @@ export default function MembershipPage() {
         <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
           <div>
             <h1 style={h1}>{ui.user.role === "DRIVER" ? "Driver membership" : "Rider membership"}</h1>
-            <p style={muted}>
-              After your free trial, membership is {ui.priceAfterTrial}/month.
-            </p>
+            <p style={muted}>After your free trial, membership is {ui.priceAfterTrial}/month.</p>
           </div>
           <MembershipBadge membership={ui.membership as any} />
         </div>
@@ -245,9 +264,7 @@ export default function MembershipPage() {
           <LabelRow label="Payment method" value={ui.paymentMethodLine} />
 
           {ui.membership.cancelAtPeriodEnd ? (
-            <p style={{ ...muted, marginTop: 6 }}>
-              Your membership is set to cancel at the end of the current period.
-            </p>
+            <p style={{ ...muted, marginTop: 6 }}>Your membership is set to cancel at the end of the current period.</p>
           ) : null}
 
           <div style={{ marginTop: 12, display: "flex", gap: 10, flexWrap: "wrap" }}>
@@ -274,9 +291,7 @@ export default function MembershipPage() {
             </Link>
           </div>
 
-          {actionError ? (
-            <p style={{ marginTop: 10, color: "#b91c1c", fontSize: 14 }}>{actionError}</p>
-          ) : null}
+          {actionError ? <p style={{ marginTop: 10, color: "#b91c1c", fontSize: 14 }}>{actionError}</p> : null}
 
           {ui.state === "TRIAL" ? (
             <p style={{ ...muted, marginTop: 8 }}>

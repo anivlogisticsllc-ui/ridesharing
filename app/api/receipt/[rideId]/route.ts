@@ -1,20 +1,28 @@
 // app/api/receipt/[rideId]/route.ts
-import { NextResponse } from "next/server";
-import { getServerSession } from "next-auth";
-import { authOptions } from "@/pages/api/auth/[...nextauth]";
+import { NextRequest, NextResponse } from "next/server";
+import { getToken } from "next-auth/jwt";
 import { prisma } from "@/lib/prisma";
-import { BookingStatus, RideStatus, PaymentType } from "@prisma/client";
+import { PaymentType, RideStatus } from "@prisma/client";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
 
 type ReceiptResponse =
-  | { ok: true; receipt: any }
+  | { ok: true; receipt: unknown }
   | { ok: false; error: string };
 
-function toStr(v: unknown) {
+function toStr(v: unknown): string {
   return typeof v === "string" ? v : "";
 }
 
 function asCents(v: unknown): number | null {
-  return typeof v === "number" && Number.isFinite(v) ? Math.max(0, Math.round(v)) : null;
+  if (typeof v === "number" && Number.isFinite(v)) return Math.max(0, Math.round(v));
+  if (typeof v === "string" && v.trim() !== "") {
+    const n = Number(v);
+    return Number.isFinite(n) ? Math.max(0, Math.round(n)) : null;
+  }
+  return null;
 }
 
 function paymentLabel(pt: PaymentType | null | undefined): "CARD" | "CASH" | null {
@@ -23,20 +31,30 @@ function paymentLabel(pt: PaymentType | null | undefined): "CARD" | "CASH" | nul
   return null;
 }
 
-export async function GET(_req: Request, { params }: { params: { rideId: string } }) {
-  try {
-    const session = await getServerSession(authOptions);
-    const user = session?.user as any;
+// IMPORTANT: your Next types validator expects params to be a Promise
+type RouteContext = { params: Promise<{ rideId: string }> };
 
-    const userId = toStr(user?.id).trim();
+export async function GET(req: NextRequest, { params }: RouteContext) {
+  try {
+    const token = await getToken({ req });
+    const userId = toStr((token as any)?.sub || (token as any)?.id).trim();
+
     if (!userId) {
-      return NextResponse.json({ ok: false, error: "Not authenticated" } satisfies ReceiptResponse, { status: 401 });
+      return NextResponse.json(
+        { ok: false, error: "Not authenticated" } satisfies ReceiptResponse,
+        { status: 401 }
+      );
     }
 
-    // NOTE: your param name is [rideId], but this route is actually keyed by bookingId in the UI.
-    const bookingId = toStr(params?.rideId).trim();
+    const { rideId } = await params;
+
+    // NOTE: route segment is [rideId], but UI is passing bookingId. Keeping behavior as bookingId.
+    const bookingId = toStr(rideId).trim();
     if (!bookingId) {
-      return NextResponse.json({ ok: false, error: "Missing bookingId" } satisfies ReceiptResponse, { status: 400 });
+      return NextResponse.json(
+        { ok: false, error: "Missing bookingId" } satisfies ReceiptResponse,
+        { status: 400 }
+      );
     }
 
     const booking = await prisma.booking.findUnique({
@@ -96,12 +114,15 @@ export async function GET(_req: Request, { params }: { params: { rideId: string 
     });
 
     if (!booking?.ride) {
-      return NextResponse.json({ ok: false, error: "Receipt not found" } satisfies ReceiptResponse, { status: 404 });
+      return NextResponse.json(
+        { ok: false, error: "Receipt not found" } satisfies ReceiptResponse,
+        { status: 404 }
+      );
     }
 
     const ride = booking.ride;
 
-    // Receipt only after ride completed (your existing behavior)
+    // Receipt only after ride completed
     if (ride.status !== RideStatus.COMPLETED) {
       return NextResponse.json(
         { ok: false, error: "Receipt is only available for completed rides." } satisfies ReceiptResponse,
@@ -114,11 +135,14 @@ export async function GET(_req: Request, { params }: { params: { rideId: string 
     const isRider = booking.riderId === userId || ride.rider?.id === userId;
 
     if (!isDriver && !isRider) {
-      return NextResponse.json({ ok: false, error: "Not allowed" } satisfies ReceiptResponse, { status: 403 });
+      return NextResponse.json(
+        { ok: false, error: "Not allowed" } satisfies ReceiptResponse,
+        { status: 403 }
+      );
     }
 
-    // ---- Amount logic ----
-    // If OutstandingCharge exists, it is the truth for fee + total for the "unpaid cash ride" scenario.
+    // Amount logic:
+    // If OutstandingCharge exists, it is the source of truth for "unpaid cash ride" scenario.
     const oc = booking.outstandingCharge;
 
     const fareCents =
@@ -128,16 +152,13 @@ export async function GET(_req: Request, { params }: { params: { rideId: string 
       asCents(ride.totalPriceCents) ??
       0;
 
-    const convenienceFeeCents =
-      oc?.convenienceFeeCents ??
-      0;
+    const convenienceFeeCents = oc?.convenienceFeeCents ?? 0;
+    const discountCents = oc ? 0 : asCents(booking.discountCents) ?? 0;
 
     const totalCents =
       oc?.totalCents ??
       asCents(booking.finalAmountCents) ??
-      // if we only have base fare, total is base - discount (no fee in normal receipts)
-      Math.max(0, fareCents - (asCents(booking.discountCents) ?? 0)) ??
-      0;
+      Math.max(0, fareCents - discountCents);
 
     const receipt = {
       booking: {
@@ -149,8 +170,8 @@ export async function GET(_req: Request, { params }: { params: { rideId: string 
         currency: (booking.currency || "USD").toUpperCase(),
 
         riderId: booking.riderId,
-        riderName: booking.riderName ?? booking.ride.rider?.name ?? null,
-        riderEmail: booking.riderEmail ?? booking.ride.rider?.email ?? null,
+        riderName: booking.riderName ?? ride.rider?.name ?? null,
+        riderEmail: booking.riderEmail ?? ride.rider?.email ?? null,
       },
 
       ride: {
@@ -166,13 +187,11 @@ export async function GET(_req: Request, { params }: { params: { rideId: string 
         driver: ride.driver ? { name: ride.driver.name, email: ride.driver.email } : null,
       },
 
-      // The UI should render from these three for the breakdown
       money: {
         baseFareCents: fareCents,
-        discountCents: oc ? 0 : (asCents(booking.discountCents) ?? 0),
+        discountCents,
         convenienceFeeCents,
         totalPriceCents: totalCents,
-        // helpful for UI to decide what mode it is
         source: oc ? "OUTSTANDING_CHARGE" : "BOOKING",
       },
 
@@ -194,9 +213,15 @@ export async function GET(_req: Request, { params }: { params: { rideId: string 
         : null,
     };
 
-    return NextResponse.json({ ok: true, receipt } satisfies ReceiptResponse, { status: 200 });
+    return NextResponse.json(
+      { ok: true, receipt } satisfies ReceiptResponse,
+      { status: 200 }
+    );
   } catch (err) {
-    console.error("[api/receipt/[id]] error:", err);
-    return NextResponse.json({ ok: false, error: "Server error" } satisfies ReceiptResponse, { status: 500 });
+    console.error("[api/receipt/[rideId]] error:", err);
+    return NextResponse.json(
+      { ok: false, error: "Server error" } satisfies ReceiptResponse,
+      { status: 500 }
+    );
   }
 }

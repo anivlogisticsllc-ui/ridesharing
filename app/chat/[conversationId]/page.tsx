@@ -17,11 +17,16 @@ type ChatMessage = {
 function safeConversationId(raw: unknown): string | null {
   if (typeof raw !== "string") return null;
   const trimmed = raw.trim();
-  return trimmed.length ? decodeURIComponent(trimmed) : null;
+  if (!trimmed) return null;
+
+  try {
+    return decodeURIComponent(trimmed);
+  } catch {
+    return trimmed;
+  }
 }
 
 function markSeen(role: string | null, conversationId: string) {
-  // MVP: localStorage "last seen"
   try {
     const who = role === "driver" ? "driver" : role === "rider" ? "rider" : "user";
     localStorage.setItem(`chat:lastSeen:${who}:${conversationId}`, new Date().toISOString());
@@ -30,16 +35,20 @@ function markSeen(role: string | null, conversationId: string) {
   }
 }
 
+// Type guard TS always understands
+function isNonEmptyString(v: unknown): v is string {
+  return typeof v === "string" && v.trim().length > 0;
+}
+
 export default function ChatPage() {
-  const params = useParams<{ conversationId: string }>();
+  const params = useParams(); // let’s not pretend params is typed perfectly
   const searchParams = useSearchParams();
 
-  const conversationId = useMemo(
-    () => safeConversationId(params?.conversationId),
-    [params]
-  );
+  const conversationId = useMemo(() => {
+    const raw = (params as any)?.conversationId;
+    return safeConversationId(raw);
+  }, [params]);
 
-  // Query params
   const sp = searchParams ?? new URLSearchParams();
   const isEmbedded = sp.get("embed") === "1";
   const role = sp.get("role"); // "driver" | "rider" | null
@@ -57,21 +66,20 @@ export default function ChatPage() {
 
   const pollRef = useRef<number | null>(null);
 
-  // Mark seen as soon as chat opens (helps badge clear immediately)
   useEffect(() => {
-    if (!conversationId) return;
+    if (!isNonEmptyString(conversationId)) return;
     markSeen(role, conversationId);
   }, [conversationId, role]);
 
-  // Poll messages
   useEffect(() => {
-    if (!conversationId) return;
+    if (!isNonEmptyString(conversationId)) return;
 
+    const cid = conversationId; // cid is now *definitely* string
     let cancelled = false;
 
     async function loadMessages() {
       try {
-        const res = await fetch(`/api/chat/${encodeURIComponent(conversationId)}`, {
+        const res = await fetch(`/api/chat/${encodeURIComponent(cid)}`, {
           method: "GET",
           cache: "no-store",
         });
@@ -84,12 +92,9 @@ export default function ChatPage() {
         }
 
         if (!cancelled) {
-          const next = (data.messages || []) as ChatMessage[];
-          setMessages(next);
+          setMessages((data.messages || []) as ChatMessage[]);
           setError(null);
-
-          // If messages loaded successfully, also mark as seen again (keeps timestamp fresh)
-          markSeen(role, conversationId);
+          markSeen(role, cid);
         }
       } catch {
         if (!cancelled) setError("Network error while loading chat.");
@@ -103,9 +108,7 @@ export default function ChatPage() {
 
     loadMessages();
 
-    // clear any existing interval
     if (pollRef.current) window.clearInterval(pollRef.current);
-
     pollRef.current = window.setInterval(loadMessages, 5000);
 
     return () => {
@@ -117,27 +120,28 @@ export default function ChatPage() {
     };
   }, [conversationId, role]);
 
-  // Apply one-time prefill only after first load finished AND there are truly no messages
   useEffect(() => {
     if (!hadFirstLoad) return;
     if (!prefill) return;
     if (messages.length > 0) return;
     if (!(isEmbedded && role === "driver")) return;
-
     setInput(prefill);
   }, [hadFirstLoad, prefill, messages.length, isEmbedded, role]);
 
   async function handleSend(e: React.FormEvent) {
     e.preventDefault();
     if (!canSend) return;
-    if (!input.trim()) return;
-    if (!conversationId) return;
 
     const text = input.trim();
+    if (!text) return;
+
+    if (!isNonEmptyString(conversationId)) return;
+    const cid = conversationId;
+
     setInput("");
 
     try {
-      const res = await fetch(`/api/chat/${encodeURIComponent(conversationId)}`, {
+      const res = await fetch(`/api/chat/${encodeURIComponent(cid)}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ body: text }),
@@ -149,11 +153,10 @@ export default function ChatPage() {
         return;
       }
 
-      setMessages((prev) => [...prev, data.message]);
+      setMessages((prev) => [...prev, data.message as ChatMessage]);
       setError(null);
 
-      // When you send, you’ve definitely “seen” the chat
-      markSeen(role, conversationId);
+      markSeen(role, cid);
 
       if (isEmbedded && role === "driver" && autoClose) {
         if (window.parent && window.parent !== window) {
@@ -174,9 +177,7 @@ export default function ChatPage() {
         fontFamily: "system-ui, sans-serif",
       }}
     >
-      <h1 style={{ fontSize: 22, fontWeight: 600, marginBottom: 16 }}>
-        Ride chat
-      </h1>
+      <h1 style={{ fontSize: 22, fontWeight: 600, marginBottom: 16 }}>Ride chat</h1>
 
       <div style={{ marginBottom: 24 }}>
         {loading ? (
@@ -208,9 +209,7 @@ export default function ChatPage() {
                   }}
                 >
                   <span>{m.sender.publicId || m.sender.name || "User"}</span>
-                  <span style={{ color: "#9ca3af" }}>
-                    {new Date(m.createdAt).toLocaleTimeString()}
-                  </span>
+                  <span style={{ color: "#9ca3af" }}>{new Date(m.createdAt).toLocaleTimeString()}</span>
                 </div>
                 <div style={{ fontSize: 14, whiteSpace: "pre-wrap" }}>{m.body}</div>
               </li>

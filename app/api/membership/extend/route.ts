@@ -1,8 +1,9 @@
-import { NextResponse } from "next/server";
+// app/api/membership/extend/route.ts
+import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/pages/api/auth/[...nextauth]";
 import { prisma } from "@/lib/prisma";
-import { MembershipStatus, MembershipType, type MembershipPlan } from "@prisma/client";
+import { MembershipStatus, MembershipType } from "@prisma/client";
 
 type ReqBody = {
   email: string;
@@ -14,20 +15,27 @@ function toMembershipType(t: ReqBody["type"]): MembershipType {
   return t === "DRIVER" ? MembershipType.DRIVER : MembershipType.RIDER;
 }
 
-export async function POST(req: Request) {
+function isValidEmail(email: string): boolean {
+  // Simple check is OK for admin tooling
+  return email.includes("@") && email.includes(".");
+}
+
+export async function POST(req: NextRequest) {
   try {
     const session = await getServerSession(authOptions);
     const role = (session?.user as any)?.role as string | undefined;
+
     if (!session?.user || role !== "ADMIN") {
       return NextResponse.json({ ok: false, error: "Forbidden" }, { status: 403 });
     }
 
     const body = (await req.json().catch(() => null)) as ReqBody | null;
-    const email = body?.email?.trim().toLowerCase();
+
+    const email = body?.email?.trim().toLowerCase() ?? "";
     const days = Number(body?.days);
     const type = body?.type;
 
-    if (!email || !email.includes("@")) {
+    if (!email || !isValidEmail(email)) {
       return NextResponse.json({ ok: false, error: "Invalid email" }, { status: 400 });
     }
     if (!Number.isFinite(days) || days <= 0 || days > 3650) {
@@ -53,19 +61,19 @@ export async function POST(req: Request) {
     const latest = await prisma.membership.findFirst({
       where: { userId: user.id, type: membershipType },
       orderBy: { startDate: "desc" },
-      select: { id: true, expiryDate: true, plan: true, amountPaidCents: true },
+      select: { id: true, expiryDate: true },
     });
 
     const baseExpiry = latest?.expiryDate && latest.expiryDate > now ? latest.expiryDate : now;
     const newExpiry = new Date(baseExpiry.getTime() + days * 24 * 60 * 60 * 1000);
 
-    // If no membership exists, create one. If it exists, update its expiry.
     if (!latest) {
+      // IMPORTANT: do NOT set plan: null unless your Prisma schema allows it.
+      // If plan is optional, omit it; if required, set a real enum value (e.g. STANDARD).
       await prisma.membership.create({
         data: {
           userId: user.id,
           type: membershipType,
-          plan: null as MembershipPlan | null, // keep null for MVP
           status: MembershipStatus.ACTIVE,
           startDate: now,
           expiryDate: newExpiry,
@@ -82,14 +90,17 @@ export async function POST(req: Request) {
       });
     }
 
-    return NextResponse.json({
-      ok: true,
-      email,
-      type,
-      newExpiry: newExpiry.toISOString(),
-    });
+    return NextResponse.json(
+      {
+        ok: true,
+        email,
+        type,
+        newExpiry: newExpiry.toISOString(),
+      },
+      { status: 200 }
+    );
   } catch (err) {
-    console.error("POST /api/admin/membership/extend error:", err);
+    console.error("POST /api/membership/extend error:", err);
     return NextResponse.json({ ok: false, error: "Internal server error" }, { status: 500 });
   }
 }

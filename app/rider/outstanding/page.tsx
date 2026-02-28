@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import React, { Suspense, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 
 type OutstandingPayload = {
@@ -62,7 +62,7 @@ function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit & { timeou
   return fetch(input, { ...rest, signal: controller.signal }).finally(() => clearTimeout(t));
 }
 
-export default function RiderOutstandingPage() {
+function RiderOutstandingInner() {
   const sp = useSearchParams();
   const router = useRouter();
 
@@ -205,7 +205,9 @@ export default function RiderOutstandingPage() {
             </div>
             <div className="flex items-center justify-between border-t pt-2">
               <span className="text-slate-900 font-semibold">Total</span>
-              <span className="text-slate-900 font-semibold">{formatMoney(outstanding.totalCents, outstanding.currency)}</span>
+              <span className="text-slate-900 font-semibold">
+                {formatMoney(outstanding.totalCents, outstanding.currency)}
+              </span>
             </div>
           </div>
 
@@ -253,5 +255,13 @@ export default function RiderOutstandingPage() {
         </div>
       </div>
     </main>
+  );
+}
+
+export default function RiderOutstandingPage() {
+  return (
+    <Suspense fallback={<div className="mx-auto max-w-2xl px-4 py-10 text-sm text-slate-600">Loading…</div>}>
+      <RiderOutstandingInner />
+    </Suspense>
   );
 }
