@@ -60,6 +60,59 @@ function wrapHtml(title: string, bodyHtml: string) {
   `;
 }
 
+/**
+ * Canonical app URL for building links in emails.
+ * Priority:
+ *  1) APP_URL (recommended)
+ *  2) NEXTAUTH_URL (since you already set it)
+ *  3) VERCEL_URL (auto, no protocol)
+ *  4) localhost fallback
+ */
+function getAppUrl(): string {
+  const raw =
+    process.env.APP_URL ||
+    process.env.NEXT_PUBLIC_APP_URL ||
+    process.env.NEXTAUTH_URL;
+
+  if (raw && raw.trim()) return raw.replace(/\/$/, "");
+
+  const vercel = process.env.VERCEL_URL;
+  if (vercel && vercel.trim()) return `https://${vercel.replace(/\/$/, "")}`;
+
+  return "http://localhost:3000";
+}
+
+/**
+ * Ensures URLs in emails always point at production base, even if caller passes:
+ * - relative path: "/auth/verify?token=..."
+ * - localhost url: "http://localhost:3000/auth/verify?token=..."
+ */
+function normalizeAppUrl(inputUrl: string): string {
+  const base = getAppUrl();
+
+  const trimmed = (inputUrl || "").trim();
+  if (!trimmed) return base;
+
+  // Relative path -> absolute
+  if (trimmed.startsWith("/")) return `${base}${trimmed}`;
+
+  // If it's already the correct base, keep it
+  if (trimmed.startsWith(base)) return trimmed;
+
+  // Rewrite localhost links to production base
+  if (trimmed.startsWith("http://localhost") || trimmed.startsWith("https://localhost")) {
+    try {
+      const u = new URL(trimmed);
+      return `${base}${u.pathname}${u.search}${u.hash}`;
+    } catch {
+      return `${base}/`;
+    }
+  }
+
+  // Any other absolute URL: keep as-is (devil’s advocate: avoids breaking intentional external links)
+  return trimmed;
+}
+
 async function sendOrLog(args: { to: string; subject: string; html: string; text?: string }) {
   const transporter = getTransport();
   if (!transporter) {
@@ -117,7 +170,8 @@ function normalizeCents(v: number | null | undefined): number {
 /* -------------------- Auth emails -------------------- */
 
 export async function sendVerificationEmail(to: string, verifyUrl: string) {
-  const safeUrl = escapeHtml(verifyUrl);
+  const fixedUrl = normalizeAppUrl(verifyUrl);
+  const safeUrl = escapeHtml(fixedUrl);
 
   const html = wrapHtml(
     "Confirm your email",
@@ -140,12 +194,15 @@ export async function sendVerificationEmail(to: string, verifyUrl: string) {
     `
   );
 
-  const text = ["Confirm your email", "", "Verify your email using the link below:", verifyUrl].join("\n");
+  const text = ["Confirm your email", "", "Verify your email using the link below:", fixedUrl].join(
+    "\n"
+  );
   await sendOrLog({ to, subject: "Verify your email", html, text });
 }
 
 export async function sendPasswordResetEmail(to: string, resetUrl: string) {
-  const safeUrl = escapeHtml(resetUrl);
+  const fixedUrl = normalizeAppUrl(resetUrl);
+  const safeUrl = escapeHtml(fixedUrl);
 
   const html = wrapHtml(
     "Reset your password",
@@ -175,7 +232,7 @@ export async function sendPasswordResetEmail(to: string, resetUrl: string) {
     "Reset your password",
     "",
     "Use the link below to set a new password:",
-    resetUrl,
+    fixedUrl,
     "",
     "If you didn’t request this, ignore this email.",
   ].join("\n");
@@ -189,7 +246,6 @@ export type RideReceiptSnapshot = {
   id: string;
   status: string;
 
-  // You can pass full addresses here (we treat as display strings)
   originCity: string;
   originLat: number;
   originLng: number;
@@ -204,10 +260,8 @@ export type RideReceiptSnapshot = {
   passengerCount: number | null;
   distanceMiles: number | null;
 
-  // source of truth for email total (prefer finalTotalCents if provided)
   totalPriceCents: number | null;
 
-  // safe additive extras
   bookingId?: string;
   paymentType?: "CARD" | "CASH" | null;
 
@@ -458,7 +512,7 @@ function driverReceiptHtml(args: {
 export async function sendRideReceiptEmail(args: {
   riderEmail: string;
   riderName?: string | null;
-  riderEmailLabel?: string | null; // not used; safe additive if you pass it
+  riderEmailLabel?: string | null;
   driverName?: string | null;
   driverEmail?: string | null;
   ride: RideReceiptSnapshot;
@@ -551,7 +605,9 @@ export async function sendOutstandingChargeEmailToRider(args: {
 
   const title = "Action required: unpaid ride reported";
   const subject = "Action required: unpaid ride reported";
-  const safeResolve = escapeHtml(resolveUrl);
+
+  const fixedResolveUrl = normalizeAppUrl(resolveUrl);
+  const safeResolve = escapeHtml(fixedResolveUrl);
 
   const total = fmtMoney(outstanding.totalCents);
   const fare = fmtMoney(outstanding.fareCents);
@@ -634,7 +690,7 @@ export async function sendOutstandingChargeEmailToRider(args: {
     `Reason: ${outstanding.reason}`,
     outstanding.note ? `Note: ${outstanding.note}` : "",
     "",
-    `Review & resolve: ${resolveUrl}`,
+    `Review & resolve: ${fixedResolveUrl}`,
     "",
     `Outstanding Charge ID: ${outstanding.id}`,
     `Ride ID: ${ride.id}`,
