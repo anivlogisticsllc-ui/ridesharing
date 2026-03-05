@@ -51,7 +51,14 @@ function applyCashDiscount(totalCents: number, cashDiscountBps: number) {
   return Math.max(0, discounted);
 }
 
+/**
+ * Ensures the user has a default card on file.
+ * - Fast path: DB default paymentMethod with a stripePaymentMethodId.
+ * - Slow path: look at Stripe customer defaults, then self-heal DB + stripeDefaultPaymentId.
+ */
 async function findCardOnFile(userId: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  const needCardMsg = "A card is required. Please add a payment method in Billing.";
+
   // 1) DB default first
   const dbDefault = await prisma.paymentMethod.findFirst({
     where: { userId, isDefault: true },
@@ -67,18 +74,18 @@ async function findCardOnFile(userId: string): Promise<{ ok: true } | { ok: fals
   });
 
   const customerId = user?.stripeCustomerId ?? null;
-  if (!customerId) {
-    return { ok: false, error: "A card is required. Please add a payment method in Billing." };
-  }
+  if (!customerId) return { ok: false, error: needCardMsg };
 
   const customer = await stripe.customers.retrieve(customerId);
-  if (!customer || (customer as any).deleted) {
-    return { ok: false, error: "Billing profile is missing. Please add a payment method in Billing." };
-  }
+  if (!customer || (customer as any).deleted) return { ok: false, error: needCardMsg };
 
   const defaultPm = (customer as Stripe.Customer).invoice_settings?.default_payment_method;
   const defaultPmId =
-    typeof defaultPm === "string" ? defaultPm : typeof (defaultPm as any)?.id === "string" ? (defaultPm as any).id : null;
+    typeof defaultPm === "string"
+      ? defaultPm
+      : typeof (defaultPm as any)?.id === "string"
+      ? (defaultPm as any).id
+      : null;
 
   let pmId: string | null = defaultPmId;
 
@@ -87,25 +94,29 @@ async function findCardOnFile(userId: string): Promise<{ ok: true } | { ok: fals
     pmId = list.data?.[0]?.id ?? null;
   }
 
-  if (!pmId) {
-    return { ok: false, error: "A card is required. Please add a payment method in Billing." };
-  }
+  if (!pmId) return { ok: false, error: needCardMsg };
 
   // Ensure default on Stripe
   await stripe.customers.update(customerId, { invoice_settings: { default_payment_method: pmId } });
 
   const pm = await stripe.paymentMethods.retrieve(pmId);
-  if (!pm || pm.type !== "card" || !pm.card) {
-    return { ok: false, error: "A card is required. Please add a payment method in Billing." };
-  }
+  if (!pm || pm.type !== "card" || !pm.card) return { ok: false, error: needCardMsg };
 
   // Self-heal DB so future checks are fast
   await prisma.$transaction(async (tx) => {
-    await tx.paymentMethod.updateMany({ where: { userId, isDefault: true }, data: { isDefault: false } });
+    await tx.paymentMethod.updateMany({
+      where: { userId, isDefault: true },
+      data: { isDefault: false },
+    });
 
     await tx.paymentMethod.upsert({
-      // assumes stripePaymentMethodId is unique in schema
-      where: { stripePaymentMethodId: pmId },
+      // uses @@unique([userId, stripePaymentMethodId])
+      where: {
+        userId_stripePaymentMethodId: {
+          userId,
+          stripePaymentMethodId: pmId,
+        },
+      },
       create: {
         userId,
         provider: "STRIPE",
@@ -115,16 +126,15 @@ async function findCardOnFile(userId: string): Promise<{ ok: true } | { ok: fals
         expMonth: pm.card?.exp_month ?? null,
         expYear: pm.card?.exp_year ?? null,
         isDefault: true,
-      } as any,
+      },
       update: {
-        userId,
         provider: "STRIPE",
         brand: pm.card?.brand ?? null,
         last4: pm.card?.last4 ?? null,
         expMonth: pm.card?.exp_month ?? null,
         expYear: pm.card?.exp_year ?? null,
         isDefault: true,
-      } as any,
+      },
     });
 
     await tx.user.update({
@@ -247,10 +257,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
       // CARD RULES (your design)
       const isTrial = gate.ok && gate.state === "TRIAL";
-
-      const mustHaveCard =
-        paymentType === PaymentType.CARD ||
-        (paymentType === PaymentType.CASH && isTrial);
+      const mustHaveCard = paymentType === PaymentType.CARD || (paymentType === PaymentType.CASH && isTrial);
 
       if (mustHaveCard) {
         const cardGate = await findCardOnFile(riderId);
