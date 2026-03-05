@@ -1,3 +1,4 @@
+// app/billing/membership/page.tsx
 "use client";
 
 import Link from "next/link";
@@ -30,14 +31,13 @@ type BillingInfo = {
   } | null;
 };
 
-// Match what computeMembershipState expects (or at least don't fight it)
 type MembershipStatus = "ACTIVE" | "EXPIRED" | "TRIAL" | "CANCELLED" | "NONE";
 
 type MembershipSummary = {
   plan: string | null;
   kind?: "TRIAL" | "PAID" | "NONE";
   active: boolean;
-  status?: MembershipStatus | null; // <-- tighten this
+  status?: MembershipStatus | null;
   trialEndsAt: string | null;
   currentPeriodEnd: string | null;
   cancelAtPeriodEnd: boolean;
@@ -62,10 +62,20 @@ function LabelRow({ label, value }: { label: string; value: React.ReactNode }) {
   );
 }
 
-// Defensive: normalize any unknown status coming from API
 function normalizeStatus(s: unknown): MembershipStatus | null {
   if (s === "ACTIVE" || s === "EXPIRED" || s === "TRIAL" || s === "CANCELLED" || s === "NONE") return s;
   return null;
+}
+
+async function readApiError(res: Response) {
+  const text = await res.text().catch(() => "");
+  if (!text) return `Request failed (HTTP ${res.status}).`;
+  try {
+    const json = JSON.parse(text);
+    return json?.error || json?.message || `Request failed (HTTP ${res.status}).`;
+  } catch {
+    return text.slice(0, 300) || `Request failed (HTTP ${res.status}).`;
+  }
 }
 
 /* ---------- Page ---------- */
@@ -75,9 +85,8 @@ export default function MembershipPage() {
 
   const [data, setData] = useState<MembershipApiResponse | null>(null);
   const [loading, setLoading] = useState(true);
-
-  const [activating, setActivating] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [activating, setActivating] = useState(false);
 
   async function load() {
     setLoading(true);
@@ -95,7 +104,6 @@ export default function MembershipPage() {
         return;
       }
 
-      // normalize status defensively in case API returns a plain string
       if (json.ok) {
         (json.membership as any).status = normalizeStatus((json.membership as any).status);
       }
@@ -105,6 +113,35 @@ export default function MembershipPage() {
       setData({ ok: false, error: e?.message || "Failed to load membership." });
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function startMembershipCheckout() {
+    // This is the clean hook point for Stripe Checkout.
+    // Implement: POST /api/billing/membership/checkout -> { ok: true, url: string }
+    setActionError(null);
+    setActivating(true);
+    try {
+      const res = await fetch("/api/billing/membership/activate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        cache: "no-store",
+      });
+
+      if (!res.ok) throw new Error(await readApiError(res));
+
+      const json = (await res.json().catch(() => null)) as any;
+      const url = typeof json?.url === "string" ? json.url : null;
+
+      if (!url) {
+        throw new Error(json?.error || "Checkout did not return a redirect URL.");
+      }
+
+      window.location.href = url;
+    } catch (e: any) {
+      setActionError(e?.message || "Could not start membership checkout.");
+    } finally {
+      setActivating(false);
     }
   }
 
@@ -120,42 +157,11 @@ export default function MembershipPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [router]);
 
-  async function handleActivateTrial() {
-    try {
-      setActionError(null);
-      setActivating(true);
-
-      const res = await fetch("/api/billing/membership/activate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ plan: "STANDARD", days: 30 }),
-      });
-
-      const json = await res.json().catch(() => null);
-
-      if (res.status === 401) {
-        router.replace("/auth/login?callbackUrl=/billing/membership");
-        return;
-      }
-
-      if (!res.ok || !json?.ok) {
-        throw new Error(json?.error || "Failed to start trial.");
-      }
-
-      await load();
-    } catch (e: any) {
-      setActionError(e?.message || "Trial activation failed.");
-    } finally {
-      setActivating(false);
-    }
-  }
-
   const ui = useMemo(() => {
     if (!data || data.ok === false) return null;
 
     const { user, membership: rawMembership, billing } = data;
 
-    // extra safety: ensure status is in the allowed union
     const membership: MembershipSummary = {
       ...rawMembership,
       status: normalizeStatus((rawMembership as any).status),
@@ -188,13 +194,22 @@ export default function MembershipPage() {
       return label;
     })();
 
-    const canStartTrial = !activating && (state === "NONE" || state === "EXPIRED");
-
     const paymentMethodLine = billing.hasPaymentMethod
       ? billing.defaultPaymentMethod
         ? formatCardLabel(billing.defaultPaymentMethod)
         : "Card on file"
       : "No card on file";
+
+    const helpLine = (() => {
+      if (state === "ACTIVE") return "Your membership is active.";
+      if (state === "TRIAL")
+        return "During trial, CASH requests require a backup card on file. After trial ends, you’ll need a paid membership to continue.";
+      if (state === "EXPIRED")
+        return "Your trial ended. Activate a paid membership to continue requesting rides.";
+      return "Activate a membership to access member-only features.";
+    })();
+
+    const showActivate = state === "EXPIRED" || state === "NONE" || state === "TRIAL";
 
     return {
       user,
@@ -203,13 +218,13 @@ export default function MembershipPage() {
       plan,
       profileHref,
       state,
-      canStartTrial,
       statusLine,
       priceAfterTrial,
-      trialEndLabel,
       paymentMethodLine,
+      helpLine,
+      showActivate,
     };
-  }, [data, activating]);
+  }, [data]);
 
   if (loading) {
     return (
@@ -245,10 +260,13 @@ export default function MembershipPage() {
 
   if (!ui) return null;
 
+  const activateLabel =
+    ui.state === "TRIAL" ? "Activate paid membership" : ui.state === "ACTIVE" ? "Manage membership" : "Activate membership";
+
   return (
     <main style={pageStyle}>
       <Card>
-        <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "flex-start" }}>
           <div>
             <h1 style={h1}>{ui.user.role === "DRIVER" ? "Driver membership" : "Rider membership"}</h1>
             <p style={muted}>After your free trial, membership is {ui.priceAfterTrial}/month.</p>
@@ -263,24 +281,45 @@ export default function MembershipPage() {
           <LabelRow label="Monthly price" value={ui.priceAfterTrial} />
           <LabelRow label="Payment method" value={ui.paymentMethodLine} />
 
+          <p style={{ ...muted, marginTop: 6 }}>{ui.helpLine}</p>
+
           {ui.membership.cancelAtPeriodEnd ? (
-            <p style={{ ...muted, marginTop: 6 }}>Your membership is set to cancel at the end of the current period.</p>
+            <p style={{ ...muted, marginTop: 0 }}>
+              Your membership is set to cancel at the end of the current period.
+            </p>
           ) : null}
 
-          <div style={{ marginTop: 12, display: "flex", gap: 10, flexWrap: "wrap" }}>
-            <button
-              type="button"
-              onClick={handleActivateTrial}
-              disabled={!ui.canStartTrial}
-              style={!ui.canStartTrial ? disabledBtn : primaryBtn}
-              title={ui.canStartTrial ? "Start a 30-day trial" : "Membership already active"}
-            >
-              {activating ? "Starting…" : ui.canStartTrial ? "Start free 30-day trial" : "Membership active"}
-            </button>
+          {actionError ? (
+            <div style={{ marginTop: 8, border: "1px solid #fecaca", background: "#fef2f2", color: "#b91c1c", padding: 12, borderRadius: 10 }}>
+              <div style={{ fontWeight: 700, fontSize: 13 }}>Action failed</div>
+              <div style={{ fontSize: 13, marginTop: 4 }}>{actionError}</div>
+            </div>
+          ) : null}
 
+          {/* Primary actions */}
+          <div style={{ marginTop: 12, display: "flex", gap: 10, flexWrap: "wrap" }}>
             <Link href="/account/billing" style={linkBtn}>
               Manage billing
             </Link>
+
+            <Link href="/account/billing/payment-method" style={linkBtn}>
+              Manage cards
+            </Link>
+
+            {ui.showActivate ? (
+              <button
+                type="button"
+                onClick={startMembershipCheckout}
+                disabled={activating}
+                style={{
+                  ...linkBtn,
+                  cursor: activating ? "not-allowed" : "pointer",
+                  opacity: activating ? 0.7 : 1,
+                }}
+              >
+                {activating ? "Starting…" : activateLabel}
+              </button>
+            ) : null}
 
             <Link href={ui.profileHref} style={linkBtn}>
               Profile
@@ -290,14 +329,6 @@ export default function MembershipPage() {
               Home
             </Link>
           </div>
-
-          {actionError ? <p style={{ marginTop: 10, color: "#b91c1c", fontSize: 14 }}>{actionError}</p> : null}
-
-          {ui.state === "TRIAL" ? (
-            <p style={{ ...muted, marginTop: 8 }}>
-              When the trial ends, you’ll need an active paid membership to continue using member-only features.
-            </p>
-          ) : null}
         </div>
       </Card>
     </main>
@@ -313,7 +344,7 @@ function Card({ children }: { children: React.ReactNode }) {
         border: "1px solid #e5e7eb",
         borderRadius: 12,
         padding: 24,
-        maxWidth: 600,
+        maxWidth: 640,
         width: "100%",
         background: "#fff",
       }}
@@ -346,17 +377,6 @@ const muted: React.CSSProperties = {
   lineHeight: 1.5,
 };
 
-const disabledBtn: React.CSSProperties = {
-  padding: "10px 14px",
-  borderRadius: 10,
-  border: "1px solid #d1d5db",
-  background: "#f3f4f6",
-  color: "#6b7280",
-  cursor: "not-allowed",
-  fontSize: 14,
-  fontWeight: 600,
-};
-
 const linkBtn: React.CSSProperties = {
   padding: "10px 14px",
   borderRadius: 10,
@@ -364,17 +384,6 @@ const linkBtn: React.CSSProperties = {
   background: "#fff",
   color: "#111827",
   textDecoration: "none",
-  fontSize: 14,
-  fontWeight: 600,
-};
-
-const primaryBtn: React.CSSProperties = {
-  padding: "10px 14px",
-  borderRadius: 10,
-  border: "1px solid #111827",
-  background: "#111827",
-  color: "#ffffff",
-  cursor: "pointer",
   fontSize: 14,
   fontWeight: 600,
 };

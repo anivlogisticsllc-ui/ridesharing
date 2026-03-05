@@ -2,7 +2,7 @@
 
 export type MeMembership = {
   plan: string | null; // legacy/display only
-  active: boolean; // computed on server (or derived)
+  active: boolean; // computed on server
   status?: "ACTIVE" | "EXPIRED" | null;
 
   trialEndsAt: string | null; // ISO
@@ -12,19 +12,36 @@ export type MeMembership = {
 
 export type MembershipState = "TRIAL" | "ACTIVE" | "EXPIRED" | "NONE";
 
+function parseIsoMs(iso: string | null | undefined): number | null {
+  if (!iso) return null;
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+export function formatDate(iso: string | null): string | null {
+  const ms = parseIsoMs(iso);
+  if (ms === null) return null;
+
+  return new Date(ms).toLocaleDateString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "2-digit",
+  });
+}
+
 export function computeMembershipState(
   m: MeMembership | null | undefined
 ): { state: MembershipState; label: string; endsAtLabel: string | null } {
   if (!m) return { state: "NONE", label: "No membership", endsAtLabel: null };
 
   const now = Date.now();
+  const trialEndsAtMs = parseIsoMs(m.trialEndsAt);
+  const periodEndMs = parseIsoMs(m.currentPeriodEnd);
 
-  const trialEndsAtMs = m.trialEndsAt ? Date.parse(m.trialEndsAt) : NaN;
-  const periodEndMs = m.currentPeriodEnd ? Date.parse(m.currentPeriodEnd) : NaN;
+  const inTrial = trialEndsAtMs !== null && trialEndsAtMs > now;
 
-  const inTrial = Number.isFinite(trialEndsAtMs) && trialEndsAtMs > now;
-  const periodValid = Number.isFinite(periodEndMs) && periodEndMs > now;
-  const periodExpired = Number.isFinite(periodEndMs) && periodEndMs <= now;
+  const periodValid = periodEndMs !== null && periodEndMs > now;
+  const periodExpired = periodEndMs !== null && periodEndMs <= now;
 
   if (inTrial) {
     return {
@@ -46,22 +63,9 @@ export function computeMembershipState(
     return {
       state: "ACTIVE",
       label: "Active",
-      endsAtLabel: Number.isFinite(periodEndMs) ? formatDate(m.currentPeriodEnd) : null,
+      endsAtLabel: periodEndMs !== null ? formatDate(m.currentPeriodEnd) : null,
     };
   }
 
   return { state: "NONE", label: "Not active", endsAtLabel: null };
-}
-
-export function formatDate(iso: string | null): string | null {
-  if (!iso) return null;
-  const ms = Date.parse(iso);
-  if (!Number.isFinite(ms)) return null;
-
-  const d = new Date(ms);
-  return d.toLocaleDateString(undefined, {
-    year: "numeric",
-    month: "short",
-    day: "2-digit",
-  });
 }

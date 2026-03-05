@@ -1,3 +1,4 @@
+// app/account/billing/page.tsx
 "use client";
 
 import Link from "next/link";
@@ -16,7 +17,6 @@ type RiderPayment = {
   status: string;
   currency: string;
   amountCents: number;
-
   ride?: {
     id: string;
     departureTime: string | null;
@@ -24,7 +24,6 @@ type RiderPayment = {
     destinationCity: string | null;
     status: string | null;
   } | null;
-
   paymentMethod?: {
     id: string;
     provider: string;
@@ -55,15 +54,35 @@ type DriverApiResponse =
     }
   | { ok: false; error: string };
 
+type MeApiResponse =
+  | {
+      ok: true;
+      user: {
+        id: string;
+        name: string | null;
+        email: string;
+        role: Role;
+        onboardingCompleted: boolean;
+        emailVerified?: boolean;
+      };
+      membership: {
+        plan: string | null;
+        kind: "NONE" | "TRIAL" | "PAID";
+        status: "none" | "trialing" | "active" | "expired";
+        active: boolean;
+        trialEndsAt: string | null;
+        currentPeriodEnd: string | null;
+        cancelAtPeriodEnd: boolean;
+      };
+    }
+  | { ok: false; error: string };
+
 function money(cents: number, currency: string) {
   const c = (currency || "USD").toUpperCase();
   const amount = (Number.isFinite(cents) ? cents : 0) / 100;
 
   try {
-    return new Intl.NumberFormat(undefined, {
-      style: "currency",
-      currency: c,
-    }).format(amount);
+    return new Intl.NumberFormat(undefined, { style: "currency", currency: c }).format(amount);
   } catch {
     return `${amount.toFixed(2)} ${c}`;
   }
@@ -105,6 +124,46 @@ function statusPill(status: string) {
   );
 }
 
+function membershipUi(m: MeApiResponse extends { ok: true } ? MeApiResponse["membership"] : any) {
+  const status = m?.status || "none";
+
+  if (status === "active") {
+    return { label: "Active", tone: "good" as const, cta: "Manage membership" };
+  }
+  if (status === "trialing") {
+    const ends = m?.trialEndsAt ? new Date(m.trialEndsAt).toLocaleDateString() : null;
+    return {
+      label: ends ? `Trial (ends ${ends})` : "Trial",
+      tone: "good" as const,
+      cta: "Manage membership",
+    };
+  }
+  if (status === "expired") {
+    const ended = m?.currentPeriodEnd ? new Date(m.currentPeriodEnd).toLocaleDateString() : null;
+    return {
+      label: ended ? `Expired (ended ${ended})` : "Expired",
+      tone: "bad" as const,
+      cta: "Activate membership",
+    };
+  }
+  return { label: "Not active", tone: "warn" as const, cta: "Activate membership" };
+}
+
+function badge(tone: "good" | "warn" | "bad", text: string) {
+  const cls =
+    tone === "good"
+      ? "bg-emerald-50 text-emerald-700 ring-1 ring-emerald-200"
+      : tone === "bad"
+      ? "bg-rose-50 text-rose-700 ring-1 ring-rose-200"
+      : "bg-amber-50 text-amber-800 ring-1 ring-amber-200";
+
+  return (
+    <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-medium ${cls}`}>
+      {text}
+    </span>
+  );
+}
+
 export default function AccountBillingPage() {
   const router = useRouter();
   const { data: session, status } = useSession();
@@ -113,7 +172,7 @@ export default function AccountBillingPage() {
 
   const showRider = role === "RIDER";
   const showDriver = role === "DRIVER" || role === "ADMIN";
-  const showBothSections = role === "ADMIN"; // admins can see both blocks if desired
+  const showBothSections = role === "ADMIN";
 
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -122,6 +181,8 @@ export default function AccountBillingPage() {
   const [driverPayouts, setDriverPayouts] = useState<DriverPayout[]>([]);
   const [serviceFeeTotal, setServiceFeeTotal] = useState<number>(0);
   const [serviceFeeCount, setServiceFeeCount] = useState<number>(0);
+
+  const [meMembership, setMeMembership] = useState<MeApiResponse extends { ok: true } ? any : any>(null);
 
   const callbackUrl = useMemo(() => "/account/billing", []);
 
@@ -144,6 +205,15 @@ export default function AccountBillingPage() {
       try {
         setLoading(true);
         setError(null);
+
+        // Membership status (for CTA)
+        const meRes = await fetch("/api/auth/me", { cache: "no-store" });
+        const meJson = (await meRes.json().catch(() => null)) as MeApiResponse | null;
+        if (meRes.ok && meJson && "ok" in meJson && meJson.ok) {
+          if (!cancelled) setMeMembership(meJson.membership);
+        } else {
+          if (!cancelled) setMeMembership(null);
+        }
 
         // Rider payments
         if (showRider || showBothSections) {
@@ -188,6 +258,8 @@ export default function AccountBillingPage() {
     };
   }, [session, status, role, router, callbackUrl, showRider, showDriver, showBothSections]);
 
+  const m = membershipUi(meMembership);
+
   return (
     <main className="min-h-[calc(100vh-4rem)] bg-slate-50">
       <div className="mx-auto max-w-5xl space-y-6 px-4 py-10">
@@ -224,6 +296,37 @@ export default function AccountBillingPage() {
           </div>
         ) : (
           <>
+            {/* Membership + Cards (top-level actions) */}
+            <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                <div>
+                  <h2 className="text-sm font-semibold text-slate-900">Membership</h2>
+                  <p className="mt-1 text-sm text-slate-600">
+                    Status: {badge(m.tone, m.label)}
+                  </p>
+                  <p className="mt-2 text-xs text-slate-500">
+                    If your membership is expired, you won’t be able to request rides until you activate a plan.
+                  </p>
+                </div>
+
+                <div className="flex flex-wrap gap-2">
+                  <Link
+                    href="/billing/membership"
+                    className="inline-flex items-center rounded-full border border-slate-300 bg-white px-3 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                  >
+                    {m.cta}
+                  </Link>
+
+                  <Link
+                    href="/account/billing/payment-method"
+                    className="inline-flex items-center rounded-full border border-slate-300 bg-white px-3 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50"
+                  >
+                    Manage cards
+                  </Link>
+                </div>
+              </div>
+            </section>
+
             {(showRider || showBothSections) && (
               <section className="space-y-3 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
                 <div>
@@ -277,9 +380,7 @@ export default function AccountBillingPage() {
 
                 <div className="grid gap-3 sm:grid-cols-2">
                   <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
-                    <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
-                      Service fees
-                    </p>
+                    <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Service fees</p>
                     <p className="mt-2 text-xl font-semibold text-slate-900">
                       {money(serviceFeeTotal, "USD")}
                     </p>
@@ -289,9 +390,7 @@ export default function AccountBillingPage() {
                   </div>
 
                   <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
-                    <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
-                      Payouts
-                    </p>
+                    <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Payouts</p>
                     <p className="mt-2 text-xl font-semibold text-slate-900">{driverPayouts.length}</p>
                     <p className="mt-1 text-[11px] text-slate-500">Total payout records</p>
                   </div>
@@ -329,19 +428,6 @@ export default function AccountBillingPage() {
                 )}
               </section>
             )}
-
-            <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-              <h2 className="text-sm font-semibold text-slate-900">Membership</h2>
-              <p className="mt-1 text-sm text-slate-600">Membership charges are managed separately.</p>
-              <div className="mt-3">
-                <Link
-                  href="/billing/membership"
-                  className="inline-flex items-center rounded-full border border-slate-300 bg-white px-3 py-1 text-xs font-medium text-slate-700 hover:bg-slate-50"
-                >
-                  Go to membership
-                </Link>
-              </div>
-            </section>
           </>
         )}
       </div>

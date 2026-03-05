@@ -1,172 +1,238 @@
 // app/api/stripe/webhook/route.ts
 import { NextResponse } from "next/server";
-import Stripe from "stripe";
 import { stripe } from "@/lib/stripe";
 import { prisma } from "@/lib/prisma";
+import {
+  MembershipPlan,
+  MembershipStatus,
+  MembershipType,
+} from "@prisma/client";
 
-export const runtime = "nodejs"; // needed for raw body signature verification
 export const dynamic = "force-dynamic";
+export const revalidate = 0;
 
-function envOrThrow(name: string) {
-  const v = process.env[name];
-  if (!v) throw new Error(`Missing env: ${name}`);
-  return v;
+function jsonOk() {
+  return NextResponse.json({ ok: true });
 }
 
-function asStringId(x: unknown): string | null {
-  if (typeof x === "string" && x.trim()) return x.trim();
-  if (x && typeof x === "object" && "id" in x) {
-    const id = (x as any).id;
-    return typeof id === "string" && id.trim() ? id.trim() : null;
+function jsonError(status: number, error: string) {
+  return NextResponse.json({ ok: false, error }, { status });
+}
+
+function isMembershipType(v: unknown): v is MembershipType {
+  return v === MembershipType.RIDER || v === MembershipType.DRIVER;
+}
+
+function toDateFromUnixSeconds(v: unknown): Date | null {
+  if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) return null;
+  return new Date(v * 1000);
+}
+
+async function setUserMembershipFlags(userId: string, active: boolean) {
+  await prisma.user.update({
+    where: { id: userId },
+    data: {
+      membershipActive: active,
+      membershipPlan: "STANDARD",
+      trialEndsAt: null,
+    },
+  });
+}
+
+async function createMembershipRowFromSub(sub: any, userId: string, membershipType: MembershipType) {
+  const start =
+    toDateFromUnixSeconds(sub?.current_period_start) ?? new Date();
+
+  const end =
+    toDateFromUnixSeconds(sub?.current_period_end) ??
+    new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+
+  const statusStr = String(sub?.status || "");
+  const activeLike = statusStr === "active" || statusStr === "trialing";
+  const status: MembershipStatus = activeLike
+    ? MembershipStatus.ACTIVE
+    : MembershipStatus.EXPIRED;
+
+  // best-effort monthly cents:
+  const unitAmount = sub?.items?.data?.[0]?.price?.unit_amount;
+  const amountPaidCents =
+    typeof unitAmount === "number" && Number.isFinite(unitAmount) && unitAmount > 0
+      ? unitAmount
+      : 0;
+
+  const subId = typeof sub?.id === "string" ? sub.id : null;
+
+  await prisma.membership.create({
+    data: {
+      userId,
+      type: membershipType,
+      startDate: start,
+      expiryDate: end,
+      status,
+      amountPaidCents,
+      paymentProvider: "STRIPE",
+      paymentRef: subId ?? undefined,
+      plan: MembershipPlan.STANDARD,
+    },
+  });
+
+  await setUserMembershipFlags(userId, status === MembershipStatus.ACTIVE);
+}
+
+async function refreshLatestMembershipFromSub(sub: any, userId: string, membershipType: MembershipType) {
+  const end = toDateFromUnixSeconds(sub?.current_period_end);
+  if (!end) return;
+
+  const statusStr = String(sub?.status || "");
+  const activeLike = statusStr === "active" || statusStr === "trialing";
+  const status: MembershipStatus = activeLike
+    ? MembershipStatus.ACTIVE
+    : MembershipStatus.EXPIRED;
+
+  const latest = await prisma.membership.findFirst({
+    where: { userId, type: membershipType },
+    orderBy: { startDate: "desc" },
+    select: { id: true },
+  });
+
+  if (!latest) {
+    await createMembershipRowFromSub(sub, userId, membershipType);
+    return;
   }
-  return null;
+
+  const subId = typeof sub?.id === "string" ? sub.id : null;
+
+  await prisma.membership.update({
+    where: { id: latest.id },
+    data: {
+      expiryDate: end,
+      status,
+      paymentProvider: "STRIPE",
+      paymentRef: subId ?? undefined,
+    },
+  });
+
+  await setUserMembershipFlags(userId, status === MembershipStatus.ACTIVE);
 }
 
-async function resolveUserIdFromSetupIntent(si: Stripe.SetupIntent): Promise<string | null> {
-  // 1) Preferred: metadata on SetupIntent (you should set this when creating SI)
-  const metaUserId = (si.metadata?.userId || "").trim();
-  if (metaUserId) return metaUserId;
+async function expireLatestMembership(userId: string, membershipType: MembershipType) {
+  const latest = await prisma.membership.findFirst({
+    where: { userId, type: membershipType },
+    orderBy: { startDate: "desc" },
+    select: { id: true },
+  });
 
-  // 2) Fallback: lookup by stripeCustomerId in your DB
-  const customerId = asStringId(si.customer);
-  if (customerId) {
-    const u = await prisma.user.findUnique({
-      where: { stripeCustomerId: customerId },
-      select: { id: true },
+  if (latest) {
+    await prisma.membership.update({
+      where: { id: latest.id },
+      data: { status: MembershipStatus.EXPIRED },
     });
-    if (u?.id) return u.id;
   }
 
-  // 3) Last resort: customer.metadata.userId (works only if you set it)
-  if (customerId) {
-    const customer = (await stripe.customers.retrieve(customerId)) as Stripe.Customer;
-    const userId = (customer.metadata?.userId || "").trim();
-    if (userId) return userId;
-  }
-
-  return null;
+  await setUserMembershipFlags(userId, false);
 }
 
 export async function POST(req: Request) {
-  const webhookSecret = envOrThrow("STRIPE_WEBHOOK_SECRET");
+  const secret = process.env.STRIPE_WEBHOOK_SECRET;
+  if (!secret) return jsonError(500, "Missing STRIPE_WEBHOOK_SECRET");
 
   const sig = req.headers.get("stripe-signature");
-  if (!sig) {
-    return NextResponse.json({ ok: false, error: "Missing stripe-signature" }, { status: 400 });
-  }
+  if (!sig) return jsonError(400, "Missing stripe-signature header");
 
-  const body = await req.text();
+  const rawBody = await req.text();
 
-  let event: Stripe.Event;
+  let event: any;
   try {
-    event = stripe.webhooks.constructEvent(body, sig, webhookSecret);
+    event = stripe.webhooks.constructEvent(rawBody, sig, secret);
   } catch (err: any) {
-    return NextResponse.json(
-      { ok: false, error: `Webhook signature verification failed: ${err?.message || String(err)}` },
-      { status: 400 }
-    );
+    return jsonError(400, `Webhook signature verification failed: ${err?.message || "unknown error"}`);
   }
 
   try {
     switch (event.type) {
-      case "setup_intent.succeeded": {
-        const si = event.data.object as Stripe.SetupIntent;
+      case "checkout.session.completed": {
+        const session = event.data?.object as any;
 
-        const customerId = asStringId(si.customer);
-        const paymentMethodId = asStringId(si.payment_method);
+        const subscriptionId =
+          typeof session?.subscription === "string"
+            ? session.subscription
+            : typeof session?.subscription?.id === "string"
+            ? session.subscription.id
+            : null;
 
-        if (!customerId || !paymentMethodId) {
-          console.warn("[stripe webhook] setup_intent.succeeded missing ids", {
-            hasCustomer: !!customerId,
-            hasPaymentMethod: !!paymentMethodId,
-            setupIntentId: si.id,
-          });
-          break;
-        }
+        const customerId =
+          typeof session?.customer === "string"
+            ? session.customer
+            : typeof session?.customer?.id === "string"
+            ? session.customer.id
+            : null;
 
-        const userId = await resolveUserIdFromSetupIntent(si);
-        if (!userId) {
-          console.warn("[stripe webhook] could not map setup_intent to user", {
-            setupIntentId: si.id,
-            customerId,
-          });
-          break;
-        }
+        const userId = String(session?.metadata?.userId || "");
+        const membershipType = session?.metadata?.membershipType as unknown;
 
-        const pm = await stripe.paymentMethods.retrieve(paymentMethodId);
-        const card = pm.card;
+        if (!userId || !isMembershipType(membershipType)) break;
 
-        if (!card) {
-          console.warn("[stripe webhook] payment method is not a card; ignoring", {
-            setupIntentId: si.id,
-            paymentMethodId,
-            type: pm.type,
-          });
-          break;
-        }
-
-        // Set default on Stripe customer (useful for subscriptions + future charges)
-        await stripe.customers.update(customerId, {
-          invoice_settings: { default_payment_method: paymentMethodId },
-        });
-
-        await prisma.$transaction(async (tx) => {
-          // Clear existing defaults
-          await tx.paymentMethod.updateMany({
-            where: { userId },
-            data: { isDefault: false },
-          });
-
-          // Upsert the saved card
-          await tx.paymentMethod.upsert({
-            where: { stripePaymentMethodId: paymentMethodId },
-            create: {
-              userId,
-              provider: "STRIPE",
-              stripePaymentMethodId: paymentMethodId,
-              providerPaymentMethodId: paymentMethodId,
-              brand: card.brand ?? null,
-              last4: card.last4 ?? null,
-              expMonth: card.exp_month ?? null,
-              expYear: card.exp_year ?? null,
-              isDefault: true,
-            },
-            update: {
-              userId,
-              provider: "STRIPE",
-              providerPaymentMethodId: paymentMethodId,
-              brand: card.brand ?? null,
-              last4: card.last4 ?? null,
-              expMonth: card.exp_month ?? null,
-              expYear: card.exp_year ?? null,
-              isDefault: true,
-            },
-          });
-
-          // Keep user pointers current
-          await tx.user.update({
+        if (customerId) {
+          await prisma.user.update({
             where: { id: userId },
-            data: {
-              stripeCustomerId: customerId,
-              stripeDefaultPaymentId: paymentMethodId,
-            },
+            data: { stripeCustomerId: customerId },
           });
-        });
+        }
+
+        if (subscriptionId) {
+          const sub = await stripe.subscriptions.retrieve(subscriptionId, {
+            expand: ["items.data.price"],
+          });
+          await createMembershipRowFromSub(sub, userId, membershipType);
+        }
 
         break;
       }
 
+      case "invoice.payment_succeeded": {
+        const invoice = event.data?.object as any;
+
+        const subscriptionId =
+          typeof invoice?.subscription === "string"
+            ? invoice.subscription
+            : typeof invoice?.subscription?.id === "string"
+            ? invoice.subscription.id
+            : null;
+
+        if (!subscriptionId) break;
+
+        const sub = await stripe.subscriptions.retrieve(subscriptionId, {
+          expand: ["items.data.price"],
+        });
+
+        const userId = String(sub?.metadata?.userId || "");
+        const membershipType = sub?.metadata?.membershipType as unknown;
+
+        if (!userId || !isMembershipType(membershipType)) break;
+
+        await refreshLatestMembershipFromSub(sub, userId, membershipType);
+        break;
+      }
+
+      case "customer.subscription.deleted": {
+        const sub = event.data?.object as any;
+
+        const userId = String(sub?.metadata?.userId || "");
+        const membershipType = sub?.metadata?.membershipType as unknown;
+
+        if (!userId || !isMembershipType(membershipType)) break;
+
+        await expireLatestMembership(userId, membershipType);
+        break;
+      }
+
       default:
-        // ignore other events
         break;
     }
 
-    return NextResponse.json({ ok: true });
+    return jsonOk();
   } catch (err: any) {
-    console.error("[stripe webhook] handler failed", { type: event.type, err });
-    return NextResponse.json(
-      { ok: false, error: err?.message || "Webhook handler failed" },
-      { status: 500 }
-    );
+    console.error("Stripe webhook handler error:", err?.message || err);
+    return jsonError(500, "Webhook handler failed");
   }
 }

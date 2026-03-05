@@ -311,7 +311,10 @@ model PaymentMethod {
   id                      String        @id @default(cuid())
   userId                  String
   provider                String        @default("STRIPE")
-  providerPaymentMethodId String?       @unique
+
+  // Keep it if you want, but DO NOT keep @unique globally
+  providerPaymentMethodId String?
+
   brand                   String?
   last4                   String?
   expMonth                Int?
@@ -319,12 +322,21 @@ model PaymentMethod {
   isDefault               Boolean       @default(false)
   createdAt               DateTime      @default(now())
   updatedAt               DateTime      @updatedAt
-  stripePaymentMethodId   String?       @unique
+
+  // Canonical Stripe ID
+  stripePaymentMethodId   String?
+
   user                    User          @relation(fields: [userId], references: [id])
   ridePayments            RidePayment[] @relation("RidePaymentPaymentMethod")
 
   @@index([userId])
   @@index([userId, isDefault])
+
+  // Enforce no duplicates per user (works even if stripePaymentMethodId is null sometimes)
+  @@unique([userId, stripePaymentMethodId])
+
+  // Optional (only if you truly support non-stripe providers later)
+  // @@unique([userId, provider, providerPaymentMethodId])
 }
 
 model RidePayment {

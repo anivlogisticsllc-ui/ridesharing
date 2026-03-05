@@ -39,16 +39,14 @@ async function readApiError(res: Response) {
   }
 }
 
-const publishableKey = process.env.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY || "";
-const stripePromise = publishableKey ? loadStripe(publishableKey) : null;
+const PUBLISHABLE_KEY = process.env.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY || "";
+const STRIPE_PROMISE = PUBLISHABLE_KEY ? loadStripe(PUBLISHABLE_KEY) : null;
 
-function AddCardForm({
-  clientSecret,
-  onSaved,
-}: {
-  clientSecret: string;
-  onSaved: () => Promise<void>;
-}) {
+const CALLBACK_PATH = "/account/billing/payment-method";
+const LOGIN_URL = "/auth/login?callbackUrl=" + encodeURIComponent(CALLBACK_PATH);
+
+function AddCardForm(props: { clientSecret: string; onSaved: () => Promise<void> }) {
+  const { clientSecret, onSaved } = props;
   const stripe = useStripe();
   const elements = useElements();
 
@@ -91,7 +89,7 @@ function AddCardForm({
       <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
         <h2 className="text-sm font-semibold text-slate-900">Add a card</h2>
         <p className="mt-1 text-sm text-slate-600">
-          We’ll save your card for membership billing and ride payments.
+          We’ll save your card for ride payments. Membership billing is handled separately once you activate a plan.
         </p>
 
         <div className="mt-4">
@@ -129,17 +127,13 @@ export default function PaymentMethodPage() {
 
   const [hasCard, setHasCard] = useState(false);
   const [defaultCard, setDefaultCard] = useState<DefaultPaymentMethod | null>(null);
-
   const [clientSecret, setClientSecret] = useState<string | null>(null);
 
   async function loadStatus() {
     const res = await fetch("/api/billing/payment-method", { cache: "no-store" });
 
     if (res.status === 401) {
-      router.replace(
-        "/auth/login?callbackUrl=" +
-          encodeURIComponent("/account/billing/payment-method")
-      );
+      router.replace(LOGIN_URL);
       return;
     }
 
@@ -147,7 +141,7 @@ export default function PaymentMethodPage() {
     if (!res.ok || !json || !("ok" in json) || !json.ok) {
       setHasCard(false);
       setDefaultCard(null);
-      setError((json as any)?.error || `Failed to load (HTTP ${res.status})`);
+      setError((json as any)?.error || `Failed to load (HTTP ${res.status}).`);
       return;
     }
 
@@ -157,8 +151,9 @@ export default function PaymentMethodPage() {
   }
 
   async function createSetupIntent() {
-    setCreating(true);
+    if (!STRIPE_PROMISE) return; // no Stripe in env
 
+    setCreating(true);
     try {
       const res = await fetch("/api/billing/setup-intent", {
         method: "POST",
@@ -183,12 +178,11 @@ export default function PaymentMethodPage() {
     if (status === "loading") return;
 
     if (!session) {
-      router.replace(
-        "/auth/login?callbackUrl=" +
-          encodeURIComponent("/account/billing/payment-method")
-      );
+      router.replace(LOGIN_URL);
       return;
     }
+
+    let mounted = true;
 
     (async () => {
       setLoading(true);
@@ -196,13 +190,17 @@ export default function PaymentMethodPage() {
 
       try {
         await loadStatus();
-        await createSetupIntent(); // always create so user can replace card easily
+        await createSetupIntent(); // keep ready so user can add/replace card quickly
       } catch (e: any) {
-        setError(e?.message || "Failed to load payment method page.");
+        if (mounted) setError(e?.message || "Failed to load payment method page.");
       } finally {
-        setLoading(false);
+        if (mounted) setLoading(false);
       }
     })();
+
+    return () => {
+      mounted = false;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status, session]);
 
@@ -218,7 +216,7 @@ export default function PaymentMethodPage() {
           <div>
             <h1 className="text-3xl font-semibold text-slate-900">Payment method</h1>
             <p className="mt-1 text-sm text-slate-600">
-              Add a card to enable membership billing and ride payments.
+              Add a card to enable CARD rides and to serve as backup for CASH rides during trial.
             </p>
           </div>
 
@@ -264,11 +262,11 @@ export default function PaymentMethodPage() {
               )}
 
               <p className="mt-3 text-xs text-slate-500">
-                You can add a new card anytime. The newest saved card becomes your default.
+                The newest saved card becomes your default.
               </p>
             </section>
 
-            {!publishableKey || !stripePromise ? (
+            {!PUBLISHABLE_KEY || !STRIPE_PROMISE ? (
               <div className="rounded-2xl border border-rose-200 bg-rose-50 p-4 text-rose-700 shadow-sm">
                 Missing NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY in your environment.
               </div>
@@ -279,20 +277,14 @@ export default function PaymentMethodPage() {
                 </p>
               </div>
             ) : (
-              <Elements stripe={stripePromise} options={elementsOptions}>
+              <Elements stripe={STRIPE_PROMISE} options={elementsOptions}>
                 <AddCardForm
                   clientSecret={clientSecret}
                   onSaved={async () => {
-                    // Webhook can be slightly delayed in dev; give it a beat.
+                    // Stripe/DB updates can lag slightly in dev; give it a beat.
                     await new Promise((r) => setTimeout(r, 900));
-
-                    // Re-read status from API (no-store)
                     await loadStatus();
-
-                    // Create a fresh setup intent so user can swap cards again
-                    await createSetupIntent();
-
-                    // Optional dev "belt and suspenders"
+                    await createSetupIntent(); // keep page ready for a swap
                     router.refresh();
                   }}
                 />

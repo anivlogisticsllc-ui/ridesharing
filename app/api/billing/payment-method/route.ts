@@ -9,12 +9,9 @@ import type Stripe from "stripe";
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
-function jsonError(status: number, error: string) {
-  return NextResponse.json({ ok: false, error }, { status });
-}
-
-function okResponse(payload: unknown) {
+function noStoreJson(payload: unknown, status = 200) {
   return NextResponse.json(payload, {
+    status,
     headers: {
       "Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
       Pragma: "no-cache",
@@ -23,10 +20,14 @@ function okResponse(payload: unknown) {
   });
 }
 
-async function requireUser() {
+function jsonError(status: number, error: string) {
+  return noStoreJson({ ok: false, error }, status);
+}
+
+async function requireUserId(): Promise<string | null> {
   const session = await getServerSession(authOptions);
   const userId = (session?.user as any)?.id as string | undefined;
-  return userId ? { userId } : null;
+  return typeof userId === "string" && userId.length ? userId : null;
 }
 
 function toStr(v: unknown) {
@@ -69,12 +70,18 @@ function shapeFromDb(row: {
 async function getStripeDefaultCard(
   customerId: string
 ): Promise<{ paymentMethodId: string; card: Stripe.PaymentMethod.Card } | null> {
-  // 1) Try customer's invoice_settings.default_payment_method
-  const customer = (await stripe.customers.retrieve(customerId)) as Stripe.Customer;
-  const defaultPm = customer?.invoice_settings?.default_payment_method;
+  const customerAny = await stripe.customers.retrieve(customerId);
+  if (!customerAny || (customerAny as any).deleted) return null;
 
+  const customer = customerAny as Stripe.Customer;
+
+  const defaultPm = customer.invoice_settings?.default_payment_method ?? null;
   const defaultPmId =
-    typeof defaultPm === "string" ? defaultPm : typeof defaultPm?.id === "string" ? defaultPm.id : null;
+    typeof defaultPm === "string"
+      ? defaultPm
+      : typeof (defaultPm as any)?.id === "string"
+        ? (defaultPm as any).id
+        : null;
 
   if (defaultPmId) {
     const pm = await stripe.paymentMethods.retrieve(defaultPmId);
@@ -83,7 +90,6 @@ async function getStripeDefaultCard(
     }
   }
 
-  // 2) Fallback: list card payment methods and take the first
   const list = await stripe.paymentMethods.list({
     customer: customerId,
     type: "card",
@@ -98,17 +104,86 @@ async function getStripeDefaultCard(
   return null;
 }
 
+/**
+ * Saves/updates a PaymentMethod row and makes it default for the user.
+ * Requires Prisma schema to have: @@unique([userId, stripePaymentMethodId])
+ */
+async function saveDefaultCard(params: {
+  userId: string;
+  stripePmId: string;
+  card: Stripe.PaymentMethod.Card;
+}) {
+  const { userId, stripePmId, card } = params;
+
+  const provider = "STRIPE";
+  const brand = card.brand ?? null;
+  const last4 = card.last4 ?? null;
+  const expMonth = card.exp_month ?? null;
+  const expYear = card.exp_year ?? null;
+
+  return prisma.$transaction(async (tx) => {
+    await tx.paymentMethod.updateMany({
+      where: { userId, isDefault: true },
+      data: { isDefault: false },
+    });
+
+    const row = await tx.paymentMethod.upsert({
+      where: {
+        userId_stripePaymentMethodId: {
+          userId,
+          stripePaymentMethodId: stripePmId,
+        },
+      },
+      create: {
+        userId,
+        provider,
+        stripePaymentMethodId: stripePmId,
+        brand,
+        last4,
+        expMonth,
+        expYear,
+        isDefault: true,
+      },
+      update: {
+        provider,
+        brand,
+        last4,
+        expMonth,
+        expYear,
+        isDefault: true,
+      },
+      select: {
+        id: true,
+        provider: true,
+        brand: true,
+        last4: true,
+        expMonth: true,
+        expYear: true,
+        stripePaymentMethodId: true,
+        updatedAt: true,
+      },
+    });
+
+    await tx.user.update({
+      where: { id: userId },
+      data: { stripeDefaultPaymentId: stripePmId },
+    });
+
+    return row;
+  });
+}
+
 export async function GET() {
-  const auth = await requireUser();
-  if (!auth) return jsonError(401, "Not authenticated");
+  const userId = await requireUserId();
+  if (!userId) return jsonError(401, "Not authenticated");
 
   const user = await prisma.user.findUnique({
-    where: { id: auth.userId },
+    where: { id: userId },
     select: { id: true, stripeCustomerId: true, stripeDefaultPaymentId: true },
   });
   if (!user) return jsonError(404, "User not found");
 
-  // ---- DB FIRST ----
+  // DB-first: look for default row
   const dbDefault = await prisma.paymentMethod.findFirst({
     where: { userId: user.id, isDefault: true },
     orderBy: { updatedAt: "desc" },
@@ -124,10 +199,14 @@ export async function GET() {
     },
   });
 
+  // DB fallback: row matching user.stripeDefaultPaymentId
   const dbFallback =
     !dbDefault && user.stripeDefaultPaymentId
       ? await prisma.paymentMethod.findFirst({
-          where: { userId: user.id, stripePaymentMethodId: user.stripeDefaultPaymentId },
+          where: {
+            userId: user.id,
+            stripePaymentMethodId: user.stripeDefaultPaymentId,
+          },
           select: {
             id: true,
             provider: true,
@@ -143,20 +222,18 @@ export async function GET() {
 
   const activeDb = dbDefault ?? dbFallback;
 
-  // If DB already has a usable stripePaymentMethodId, return it
   if (activeDb?.stripePaymentMethodId) {
-    const shaped = shapeFromDb(activeDb);
-    return okResponse({
+    return noStoreJson({
       ok: true,
       hasPaymentMethod: true,
       customerId: user.stripeCustomerId ?? null,
-      defaultPaymentMethod: shaped,
+      defaultPaymentMethod: shapeFromDb(activeDb),
     });
   }
 
-  // ---- STRIPE FALLBACK (fixes your current problem) ----
+  // Stripe fallback
   if (!user.stripeCustomerId) {
-    return okResponse({
+    return noStoreJson({
       ok: true,
       hasPaymentMethod: false,
       customerId: null,
@@ -165,9 +242,8 @@ export async function GET() {
   }
 
   const stripeCard = await getStripeDefaultCard(user.stripeCustomerId);
-
   if (!stripeCard) {
-    return okResponse({
+    return noStoreJson({
       ok: true,
       hasPaymentMethod: false,
       customerId: user.stripeCustomerId,
@@ -175,61 +251,14 @@ export async function GET() {
     });
   }
 
-  // Optional: self-heal DB so future calls don't need Stripe fallback
-  const provider = "STRIPE";
-  const brand = stripeCard.card.brand ?? null;
-  const last4 = stripeCard.card.last4 ?? null;
-  const expMonth = stripeCard.card.exp_month ?? null;
-  const expYear = stripeCard.card.exp_year ?? null;
-
-  const saved = await prisma.$transaction(async (tx) => {
-    await tx.paymentMethod.updateMany({
-      where: { userId: user.id, isDefault: true },
-      data: { isDefault: false },
-    });
-
-    const row = await tx.paymentMethod.upsert({
-      where: { stripePaymentMethodId: stripeCard.paymentMethodId },
-      create: {
-        userId: user.id,
-        provider,
-        stripePaymentMethodId: stripeCard.paymentMethodId,
-        brand,
-        last4,
-        expMonth,
-        expYear,
-        isDefault: true,
-      } as any,
-      update: {
-        userId: user.id,
-        provider,
-        brand,
-        last4,
-        expMonth,
-        expYear,
-        isDefault: true,
-      } as any,
-      select: {
-        id: true,
-        provider: true,
-        brand: true,
-        last4: true,
-        expMonth: true,
-        expYear: true,
-        stripePaymentMethodId: true,
-        updatedAt: true,
-      },
-    });
-
-    await tx.user.update({
-      where: { id: user.id },
-      data: { stripeDefaultPaymentId: stripeCard.paymentMethodId },
-    });
-
-    return row;
+  // Self-heal DB
+  const saved = await saveDefaultCard({
+    userId: user.id,
+    stripePmId: stripeCard.paymentMethodId,
+    card: stripeCard.card,
   });
 
-  return okResponse({
+  return noStoreJson({
     ok: true,
     hasPaymentMethod: true,
     customerId: user.stripeCustomerId,
@@ -243,15 +272,17 @@ type PostBody = {
 };
 
 export async function POST(req: Request) {
-  const auth = await requireUser();
-  if (!auth) return jsonError(401, "Not authenticated");
+  const userId = await requireUserId();
+  if (!userId) return jsonError(401, "Not authenticated");
 
   const user = await prisma.user.findUnique({
-    where: { id: auth.userId },
+    where: { id: userId },
     select: { id: true, stripeCustomerId: true },
   });
   if (!user) return jsonError(404, "User not found");
-  if (!user.stripeCustomerId) return jsonError(400, "Missing Stripe customer. Create setup-intent first.");
+  if (!user.stripeCustomerId) {
+    return jsonError(400, "Missing Stripe customer. Create setup-intent first.");
+  }
 
   const body = (await req.json().catch(() => ({}))) as PostBody;
   const setupIntentId = toStr(body.setupIntentId);
@@ -288,61 +319,14 @@ export async function POST(req: Request) {
     invoice_settings: { default_payment_method: stripePmId },
   });
 
-  const card = pm.card;
-  const provider = "STRIPE";
-  const brand = card.brand ?? null;
-  const last4 = card.last4 ?? null;
-  const expMonth = card.exp_month ?? null;
-  const expYear = card.exp_year ?? null;
-
-  const saved = await prisma.$transaction(async (tx) => {
-    await tx.paymentMethod.updateMany({
-      where: { userId: user.id, isDefault: true },
-      data: { isDefault: false },
-    });
-
-    const row = await tx.paymentMethod.upsert({
-      where: { stripePaymentMethodId: stripePmId },
-      create: {
-        userId: user.id,
-        provider,
-        stripePaymentMethodId: stripePmId,
-        brand,
-        last4,
-        expMonth,
-        expYear,
-        isDefault: true,
-      } as any,
-      update: {
-        userId: user.id,
-        provider,
-        brand,
-        last4,
-        expMonth,
-        expYear,
-        isDefault: true,
-      } as any,
-      select: {
-        id: true,
-        provider: true,
-        brand: true,
-        last4: true,
-        expMonth: true,
-        expYear: true,
-        stripePaymentMethodId: true,
-        updatedAt: true,
-      },
-    });
-
-    await tx.user.update({
-      where: { id: user.id },
-      data: { stripeDefaultPaymentId: stripePmId },
-    });
-
-    return row;
+  // Save locally + set as default
+  const saved = await saveDefaultCard({
+    userId: user.id,
+    stripePmId: stripePmId,
+    card: pm.card,
   });
 
-  return okResponse({
+  return noStoreJson({
     ok: true,
     hasPaymentMethod: true,
     customerId: user.stripeCustomerId,

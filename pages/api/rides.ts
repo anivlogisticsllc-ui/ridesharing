@@ -3,16 +3,15 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "./auth/[...nextauth]";
 import { prisma } from "../../lib/prisma";
-import { MembershipType, RideStatus, PaymentType, BookingStatus } from "@prisma/client";
+import { BookingStatus, PaymentType, RideStatus, UserRole } from "@prisma/client";
 import { membershipErrorMessage, requireTrialOrActive } from "@/lib/guardMembership";
-
-// ✅ add this import (adjust if your stripe export path differs)
 import { stripe } from "@/lib/stripe";
+import type Stripe from "stripe";
 
 type ApiResponse =
   | { ok: true; rides: any[] }
   | { ok: true; ride: any; booking?: any }
-  | { ok: false; error: string; outstandingChargeId?: string };
+  | { ok: false; error: string };
 
 function toNumber(v: unknown): number | null {
   if (typeof v === "number" && Number.isFinite(v)) return v;
@@ -36,14 +35,9 @@ function parseClientRequestId(v: unknown): string | null {
   return id.length >= 8 ? id : null;
 }
 
-function clampCashDiscountBps(bps: number) {
-  if (!Number.isFinite(bps)) return 0;
-  return Math.min(5000, Math.max(0, Math.round(bps)));
-}
-
 function computeReceipt(baseCents: number, cashDiscountBps: number) {
   const base = Number.isFinite(baseCents) ? Math.max(0, Math.round(baseCents)) : 0;
-  const bps = clampCashDiscountBps(cashDiscountBps);
+  const bps = Number.isFinite(cashDiscountBps) ? Math.max(0, Math.min(5000, Math.round(cashDiscountBps))) : 0;
   const discountCents = bps > 0 ? Math.round(base * (bps / 10000)) : 0;
   const finalAmountCents = Math.max(0, base - discountCents);
   return { baseAmountCents: base, discountCents, finalAmountCents };
@@ -52,53 +46,99 @@ function computeReceipt(baseCents: number, cashDiscountBps: number) {
 function applyCashDiscount(totalCents: number, cashDiscountBps: number) {
   if (!Number.isFinite(totalCents) || totalCents < 0) return totalCents;
   if (!Number.isFinite(cashDiscountBps) || cashDiscountBps <= 0) return totalCents;
-  const bps = clampCashDiscountBps(cashDiscountBps);
+  const bps = Math.max(0, Math.min(5000, Math.round(cashDiscountBps)));
   const discounted = Math.round(totalCents * (1 - bps / 10000));
   return Math.max(0, discounted);
 }
 
-function safeErrorMessage(err: unknown) {
-  if (err instanceof Error && err.message) return err.message;
-  return "Internal server error";
-}
+async function findCardOnFile(userId: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  // 1) DB default first
+  const dbDefault = await prisma.paymentMethod.findFirst({
+    where: { userId, isDefault: true },
+    select: { id: true, stripePaymentMethodId: true },
+  });
 
-// ✅ NEW: require backup card on file (Stripe customer + default PM)
-async function requireBackupCardOnFile(riderId: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (dbDefault?.stripePaymentMethodId) return { ok: true };
+
+  // 2) Stripe fallback + self-heal DB
   const user = await prisma.user.findUnique({
-    where: { id: riderId },
+    where: { id: userId },
     select: { stripeCustomerId: true },
   });
 
   const customerId = user?.stripeCustomerId ?? null;
   if (!customerId) {
-    return {
-      ok: false,
-      error: "A card is required before you can request rides. Please add a payment method in Billing.",
-    };
+    return { ok: false, error: "A card is required. Please add a payment method in Billing." };
   }
 
   const customer = await stripe.customers.retrieve(customerId);
   if (!customer || (customer as any).deleted) {
-    return {
-      ok: false,
-      error: "Billing profile is missing. Please add a payment method in Billing.",
-    };
+    return { ok: false, error: "Billing profile is missing. Please add a payment method in Billing." };
   }
 
-  const defaultPm = (customer as any)?.invoice_settings?.default_payment_method ?? null;
-  if (!defaultPm) {
-    return {
-      ok: false,
-      error: "A backup card is required before you can request rides. Please add a payment method in Billing.",
-    };
+  const defaultPm = (customer as Stripe.Customer).invoice_settings?.default_payment_method;
+  const defaultPmId =
+    typeof defaultPm === "string" ? defaultPm : typeof (defaultPm as any)?.id === "string" ? (defaultPm as any).id : null;
+
+  let pmId: string | null = defaultPmId;
+
+  if (!pmId) {
+    const list = await stripe.paymentMethods.list({ customer: customerId, type: "card", limit: 1 });
+    pmId = list.data?.[0]?.id ?? null;
   }
+
+  if (!pmId) {
+    return { ok: false, error: "A card is required. Please add a payment method in Billing." };
+  }
+
+  // Ensure default on Stripe
+  await stripe.customers.update(customerId, { invoice_settings: { default_payment_method: pmId } });
+
+  const pm = await stripe.paymentMethods.retrieve(pmId);
+  if (!pm || pm.type !== "card" || !pm.card) {
+    return { ok: false, error: "A card is required. Please add a payment method in Billing." };
+  }
+
+  // Self-heal DB so future checks are fast
+  await prisma.$transaction(async (tx) => {
+    await tx.paymentMethod.updateMany({ where: { userId, isDefault: true }, data: { isDefault: false } });
+
+    await tx.paymentMethod.upsert({
+      // assumes stripePaymentMethodId is unique in schema
+      where: { stripePaymentMethodId: pmId },
+      create: {
+        userId,
+        provider: "STRIPE",
+        stripePaymentMethodId: pmId,
+        brand: pm.card?.brand ?? null,
+        last4: pm.card?.last4 ?? null,
+        expMonth: pm.card?.exp_month ?? null,
+        expYear: pm.card?.exp_year ?? null,
+        isDefault: true,
+      } as any,
+      update: {
+        userId,
+        provider: "STRIPE",
+        brand: pm.card?.brand ?? null,
+        last4: pm.card?.last4 ?? null,
+        expMonth: pm.card?.exp_month ?? null,
+        expYear: pm.card?.exp_year ?? null,
+        isDefault: true,
+      } as any,
+    });
+
+    await tx.user.update({
+      where: { id: userId },
+      data: { stripeDefaultPaymentId: pmId },
+    });
+  });
 
   return { ok: true };
 }
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse<ApiResponse>) {
   try {
-    // ---------------- GET ----------------
+    // ---------- GET ----------
     if (req.method === "GET") {
       const session = await getServerSession(req, res, authOptions);
       const mine = req.query.mine === "1";
@@ -132,7 +172,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       const normalized = rides.map((r) => {
         const b = (r as any).bookings?.[0] ?? null;
         const paymentType: PaymentType | null = b?.paymentType ?? null;
-        const cashDiscountBps =
+        const cashDiscountBps: number =
           typeof b?.cashDiscountBps === "number" && Number.isFinite(b.cashDiscountBps) ? b.cashDiscountBps : 0;
 
         const baseTotalCents: number = (r as any).totalPriceCents ?? 0;
@@ -152,7 +192,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       return res.status(200).json({ ok: true, rides: normalized });
     }
 
-    // ---------------- POST ----------------
+    // ---------- POST ----------
     if (req.method === "POST") {
       const session = await getServerSession(req, res, authOptions);
       if (!session) return res.status(401).json({ ok: false, error: "Not authenticated" });
@@ -163,18 +203,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       const riderId = (session.user as any)?.id as string | undefined;
       if (!riderId) return res.status(401).json({ ok: false, error: "Not authenticated" });
 
-      // ✅ REMOVE Unpaid-balance lock (OutstandingCharge) — no longer used
-      // (leave this block out entirely)
-
-      // Membership gate (RIDER)
-      const gate: any = await requireTrialOrActive({ userId: riderId, type: MembershipType.RIDER } as any);
-      if (!gate || typeof gate.ok !== "boolean") {
-        console.error("[api/rides] requireTrialOrActive returned invalid value:", gate);
-        return res.status(500).json({ ok: false, error: "Membership gate failed unexpectedly (invalid response)." });
-      }
+      // Membership gate (source of truth = membership table)
+      const gate = await requireTrialOrActive({ userId: riderId, role: UserRole.RIDER });
       if (!gate.ok) {
-        const msg = membershipErrorMessage(gate) || gate.error || "Membership required";
-        return res.status(402).json({ ok: false, error: msg });
+        return res.status(402).json({ ok: false, error: membershipErrorMessage(gate) });
       }
 
       const body: any = req.body ?? {};
@@ -213,14 +245,22 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         });
       }
 
-      // ✅ NEW: require backup card on file BEFORE any ride can be requested
-      const cardGate = await requireBackupCardOnFile(riderId);
-      if (!cardGate.ok) return res.status(402).json({ ok: false, error: cardGate.error });
+      // CARD RULES (your design)
+      const isTrial = gate.ok && gate.state === "TRIAL";
+
+      const mustHaveCard =
+        paymentType === PaymentType.CARD ||
+        (paymentType === PaymentType.CASH && isTrial);
+
+      if (mustHaveCard) {
+        const cardGate = await findCardOnFile(riderId);
+        if (!cardGate.ok) return res.status(402).json({ ok: false, error: cardGate.error });
+      }
 
       // Canonical pricing
       const totalPriceCents = Math.round((3 + 2 * distanceMiles) * 100);
 
-      // Discount rule (10% for CASH)
+      // 10% discount for CASH
       const cashDiscountBps = paymentType === PaymentType.CASH ? 1000 : 0;
 
       const receipt =
@@ -262,53 +302,27 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
           },
         });
 
-          // inside prisma.$transaction(async (tx) => { ... })
+        const existingBooking = await tx.booking.findFirst({
+          where: { rideId: ride.id, riderId },
+          orderBy: { createdAt: "asc" as any },
+          select: { id: true },
+        });
 
-          const existingBooking = await tx.booking.findFirst({
-            where: { rideId: ride.id, riderId },
-            orderBy: { createdAt: "asc" as any },
-            select: { id: true },
-          });
-
-          if (!existingBooking) {
-            const booking = await tx.booking.create({
-              data: {
-                rideId: ride.id,
-                riderId,
-                status: BookingStatus.PENDING,
-
-                // "current" values (can change before trip starts)
-                paymentType,
-                cashDiscountBps,
-
-                // "original" values (immutable audit trail)
-                originalPaymentType: paymentType,
-                originalCashDiscountBps: cashDiscountBps,
-
-                paymentMethodId: null,
-                currency: "usd",
-
-                // receipt snapshot for THIS selection
-                baseAmountCents: receipt.baseAmountCents,
-                discountCents: receipt.discountCents,
-                finalAmountCents: receipt.finalAmountCents,
-              } as any,
-            });
-
-            return { ride, booking };
-          }
-
-          // Only allow changes if the trip hasn't started.
-          // IMPORTANT: do NOT overwrite originalPaymentType/originalCashDiscountBps here.
-          const updated = await tx.booking.updateMany({
-            where: {
-              id: existingBooking.id,
-              riderId,
-              ride: { tripStartedAt: null, status: { not: RideStatus.IN_ROUTE } },
-            },
+        if (!existingBooking) {
+          const booking = await tx.booking.create({
             data: {
+              rideId: ride.id,
+              riderId,
+              status: BookingStatus.PENDING,
+
               paymentType,
               cashDiscountBps,
+
+              // If your schema has these fields, keep them. If not, remove them.
+              originalPaymentType: paymentType,
+              originalCashDiscountBps: cashDiscountBps,
+
+              paymentMethodId: null,
               currency: "usd",
 
               baseAmountCents: receipt.baseAmountCents,
@@ -317,14 +331,22 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
             } as any,
           });
 
-          if (updated.count === 0) {
-            const e = new Error("Payment can’t be changed after the trip has started.");
-            (e as any).httpStatus = 409;
-            throw e;
-          }
-
-          const booking = await tx.booking.findUnique({ where: { id: existingBooking.id } });
           return { ride, booking };
+        }
+
+        const updated = await tx.booking.update({
+          where: { id: existingBooking.id },
+          data: {
+            paymentType,
+            cashDiscountBps,
+            currency: "usd",
+            baseAmountCents: receipt.baseAmountCents,
+            discountCents: receipt.discountCents,
+            finalAmountCents: receipt.finalAmountCents,
+          } as any,
+        });
+
+        return { ride, booking: updated };
       });
 
       return res.status(201).json({ ok: true, ride, booking });
@@ -333,16 +355,10 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     res.setHeader("Allow", "GET, POST");
     return res.status(405).json({ ok: false, error: "Method not allowed" });
   } catch (err: any) {
-    const status = typeof err?.httpStatus === "number" ? err.httpStatus : 500;
-
-    if (status !== 500) {
-      return res.status(status).json({ ok: false, error: safeErrorMessage(err) });
-    }
-
     console.error("[api/rides] unhandled error:", err);
     return res.status(500).json({
       ok: false,
-      error: process.env.NODE_ENV === "development" ? safeErrorMessage(err) : "Internal server error",
+      error: process.env.NODE_ENV === "development" && err?.message ? err.message : "Internal server error",
     });
   }
 }
