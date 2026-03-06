@@ -30,11 +30,6 @@ type CompleteRideBody = {
   elapsedSeconds?: number | null;
   distanceMiles?: number | null;
   fareCents?: number | null;
-
-  /**
-   * Optional: driver can report "not paid" (CASH ride where rider refused).
-   * In your system this should result in creating an OutstandingCharge elsewhere.
-   */
   unpaid?: boolean;
 };
 
@@ -60,12 +55,6 @@ function clampCashDiscountBps(bps: unknown) {
   return Math.min(5000, Math.max(0, Math.round(bps)));
 }
 
-/**
- * Returns a booking snapshot (base/discount/final) consistent with your model:
- * - baseAmountCents: before discount
- * - discountCents: discount amount
- * - finalAmountCents: base - discount (no fee here)
- */
 function computeReceipt(baseCents: number, cashDiscountBps: number) {
   const base = Math.max(0, Math.round(baseCents));
   const bps = clampCashDiscountBps(cashDiscountBps);
@@ -76,20 +65,22 @@ function computeReceipt(baseCents: number, cashDiscountBps: number) {
   return { baseAmountCents: base, discountCents, finalAmountCents };
 }
 
-/* ---------------- Stripe capture helper ---------------- */
+/* ---------------- Payment helpers ---------------- */
 
 async function captureAuthorizedPayment(args: {
   rideId: string;
-  driverId: string;
   amountToCaptureCents: number;
 }) {
   const amountToCapture = Math.round(args.amountToCaptureCents);
 
   if (!Number.isFinite(amountToCapture) || amountToCapture < 50) {
-    return { ok: false as const, stripeStatus: "invalid_amount", error: "Invalid capture amount." };
+    return {
+      ok: false as const,
+      stripeStatus: "invalid_amount",
+      error: "Invalid capture amount.",
+    };
   }
 
-  // Latest uncaptured authorization for this ride
   const rp = await prisma.ridePayment.findFirst({
     where: {
       rideId: args.rideId,
@@ -101,7 +92,7 @@ async function captureAuthorizedPayment(args: {
     select: {
       id: true,
       stripePaymentIntentId: true,
-      amountCents: true, // authorized amount (with buffer)
+      amountCents: true,
     },
   });
 
@@ -133,7 +124,7 @@ async function captureAuthorizedPayment(args: {
       data: {
         status: succeeded ? RidePaymentStatus.SUCCEEDED : RidePaymentStatus.PENDING,
         capturedAt: succeeded ? new Date() : null,
-        finalAmountCents: amountToCapture, // store the actual captured amount
+        finalAmountCents: amountToCapture,
       } as any,
     });
 
@@ -164,6 +155,57 @@ async function captureAuthorizedPayment(args: {
   }
 }
 
+async function writeCashRidePayment(args: {
+  rideId: string;
+  riderId: string;
+  amountCents: number;
+  baseAmountCents: number;
+  discountCents: number;
+  finalAmountCents: number;
+}) {
+  const key = `cash_complete:${args.rideId}:${args.riderId}`;
+
+  const existing = await prisma.ridePayment.findFirst({
+    where: { idempotencyKey: key },
+    select: { id: true },
+  });
+
+  if (existing) {
+    await prisma.ridePayment.update({
+      where: { id: existing.id },
+      data: {
+        amountCents: args.amountCents,
+        currency: "usd",
+        status: RidePaymentStatus.SUCCEEDED,
+        provider: "CASH",
+        paymentType: PaymentType.CASH,
+        baseAmountCents: args.baseAmountCents,
+        discountCents: args.discountCents,
+        finalAmountCents: args.finalAmountCents,
+        capturedAt: new Date(),
+      } as any,
+    });
+    return;
+  }
+
+  await prisma.ridePayment.create({
+    data: {
+      rideId: args.rideId,
+      riderId: args.riderId,
+      amountCents: args.amountCents,
+      currency: "usd",
+      status: RidePaymentStatus.SUCCEEDED,
+      provider: "CASH",
+      paymentType: PaymentType.CASH,
+      baseAmountCents: args.baseAmountCents,
+      discountCents: args.discountCents,
+      finalAmountCents: args.finalAmountCents,
+      capturedAt: new Date(),
+      idempotencyKey: key,
+    } as any,
+  });
+}
+
 /* ---------------- Handler ---------------- */
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse<ApiResponse>) {
@@ -183,21 +225,29 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
     const driverId = String(user.id);
 
-    // Verification gate
     const profile = await prisma.driverProfile.findUnique({
       where: { userId: driverId },
       select: { verificationStatus: true },
     });
+
     if (!profile) {
       return res.status(403).json({ ok: false, error: "Driver profile missing. Complete driver setup first." });
     }
     if (profile.verificationStatus !== "APPROVED") {
-      return res.status(403).json({ ok: false, error: `Driver verification required. Status: ${profile.verificationStatus}` });
+      return res.status(403).json({
+        ok: false,
+        error: `Driver verification required. Status: ${profile.verificationStatus}`,
+      });
     }
 
-    // Membership gate
-    const gate = await guardMembership({ userId: driverId, role: UserRole.DRIVER, allowTrial: true });
-    if (!gate.ok) return res.status(403).json({ ok: false, error: gate.error || "Membership required." });
+    const gate = await guardMembership({
+      userId: driverId,
+      role: UserRole.DRIVER,
+      allowTrial: true,
+    });
+    if (!gate.ok) {
+      return res.status(403).json({ ok: false, error: gate.error || "Membership required." });
+    }
 
     const body = (req.body ?? {}) as CompleteRideBody;
     const rideId = typeof body.rideId === "string" ? body.rideId.trim() : "";
@@ -216,7 +266,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
     if (!ride) return res.status(404).json({ ok: false, error: "Ride not found for this driver." });
 
-    // Idempotent: if already completed, return success (don’t double-capture)
     if (ride.status === RideStatus.COMPLETED) {
       return res.status(200).json({ ok: true });
     }
@@ -234,7 +283,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     const riderId = booking.riderId ? String(booking.riderId) : "";
     if (!riderId) return res.status(400).json({ ok: false, error: "Missing riderId on booking." });
 
-    // Resolve final distance
     let finalDistanceMiles: number | null = null;
     if (isPositiveNumber(body.distanceMiles)) finalDistanceMiles = body.distanceMiles;
     else if (isPositiveNumber((ride as any).distanceMiles)) finalDistanceMiles = (ride as any).distanceMiles;
@@ -252,19 +300,21 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       );
     }
 
-    // Resolve final fare (cents)
     const fareFromBody = clampInt(body.fareCents);
     const fareFromRide = clampInt((ride as any).totalPriceCents);
     const finalFareCents =
-      (fareFromBody && fareFromBody >= 50) ? fareFromBody :
-      (fareFromRide && fareFromRide >= 50) ? fareFromRide :
-      null;
+      fareFromBody && fareFromBody >= 50
+        ? fareFromBody
+        : fareFromRide && fareFromRide >= 50
+        ? fareFromRide
+        : null;
 
-    if (!finalFareCents) return res.status(400).json({ ok: false, error: "Missing final fare amount." });
+    if (!finalFareCents) {
+      return res.status(400).json({ ok: false, error: "Missing final fare amount." });
+    }
 
     const completionTime = new Date();
 
-    // 1) Complete ride + booking
     await prisma.$transaction(async (tx) => {
       await tx.ride.update({
         where: { id: ride.id },
@@ -282,13 +332,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       });
     });
 
-    // 2) Payment behavior
     const paymentType = booking.paymentType ?? PaymentType.CARD;
 
-    // If driver explicitly reports unpaid: treat as CASH unpaid event (no Stripe here)
-    // You’ll wire this to your OutstandingCharge creation endpoint from UI.
     if (body.unpaid === true) {
-      // Force CASH, remove discount (revert cash promo for conflict scenario)
       const receipt = computeReceipt(finalFareCents, 0);
 
       await prisma.booking.update({
@@ -300,7 +346,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
           baseAmountCents: receipt.baseAmountCents,
           discountCents: receipt.discountCents,
           finalAmountCents: receipt.finalAmountCents,
-        },
+          cashNotPaidAt: completionTime,
+          cashNotPaidReportedById: driverId,
+        } as any,
       });
 
       return res.status(200).json({
@@ -313,10 +361,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       });
     }
 
-    // CASH: successful cash paid at dropoff -> no Stripe, keep the existing discount that was set at booking time
     if (paymentType === PaymentType.CASH) {
-      // Make sure booking receipt is consistent with finalFareCents and its stored cashDiscountBps
-      const bps = typeof (booking as any).cashDiscountBps === "number" ? (booking as any).cashDiscountBps : 0;
+      const bps =
+        typeof (booking as any).cashDiscountBps === "number"
+          ? (booking as any).cashDiscountBps
+          : 0;
+
       const receipt = computeReceipt(finalFareCents, bps);
 
       await prisma.booking.update({
@@ -326,22 +376,30 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
           baseAmountCents: receipt.baseAmountCents,
           discountCents: receipt.discountCents,
           finalAmountCents: receipt.finalAmountCents,
-        },
+        } as any,
       });
 
-      return res.status(200).json({ ok: true, payment: { ok: true, method: "CASH" } });
+      await writeCashRidePayment({
+        rideId: ride.id,
+        riderId,
+        amountCents: receipt.finalAmountCents,
+        baseAmountCents: receipt.baseAmountCents,
+        discountCents: receipt.discountCents,
+        finalAmountCents: receipt.finalAmountCents,
+      });
+
+      return res.status(200).json({
+        ok: true,
+        payment: { ok: true, method: "CASH" },
+      });
     }
 
-    // CARD: capture an existing authorization (manual capture)
-    // NOTE: tips are intentionally NOT captured here yet (see note below).
     const capture = await captureAuthorizedPayment({
       rideId: ride.id,
-      driverId,
       amountToCaptureCents: finalFareCents,
     });
 
     if (capture.ok) {
-      // Update booking receipt for CARD (no discount)
       const receipt = computeReceipt(finalFareCents, 0);
 
       await prisma.booking.update({
@@ -353,7 +411,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
           baseAmountCents: receipt.baseAmountCents,
           discountCents: receipt.discountCents,
           finalAmountCents: receipt.finalAmountCents,
-        },
+        } as any,
       });
 
       return res.status(200).json({
@@ -367,7 +425,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       });
     }
 
-    // If CARD capture fails, your policy is: rider must pay CASH, NO DISCOUNT
     const cashNoDiscount = computeReceipt(finalFareCents, 0);
 
     await prisma.booking.update({
@@ -379,7 +436,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         baseAmountCents: cashNoDiscount.baseAmountCents,
         discountCents: cashNoDiscount.discountCents,
         finalAmountCents: cashNoDiscount.finalAmountCents,
-      },
+      } as any,
     });
 
     return res.status(200).json({
