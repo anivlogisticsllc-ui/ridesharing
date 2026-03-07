@@ -3,12 +3,19 @@ import { NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/pages/api/auth/[...nextauth]";
 import { prisma } from "@/lib/prisma";
-import { Prisma } from "@prisma/client";
+import {
+  MembershipStatus,
+  MembershipType,
+  Prisma,
+} from "@prisma/client";
 
 export const dynamic = "force-dynamic";
 
 function jsonError(status: number, error: string, details?: unknown) {
-  return NextResponse.json(details ? { ok: false, error, details } : { ok: false, error }, { status });
+  return NextResponse.json(
+    details ? { ok: false, error, details } : { ok: false, error },
+    { status }
+  );
 }
 
 async function requireAdmin() {
@@ -18,8 +25,13 @@ async function requireAdmin() {
   const role = (session?.user as any)?.role as string | undefined;
   const isAdminFlag = Boolean((session?.user as any)?.isAdmin);
 
-  if (!userId) return { ok: false as const, status: 401, error: "Not authenticated" };
-  if (role === "ADMIN" || isAdminFlag) return { ok: true as const };
+  if (!userId) {
+    return { ok: false as const, status: 401, error: "Not authenticated" };
+  }
+
+  if (role === "ADMIN" || isAdminFlag) {
+    return { ok: true as const };
+  }
 
   // Temporary DB grant: freeMembershipEndsAt in the future
   try {
@@ -27,7 +39,10 @@ async function requireAdmin() {
       where: { id: userId },
       select: { freeMembershipEndsAt: true },
     });
-    if (u?.freeMembershipEndsAt && u.freeMembershipEndsAt > new Date()) return { ok: true as const };
+
+    if (u?.freeMembershipEndsAt && u.freeMembershipEndsAt > new Date()) {
+      return { ok: true as const };
+    }
   } catch {
     // ignore
   }
@@ -36,7 +51,9 @@ async function requireAdmin() {
 }
 
 function isMissingColumnError(e: unknown) {
-  if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2022") return true;
+  if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2022") {
+    return true;
+  }
   const msg = String((e as any)?.message || "").toLowerCase();
   return msg.includes("does not exist") && msg.includes("column");
 }
@@ -63,6 +80,14 @@ function pickUserUpdate(body: any) {
   if (body.state !== undefined) data.state = body.state;
   if (body.postalCode !== undefined) data.postalCode = body.postalCode;
   if (body.country !== undefined) data.country = body.country;
+
+  // Legacy membership fields still supported for now
+  if (typeof body.membershipActive === "boolean") data.membershipActive = body.membershipActive;
+  if (body.membershipPlan !== undefined) data.membershipPlan = body.membershipPlan;
+  if (body.trialEndsAt !== undefined) {
+    const d = toDateOrNull(body.trialEndsAt);
+    if (d !== undefined) data.trialEndsAt = d;
+  }
 
   // Direct set/clear grant
   if (body.freeMembershipEndsAt !== undefined) {
@@ -158,10 +183,106 @@ const SELECT_WITH_GRANT = {
       updatedAt: true,
     },
   },
+  memberships: {
+    select: {
+      id: true,
+      type: true,
+      plan: true,
+      status: true,
+      amountPaidCents: true,
+      startDate: true,
+      expiryDate: true,
+      paymentProvider: true,
+      paymentRef: true,
+      createdAt: true,
+      updatedAt: true,
+    },
+    orderBy: { startDate: "desc" as const },
+    take: 10,
+  },
 } as const;
 
 const SELECT_NO_GRANT: any = { ...SELECT_WITH_GRANT };
 delete SELECT_NO_GRANT.freeMembershipEndsAt;
+
+function roleToMembershipType(role: string | null | undefined): MembershipType | null {
+  if (role === "RIDER") return MembershipType.RIDER;
+  if (role === "DRIVER") return MembershipType.DRIVER;
+  return null;
+}
+
+function hydrateUserForAdmin(rawUser: any) {
+  const now = new Date();
+  const expectedType = roleToMembershipType(rawUser?.role);
+
+  const relevantMemberships = Array.isArray(rawUser?.memberships)
+    ? rawUser.memberships.filter((m: any) => !expectedType || m.type === expectedType)
+    : [];
+
+  const latestMembership = relevantMemberships[0] ?? null;
+
+  const latestActive =
+    latestMembership &&
+    latestMembership.status === MembershipStatus.ACTIVE &&
+    latestMembership.expiryDate &&
+    new Date(latestMembership.expiryDate).getTime() > now.getTime();
+
+  const latestIsTrial =
+    Boolean(latestActive) &&
+    Number(latestMembership?.amountPaidCents ?? 0) === 0;
+
+  const computedMembership = latestMembership
+    ? {
+        source: "membership_table",
+        membershipId: latestMembership.id,
+        type: latestMembership.type,
+        plan: latestMembership.plan ?? null,
+        status: latestIsTrial
+          ? "TRIAL"
+          : latestActive
+          ? "ACTIVE"
+          : "EXPIRED",
+        active: Boolean(latestActive),
+        trialEndsAt: latestIsTrial
+          ? new Date(latestMembership.expiryDate).toISOString()
+          : null,
+        currentPeriodEnd: latestMembership.expiryDate
+          ? new Date(latestMembership.expiryDate).toISOString()
+          : null,
+        amountPaidCents: latestMembership.amountPaidCents ?? 0,
+        paymentProvider: latestMembership.paymentProvider ?? null,
+        paymentRef: latestMembership.paymentRef ?? null,
+      }
+    : {
+        source: "legacy_user_fields",
+        membershipId: null,
+        type: expectedType,
+        plan: rawUser.membershipPlan ?? null,
+        status:
+          rawUser.trialEndsAt && new Date(rawUser.trialEndsAt).getTime() > now.getTime()
+            ? "TRIAL"
+            : rawUser.membershipActive
+            ? "ACTIVE"
+            : "INACTIVE",
+        active: Boolean(rawUser.membershipActive),
+        trialEndsAt: rawUser.trialEndsAt
+          ? new Date(rawUser.trialEndsAt).toISOString()
+          : null,
+        currentPeriodEnd: null,
+        amountPaidCents: null,
+        paymentProvider: null,
+        paymentRef: null,
+      };
+
+  return {
+    ...rawUser,
+    // hydrate legacy fields from latest membership row when present
+    membershipActive: computedMembership.active,
+    membershipPlan: computedMembership.plan ?? rawUser.membershipPlan ?? null,
+    trialEndsAt: computedMembership.trialEndsAt,
+    computedMembership,
+  };
+}
 
 export async function GET(_req: Request, ctx: { params: Promise<{ id: string }> }) {
   const guard = await requireAdmin();
@@ -178,15 +299,24 @@ export async function GET(_req: Request, ctx: { params: Promise<{ id: string }> 
     });
 
     if (!user) return jsonError(404, "User not found");
-    return NextResponse.json({ ok: true, user });
+
+    return NextResponse.json({
+      ok: true,
+      user: hydrateUserForAdmin(user),
+    });
   } catch (e) {
     if (isMissingColumnError(e)) {
       const user = await prisma.user.findUnique({
         where: { id: userId },
         select: SELECT_NO_GRANT,
       });
+
       if (!user) return jsonError(404, "User not found");
-      return NextResponse.json({ ok: true, user });
+
+      return NextResponse.json({
+        ok: true,
+        user: hydrateUserForAdmin(user),
+      });
     }
 
     console.error("[admin users details]", e);
@@ -240,7 +370,10 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
       select: SELECT_WITH_GRANT as any,
     });
 
-    return NextResponse.json({ ok: true, user: updated });
+    return NextResponse.json({
+      ok: true,
+      user: hydrateUserForAdmin(updated),
+    });
   } catch (e) {
     if (isMissingColumnError(e)) {
       const updated = await prisma.user.update({
@@ -248,7 +381,11 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
         data: updateData,
         select: SELECT_NO_GRANT,
       });
-      return NextResponse.json({ ok: true, user: updated });
+
+      return NextResponse.json({
+        ok: true,
+        user: hydrateUserForAdmin(updated),
+      });
     }
 
     console.error("[admin users patch user]", e);

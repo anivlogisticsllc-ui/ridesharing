@@ -55,7 +55,6 @@ type UserDetails = {
   membershipActive: boolean;
   membershipPlan: string | null;
   trialEndsAt: string | null;
-
   freeMembershipEndsAt: string | null;
 
   createdAt: string | null;
@@ -67,7 +66,7 @@ type UserDetails = {
 type ApiOk = { ok: true; user: UserDetails };
 type ApiErr = { ok: false; error: string };
 
-const MEMBERSHIP_PLANS = ["STANDARD", "PREMIUM"] as const;
+const MEMBERSHIP_PLANS = ["STANDARD"] as const;
 
 function asRole(v: unknown): Role | null {
   return v === "RIDER" || v === "DRIVER" || v === "ADMIN" ? v : null;
@@ -128,6 +127,70 @@ function localInputToIso(local: string) {
   return d.toISOString();
 }
 
+function formatIsoShort(iso: string | null) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "—";
+  return d.toLocaleString();
+}
+
+function computeMembershipView(user: UserDetails) {
+  const now = Date.now();
+
+  const trialEndsAtMs = user.trialEndsAt ? Date.parse(user.trialEndsAt) : NaN;
+  const grantEndsAtMs = user.freeMembershipEndsAt ? Date.parse(user.freeMembershipEndsAt) : NaN;
+
+  const hasTrial = Number.isFinite(trialEndsAtMs) && trialEndsAtMs > now;
+  const hasGrant = Number.isFinite(grantEndsAtMs) && grantEndsAtMs > now;
+
+  if (hasTrial) {
+    return {
+      badge: "TRIAL",
+      summary: `Trial ends ${formatIsoShort(user.trialEndsAt)}`,
+      source: "trialEndsAt",
+    };
+  }
+
+  if (hasGrant) {
+    return {
+      badge: "ADMIN GRANT",
+      summary: `Grant ends ${formatIsoShort(user.freeMembershipEndsAt)}`,
+      source: "freeMembershipEndsAt",
+    };
+  }
+
+  if (user.membershipActive) {
+    return {
+      badge: "ACTIVE",
+      summary: `Active${user.membershipPlan ? ` • plan ${user.membershipPlan}` : ""}`,
+      source: "membershipActive",
+    };
+  }
+
+  return {
+    badge: "INACTIVE",
+    summary: "No active trial, grant, or paid membership indicated by current admin fields.",
+    source: "none",
+  };
+}
+
+function MembershipBadge({ value }: { value: string }) {
+  const cls =
+    value === "TRIAL"
+      ? "border-amber-200 bg-amber-50 text-amber-700"
+      : value === "ADMIN GRANT"
+      ? "border-sky-200 bg-sky-50 text-sky-700"
+      : value === "ACTIVE"
+      ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+      : "border-slate-200 bg-slate-50 text-slate-700";
+
+  return (
+    <span className={`inline-flex items-center rounded-full border px-2.5 py-1 text-xs font-medium ${cls}`}>
+      {value}
+    </span>
+  );
+}
+
 export default function AdminUserDetailsPage() {
   const router = useRouter();
   const params = useParams<{ id: string }>();
@@ -168,12 +231,15 @@ export default function AdminUserDetailsPage() {
     setError(null);
 
     try {
-      const res = await fetch(`/api/admin/users/${encodeURIComponent(id)}`, { cache: "no-store" });
+      const res = await fetch(`/api/admin/users/${encodeURIComponent(id)}`, {
+        cache: "no-store",
+      });
 
       if (res.status === 401) {
         router.replace(`/auth/login?callbackUrl=${callbackUrl}`);
         return;
       }
+
       if (res.status === 403) {
         setError("Forbidden");
         setUser(null);
@@ -209,8 +275,6 @@ export default function AdminUserDetailsPage() {
       return;
     }
 
-    // IMPORTANT: you now allow non-ADMIN via freeMembershipEndsAt / isAdmin flag at API level.
-    // So the page should NOT block here. Let the API enforce.
     if (!id) {
       setLoading(false);
       setError("Missing user id.");
@@ -244,9 +308,7 @@ export default function AdminUserDetailsPage() {
       const showDriverProfile = draft.role === "DRIVER" || !!draft.driverProfile;
 
       const updated = await patchDetails({
-        // Role: do NOT allow promoting to ADMIN via dropdown; only keep it if already admin
         role: draft.role,
-
         accountStatus: draft.accountStatus ?? undefined,
         isAdmin: draft.isAdmin,
 
@@ -262,7 +324,6 @@ export default function AdminUserDetailsPage() {
         postalCode: draft.postalCode,
         country: draft.country,
 
-        // Only send driverProfile if it should exist (prevents accidental upsert for riders)
         ...(showDriverProfile
           ? {
               driverProfile: {
@@ -302,6 +363,7 @@ export default function AdminUserDetailsPage() {
 
     setSaving(true);
     setError(null);
+
     try {
       const updated = await patchDetails({ grantDays: days });
       setUser(updated);
@@ -317,6 +379,7 @@ export default function AdminUserDetailsPage() {
   async function clearGrant() {
     setSaving(true);
     setError(null);
+
     try {
       const updated = await patchDetails({ freeMembershipEndsAt: null });
       setUser(updated);
@@ -329,6 +392,7 @@ export default function AdminUserDetailsPage() {
   }
 
   const showDriverProfile = !!draft && (draft.role === "DRIVER" || !!draft.driverProfile);
+  const membershipView = draft ? computeMembershipView(draft) : null;
 
   if (status === "loading") {
     return <main className="p-8 text-sm text-slate-600">Loading…</main>;
@@ -340,7 +404,7 @@ export default function AdminUserDetailsPage() {
         <header className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0">
             <h1 className="text-3xl font-semibold text-slate-900">User details</h1>
-            <p className="mt-1 text-sm text-slate-600 break-words">UserId: {id}</p>
+            <p className="mt-1 break-words text-sm text-slate-600">UserId: {id}</p>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
@@ -393,13 +457,13 @@ export default function AdminUserDetailsPage() {
 
               <div className="mt-4 grid gap-3 md:grid-cols-2">
                 <Field label="Email">
-                  <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm break-words">
+                  <div className="break-words rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm">
                     {draft.email}
                   </div>
                 </Field>
 
                 <Field label="Public ID (stable external reference)">
-                  <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm break-words">
+                  <div className="break-words rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm">
                     {fmt(draft.publicId)}
                   </div>
                 </Field>
@@ -472,9 +536,46 @@ export default function AdminUserDetailsPage() {
               </div>
             </section>
 
+            {/* Computed membership view */}
+            <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <h2 className="text-sm font-semibold text-slate-900">Computed membership view</h2>
+                  <p className="mt-1 text-xs text-slate-500">
+                    Trial is a state, not a plan. This section summarizes how the current admin fields would be interpreted.
+                  </p>
+                </div>
+
+                {membershipView ? <MembershipBadge value={membershipView.badge} /> : null}
+              </div>
+
+              <div className="mt-4 grid gap-3 md:grid-cols-3">
+                <Field label="Summary">
+                  <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-800">
+                    {membershipView?.summary ?? "—"}
+                  </div>
+                </Field>
+
+                <Field label="Source">
+                  <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-800">
+                    {membershipView?.source ?? "—"}
+                  </div>
+                </Field>
+
+                <Field label="Plan">
+                  <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-800">
+                    {fmt(draft.membershipPlan)}
+                  </div>
+                </Field>
+              </div>
+            </section>
+
             {/* Membership + Admin grant */}
             <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-              <h2 className="text-sm font-semibold text-slate-900">Membership & Admin grant</h2>
+              <h2 className="text-sm font-semibold text-slate-900">Membership fields & admin grant</h2>
+              <p className="mt-1 text-xs text-slate-500">
+                Plan should remain a tier like STANDARD. Trial and grant are time-based states.
+              </p>
 
               <div className="mt-4 grid gap-3 md:grid-cols-2">
                 <Field label="Membership active">
@@ -560,7 +661,7 @@ export default function AdminUserDetailsPage() {
               </div>
             </section>
 
-            {/* Driver profile (UI fix: only show for drivers or if it exists already) */}
+            {/* Driver profile */}
             {showDriverProfile ? (
               <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
                 <h2 className="text-sm font-semibold text-slate-900">Driver profile</h2>

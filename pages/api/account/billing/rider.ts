@@ -5,13 +5,15 @@ import { authOptions } from "../../auth/[...nextauth]";
 import { prisma } from "../../../../lib/prisma";
 import { BookingStatus, PaymentType, RideStatus } from "@prisma/client";
 
+type RiderPaymentType = "CARD" | "CASH" | "UNKNOWN";
+
 type RiderBillingRow = {
   id: string;
   createdAt: string;
   status: string;
   currency: string;
   amountCents: number;
-
+  paymentType: RiderPaymentType;
   ride: {
     id: string;
     departureTime: string | null;
@@ -19,7 +21,6 @@ type RiderBillingRow = {
     destinationCity: string | null;
     status: string | null;
   } | null;
-
   paymentMethod: {
     id: string;
     brand: string | null;
@@ -31,7 +32,14 @@ type RiderBillingRow = {
 };
 
 type RiderBillingResponse =
-  | { ok: true; payments: RiderBillingRow[] }
+  | {
+      ok: true;
+      payments: RiderBillingRow[];
+      summary: {
+        count: number;
+        totalAmountCents: number;
+      };
+    }
   | { ok: false; error: string };
 
 function toIso(d: Date | null | undefined) {
@@ -40,6 +48,18 @@ function toIso(d: Date | null | undefined) {
 
 function normalizeCurrency(v: string | null | undefined) {
   return (v || "USD").toUpperCase();
+}
+
+function derivePaymentType(args: {
+  paymentType: unknown;
+  hasPaymentMethod: boolean;
+  stripePaymentIntentId?: string | null;
+}): RiderPaymentType {
+  if (args.paymentType === PaymentType.CASH || args.paymentType === "CASH") return "CASH";
+  if (args.paymentType === PaymentType.CARD || args.paymentType === "CARD") return "CARD";
+  if (args.hasPaymentMethod) return "CARD";
+  if (args.stripePaymentIntentId) return "CARD";
+  return "UNKNOWN";
 }
 
 export default async function handler(
@@ -64,20 +84,12 @@ export default async function handler(
       return res.status(403).json({ ok: false, error: "Rider access only" });
     }
 
-    const take = Math.min(Number(req.query.take ?? 50) || 50, 200);
-    const cursor = typeof req.query.cursor === "string" ? req.query.cursor : null;
+    const take = Math.min(Number(req.query.take ?? 500) || 500, 1000);
 
-    // Primary source: RidePayment rows
-    const payments = await prisma.ridePayment.findMany({
+    const ridePayments = await prisma.ridePayment.findMany({
       where: { riderId: userId },
       orderBy: { createdAt: "desc" },
       take,
-      ...(cursor
-        ? {
-            cursor: { id: cursor },
-            skip: 1,
-          }
-        : {}),
       include: {
         ride: {
           select: {
@@ -101,15 +113,20 @@ export default async function handler(
       },
     });
 
-    const mappedPayments: RiderBillingRow[] = payments.map((p) => ({
+    const mappedPayments: RiderBillingRow[] = ridePayments.map((p) => ({
       id: p.id,
       createdAt: p.createdAt.toISOString(),
-      status: String(p.status),
+      status: String(p.status || "").toUpperCase(),
       currency: normalizeCurrency(p.currency),
       amountCents:
         typeof p.finalAmountCents === "number" && p.finalAmountCents > 0
           ? p.finalAmountCents
           : p.amountCents,
+      paymentType: derivePaymentType({
+        paymentType: p.paymentType,
+        hasPaymentMethod: Boolean(p.paymentMethod),
+        stripePaymentIntentId: p.stripePaymentIntentId,
+      }),
       ride: p.ride
         ? {
             id: p.ride.id,
@@ -131,9 +148,6 @@ export default async function handler(
         : null,
     }));
 
-    // Fallback source:
-    // completed bookings for rides that have no RidePayment row yet.
-    // This makes billing history usable even for older rides created before RidePayment rows were written consistently.
     const rideIdsWithPayments = new Set(
       mappedPayments.map((p) => p.ride?.id).filter((v): v is string => Boolean(v))
     );
@@ -142,9 +156,7 @@ export default async function handler(
       where: {
         riderId: userId,
         status: BookingStatus.COMPLETED,
-        ride: {
-          status: RideStatus.COMPLETED,
-        },
+        ride: { status: RideStatus.COMPLETED },
       },
       orderBy: { updatedAt: "desc" },
       take,
@@ -163,38 +175,56 @@ export default async function handler(
 
     const fallbackRows: RiderBillingRow[] = completedBookings
       .filter((b) => b.ride && !rideIdsWithPayments.has(b.ride.id))
-      .map((b) => ({
-        id: `booking_${b.id}`,
-        createdAt: b.updatedAt.toISOString(),
-        status:
+      .map((b): RiderBillingRow => {
+        const paymentType: RiderPaymentType =
           b.paymentType === PaymentType.CASH
-            ? "SUCCEEDED"
-            : "COMPLETED",
-        currency: normalizeCurrency(b.currency),
-        amountCents:
+            ? "CASH"
+            : b.paymentType === PaymentType.CARD
+            ? "CARD"
+            : "UNKNOWN";
+
+        const amountCents =
           typeof b.finalAmountCents === "number" && b.finalAmountCents > 0
             ? b.finalAmountCents
             : typeof b.baseAmountCents === "number" && b.baseAmountCents > 0
             ? b.baseAmountCents
-            : 0,
-        ride: b.ride
-          ? {
-              id: b.ride.id,
-              departureTime: toIso(b.ride.departureTime as any),
-              originCity: (b.ride as any).originCity ?? null,
-              destinationCity: (b.ride as any).destinationCity ?? null,
-              status: (b.ride as any).status ?? null,
-            }
-          : null,
-        paymentMethod: null,
-      }))
+            : 0;
+
+        return {
+          id: `booking_${b.id}`,
+          createdAt: b.updatedAt.toISOString(),
+          status: "COMPLETED",
+          currency: normalizeCurrency(b.currency),
+          amountCents,
+          paymentType,
+          ride: b.ride
+            ? {
+                id: b.ride.id,
+                departureTime: toIso(b.ride.departureTime as any),
+                originCity: (b.ride as any).originCity ?? null,
+                destinationCity: (b.ride as any).destinationCity ?? null,
+                status: (b.ride as any).status ?? null,
+              }
+            : null,
+          paymentMethod: null,
+        };
+      })
       .filter((row) => row.amountCents > 0);
 
-    const all = [...mappedPayments, ...fallbackRows].sort((a, b) => {
-      return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
-    });
+    const all = [...mappedPayments, ...fallbackRows].sort(
+      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    );
 
-    return res.status(200).json({ ok: true, payments: all.slice(0, take) });
+    const totalAmountCents = all.reduce((sum, p) => sum + (p.amountCents || 0), 0);
+
+    return res.status(200).json({
+      ok: true,
+      payments: all,
+      summary: {
+        count: all.length,
+        totalAmountCents,
+      },
+    });
   } catch (err: any) {
     console.error("Rider billing API error:", err);
     return res.status(500).json({

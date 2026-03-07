@@ -17,6 +17,7 @@ type RiderPayment = {
   status: string;
   currency: string;
   amountCents: number;
+  paymentType: "CARD" | "CASH" | "UNKNOWN";
   ride?: {
     id: string;
     departureTime: string | null;
@@ -43,7 +44,14 @@ type DriverPayout = {
 };
 
 type RiderApiResponse =
-  | { ok: true; payments: RiderPayment[] }
+  | {
+      ok: true;
+      payments: RiderPayment[];
+      summary: {
+        count: number;
+        totalAmountCents: number;
+      };
+    }
   | { ok: false; error: string };
 
 type DriverApiResponse =
@@ -77,6 +85,10 @@ type MeApiResponse =
     }
   | { ok: false; error: string };
 
+type RiderRange = "7d" | "30d" | "this_month" | "all" | "custom";
+type RiderStatusFilter = "all" | "succeeded" | "completed" | "failed" | "refunded" | "pending";
+type RiderMethodFilter = "all" | "card" | "cash" | "unknown";
+
 function money(cents: number, currency: string) {
   const c = (currency || "USD").toUpperCase();
   const amount = (Number.isFinite(cents) ? cents : 0) / 100;
@@ -89,8 +101,12 @@ function money(cents: number, currency: string) {
 }
 
 function methodLabel(p: RiderPayment) {
+  if (p.paymentType === "CASH") return "CASH";
+  if (p.paymentType === "CARD" && !p.paymentMethod) return "CARD";
+
   const m = p.paymentMethod;
   if (!m) return "—";
+
   const brand = (m.brand || m.provider || "").toUpperCase();
   const last4 = m.last4 ? `•••• ${m.last4}` : "";
   const exp =
@@ -109,7 +125,7 @@ function routeLabel(p: RiderPayment) {
 function statusPill(status: string) {
   const s = String(status || "").toUpperCase();
   const isGood = ["SUCCEEDED", "PAID", "COMPLETED"].includes(s);
-  const isBad = ["FAILED", "CANCELED", "CANCELLED"].includes(s);
+  const isBad = ["FAILED", "CANCELED", "CANCELLED", "REFUNDED"].includes(s);
 
   const cls = isGood
     ? "bg-emerald-50 text-emerald-700 ring-1 ring-emerald-200"
@@ -164,6 +180,97 @@ function badge(tone: "good" | "warn" | "bad", text: string) {
   );
 }
 
+function yyyyMmDd(d: Date) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function parseDateInput(v: string) {
+  if (!v) return null;
+  const d = new Date(v);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function matchesRange(rowDate: Date, range: RiderRange, from: string, to: string) {
+  const today = new Date();
+  const startToday = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+
+  if (range === "all") return true;
+
+  if (range === "7d") {
+    const start = new Date(startToday);
+    start.setDate(start.getDate() - 6);
+    return rowDate >= start;
+  }
+
+  if (range === "30d") {
+    const start = new Date(startToday);
+    start.setDate(start.getDate() - 29);
+    return rowDate >= start;
+  }
+
+  if (range === "this_month") {
+    const start = new Date(today.getFullYear(), today.getMonth(), 1);
+    return rowDate >= start;
+  }
+
+  if (range === "custom") {
+    const fromDate = parseDateInput(from);
+    const toDate = parseDateInput(to);
+
+    if (fromDate) fromDate.setHours(0, 0, 0, 0);
+    if (toDate) toDate.setHours(23, 59, 59, 999);
+
+    if (fromDate && rowDate < fromDate) return false;
+    if (toDate && rowDate > toDate) return false;
+    return true;
+  }
+
+  return true;
+}
+
+function matchesStatus(status: string, filter: RiderStatusFilter) {
+  const s = String(status || "").toUpperCase();
+
+  if (filter === "all") return true;
+  if (filter === "succeeded") return s === "SUCCEEDED";
+  if (filter === "completed") return s === "COMPLETED";
+  if (filter === "failed") return s === "FAILED";
+  if (filter === "refunded") return s === "REFUNDED";
+  if (filter === "pending") return s === "PENDING" || s === "AUTHORIZED";
+
+  return true;
+}
+
+function matchesMethod(paymentType: RiderPayment["paymentType"], filter: RiderMethodFilter) {
+  if (filter === "all") return true;
+  if (filter === "card") return paymentType === "CARD";
+  if (filter === "cash") return paymentType === "CASH";
+  if (filter === "unknown") return paymentType === "UNKNOWN";
+  return true;
+}
+
+function matchesQuery(p: RiderPayment, q: string) {
+  const s = q.trim().toLowerCase();
+  if (!s) return true;
+
+  const hay = [
+    p.ride?.originCity || "",
+    p.ride?.destinationCity || "",
+    p.ride?.id || "",
+    p.status || "",
+    p.paymentType || "",
+    p.paymentMethod?.brand || "",
+    p.paymentMethod?.last4 || "",
+  ]
+    .join(" ")
+    .toLowerCase();
+
+  return hay.includes(s);
+}
+
 export default function AccountBillingPage() {
   const router = useRouter();
   const { data: session, status } = useSession();
@@ -177,12 +284,20 @@ export default function AccountBillingPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const [riderPayments, setRiderPayments] = useState<RiderPayment[]>([]);
+  const [allRiderPayments, setAllRiderPayments] = useState<RiderPayment[]>([]);
+
   const [driverPayouts, setDriverPayouts] = useState<DriverPayout[]>([]);
   const [serviceFeeTotal, setServiceFeeTotal] = useState<number>(0);
   const [serviceFeeCount, setServiceFeeCount] = useState<number>(0);
 
   const [meMembership, setMeMembership] = useState<MeApiResponse extends { ok: true } ? any : any>(null);
+
+  const [range, setRange] = useState<RiderRange>("30d");
+  const [statusFilter, setStatusFilter] = useState<RiderStatusFilter>("all");
+  const [methodFilter, setMethodFilter] = useState<RiderMethodFilter>("all");
+  const [q, setQ] = useState("");
+  const [from, setFrom] = useState(() => yyyyMmDd(new Date(new Date().setDate(new Date().getDate() - 29))));
+  const [to, setTo] = useState(() => yyyyMmDd(new Date()));
 
   const callbackUrl = useMemo(() => "/account/billing", []);
 
@@ -206,7 +321,6 @@ export default function AccountBillingPage() {
         setLoading(true);
         setError(null);
 
-        // Membership status (for CTA)
         const meRes = await fetch("/api/auth/me", { cache: "no-store" });
         const meJson = (await meRes.json().catch(() => null)) as MeApiResponse | null;
         if (meRes.ok && meJson && "ok" in meJson && meJson.ok) {
@@ -215,19 +329,23 @@ export default function AccountBillingPage() {
           if (!cancelled) setMeMembership(null);
         }
 
-        // Rider payments
         if (showRider || showBothSections) {
-          const res = await fetch("/api/account/billing/rider", { cache: "no-store" });
+          const res = await fetch("/api/account/billing/rider?take=1000", {
+            cache: "no-store",
+          });
+
           const json = (await res.json().catch(() => null)) as RiderApiResponse | null;
           if (!res.ok || !json || !("ok" in json) || !json.ok) {
             throw new Error((json as any)?.error || "Failed to load rider billing");
           }
-          if (!cancelled) setRiderPayments(json.payments || []);
+
+          if (!cancelled) {
+            setAllRiderPayments(json.payments || []);
+          }
         } else if (!cancelled) {
-          setRiderPayments([]);
+          setAllRiderPayments([]);
         }
 
-        // Driver payouts / fees
         if (showDriver || showBothSections) {
           const res = await fetch("/api/account/billing/driver", { cache: "no-store" });
           const json = (await res.json().catch(() => null)) as DriverApiResponse | null;
@@ -258,11 +376,33 @@ export default function AccountBillingPage() {
     };
   }, [session, status, role, router, callbackUrl, showRider, showDriver, showBothSections]);
 
+  const visibleRiderPayments = useMemo(() => {
+    return allRiderPayments.filter((p) => {
+      const rowDate = new Date(p.createdAt);
+      if (Number.isNaN(rowDate.getTime())) return false;
+
+      if (!matchesRange(rowDate, range, from, to)) return false;
+      if (!matchesStatus(p.status, statusFilter)) return false;
+      if (!matchesMethod(p.paymentType, methodFilter)) return false;
+      if (!matchesQuery(p, q)) return false;
+
+      return true;
+    });
+  }, [allRiderPayments, range, from, to, statusFilter, methodFilter, q]);
+
+  const riderSummary = useMemo(() => {
+    const totalAmountCents = visibleRiderPayments.reduce((sum, p) => sum + (p.amountCents || 0), 0);
+    return {
+      count: visibleRiderPayments.length,
+      totalAmountCents,
+    };
+  }, [visibleRiderPayments]);
+
   const m = membershipUi(meMembership);
 
   return (
     <main className="min-h-[calc(100vh-4rem)] bg-slate-50">
-      <div className="mx-auto max-w-5xl space-y-6 px-4 py-10">
+      <div className="mx-auto max-w-6xl space-y-6 px-4 py-10">
         <header className="space-y-2">
           <h1 className="text-2xl font-semibold text-slate-900">Account billing</h1>
           <p className="text-sm text-slate-600">
@@ -296,14 +436,11 @@ export default function AccountBillingPage() {
           </div>
         ) : (
           <>
-            {/* Membership + Cards (top-level actions) */}
             <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
               <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                 <div>
                   <h2 className="text-sm font-semibold text-slate-900">Membership</h2>
-                  <p className="mt-1 text-sm text-slate-600">
-                    Status: {badge(m.tone, m.label)}
-                  </p>
+                  <p className="mt-1 text-sm text-slate-600">Status: {badge(m.tone, m.label)}</p>
                   <p className="mt-2 text-xs text-slate-500">
                     If your membership is expired, you won’t be able to request rides until you activate a plan.
                   </p>
@@ -328,14 +465,162 @@ export default function AccountBillingPage() {
             </section>
 
             {(showRider || showBothSections) && (
-              <section className="space-y-3 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+              <section className="space-y-4 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
                 <div>
                   <h2 className="text-sm font-semibold text-slate-900">Ride payments</h2>
                   <p className="text-xs text-slate-500">Your recent ride charges.</p>
                 </div>
 
-                {riderPayments.length === 0 ? (
-                  <p className="text-sm text-slate-500">No ride payments yet.</p>
+                <div className="grid gap-3 lg:grid-cols-4">
+                  <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
+                    <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Rides shown</p>
+                    <p className="mt-2 text-xl font-semibold text-slate-900">{riderSummary.count}</p>
+                  </div>
+
+                  <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
+                    <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Total amount</p>
+                    <p className="mt-2 text-xl font-semibold text-slate-900">
+                      {money(riderSummary.totalAmountCents, "USD")}
+                    </p>
+                  </div>
+
+                  <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
+                    <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Average ride</p>
+                    <p className="mt-2 text-xl font-semibold text-slate-900">
+                      {riderSummary.count > 0
+                        ? money(Math.round(riderSummary.totalAmountCents / riderSummary.count), "USD")
+                        : money(0, "USD")}
+                    </p>
+                  </div>
+
+                  <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
+                    <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Filter scope</p>
+                    <p className="mt-2 text-sm font-medium text-slate-900">
+                      {range === "7d"
+                        ? "Last 7 days"
+                        : range === "30d"
+                        ? "Last 30 days"
+                        : range === "this_month"
+                        ? "This month"
+                        : range === "custom"
+                        ? "Custom"
+                        : "All time"}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
+                  <div>
+                    <label className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-slate-500">
+                      Date range
+                    </label>
+                    <select
+                      value={range}
+                      onChange={(e) => setRange(e.target.value as RiderRange)}
+                      className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                    >
+                      <option value="7d">Last 7 days</option>
+                      <option value="30d">Last 30 days</option>
+                      <option value="this_month">This month</option>
+                      <option value="all">All time</option>
+                      <option value="custom">Custom</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-slate-500">
+                      Status
+                    </label>
+                    <select
+                      value={statusFilter}
+                      onChange={(e) => setStatusFilter(e.target.value as RiderStatusFilter)}
+                      className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                    >
+                      <option value="all">All</option>
+                      <option value="succeeded">Succeeded</option>
+                      <option value="completed">Completed</option>
+                      <option value="failed">Failed</option>
+                      <option value="refunded">Refunded</option>
+                      <option value="pending">Pending</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-slate-500">
+                      Method
+                    </label>
+                    <select
+                      value={methodFilter}
+                      onChange={(e) => setMethodFilter(e.target.value as RiderMethodFilter)}
+                      className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                    >
+                      <option value="all">All</option>
+                      <option value="card">Card</option>
+                      <option value="cash">Cash</option>
+                      <option value="unknown">Unknown</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-slate-500">
+                      Search route
+                    </label>
+                    <input
+                      value={q}
+                      onChange={(e) => setQ(e.target.value)}
+                      placeholder="City, route, last4..."
+                      className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                    />
+                  </div>
+
+                  <div className="flex items-end">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setRange("30d");
+                        setStatusFilter("all");
+                        setMethodFilter("all");
+                        setQ("");
+                        setFrom(yyyyMmDd(new Date(new Date().setDate(new Date().getDate() - 29))));
+                        setTo(yyyyMmDd(new Date()));
+                      }}
+                      className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
+                    >
+                      Reset filters
+                    </button>
+                  </div>
+                </div>
+
+                {range === "custom" ? (
+                  <div className="grid gap-3 md:grid-cols-2">
+                    <div>
+                      <label className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-slate-500">
+                        From
+                      </label>
+                      <input
+                        type="date"
+                        value={from}
+                        onChange={(e) => setFrom(e.target.value)}
+                        className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-slate-500">
+                        To
+                      </label>
+                      <input
+                        type="date"
+                        value={to}
+                        onChange={(e) => setTo(e.target.value)}
+                        className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                      />
+                    </div>
+                  </div>
+                ) : null}
+
+                {visibleRiderPayments.length === 0 ? (
+                  <p className="text-sm text-slate-500">No ride payments match the current filters.</p>
                 ) : (
                   <div className="overflow-hidden rounded-xl border border-slate-200">
                     <div className="overflow-auto">
@@ -350,7 +635,7 @@ export default function AccountBillingPage() {
                           </tr>
                         </thead>
                         <tbody>
-                          {riderPayments.map((p) => (
+                          {visibleRiderPayments.map((p) => (
                             <tr key={p.id} className="border-t border-slate-100">
                               <td className="px-4 py-2 text-slate-700">
                                 {new Date(p.createdAt).toLocaleDateString()}
@@ -363,6 +648,18 @@ export default function AccountBillingPage() {
                               </td>
                             </tr>
                           ))}
+
+                          <tr className="border-t-2 border-slate-200 bg-slate-50">
+                            <td className="px-4 py-3 text-slate-500" colSpan={4}>
+                              <span className="font-semibold text-slate-800">Total</span>
+                              <span className="ml-2 text-xs">
+                                ({riderSummary.count} {riderSummary.count === 1 ? "ride" : "rides"})
+                              </span>
+                            </td>
+                            <td className="px-4 py-3 text-right font-semibold text-slate-900">
+                              {money(riderSummary.totalAmountCents, "USD")}
+                            </td>
+                          </tr>
                         </tbody>
                       </table>
                     </div>

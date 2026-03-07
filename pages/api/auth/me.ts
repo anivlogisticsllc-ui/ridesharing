@@ -84,11 +84,8 @@ function emptyMembership(): MembershipSummary {
 }
 
 /**
- * Ensures a trial membership exists for verified users (self-healing).
- * Devil’s advocate guard: only auto-create for RIDER/DRIVER, never ADMIN.
- *
- * If you want to require onboardingCompleted before trial creation,
- * add: if (!user.onboardingCompleted) return null;
+ * Self-heal trial membership for verified RIDER/DRIVER users.
+ * This keeps membership-table as the source of truth.
  */
 async function ensureTrialMembership(params: {
   userId: string;
@@ -101,11 +98,7 @@ async function ensureTrialMembership(params: {
   const type = roleToMembershipType(role);
   if (!type) return null;
 
-  // Only create after email verification (matches your stated rule)
   if (!emailVerified) return null;
-
-  // Optional stricter guard (uncomment if desired):
-  // if (!params.onboardingCompleted) return null;
 
   const existing = await prisma.membership.findFirst({
     where: { userId, type },
@@ -131,6 +124,44 @@ async function ensureTrialMembership(params: {
   });
 
   return true;
+}
+
+function buildMembershipSummary(latest: {
+  plan: MembershipPlan | null;
+  amountPaidCents: number;
+  expiryDate: Date;
+  status: MembershipStatus;
+} | null): MembershipSummary {
+  if (!latest) return emptyMembership();
+
+  const nowMs = Date.now();
+  const periodEndIso = toIso(latest.expiryDate);
+  const isActiveByDate = latest.expiryDate.getTime() > nowMs;
+  const isActive = isActiveByDate && latest.status === MembershipStatus.ACTIVE;
+  const isTrial = isActive && (latest.amountPaidCents ?? 0) === 0;
+  const isPaid = isActive && !isTrial;
+
+  if (!isActive) {
+    return {
+      plan: latest.plan ?? null,
+      kind: "NONE",
+      status: "expired",
+      active: false,
+      trialEndsAt: null,
+      currentPeriodEnd: periodEndIso,
+      cancelAtPeriodEnd: false,
+    };
+  }
+
+  return {
+    plan: latest.plan ?? null,
+    kind: isPaid ? "PAID" : "TRIAL",
+    status: isPaid ? "active" : "trialing",
+    active: true,
+    trialEndsAt: isTrial ? periodEndIso : null,
+    currentPeriodEnd: periodEndIso,
+    cancelAtPeriodEnd: false,
+  };
 }
 
 export default async function handler(
@@ -167,7 +198,6 @@ export default async function handler(
 
     if (!user) return res.status(404).json({ ok: false, error: "User not found" });
 
-    // Ensure membership exists for verified users
     await withRetry(() =>
       ensureTrialMembership({
         userId: user.id,
@@ -179,7 +209,6 @@ export default async function handler(
 
     const expectedType = roleToMembershipType(user.role);
 
-    // ADMIN: user info + no membership
     if (!expectedType) {
       return res.status(200).json({
         ok: true,
@@ -200,7 +229,6 @@ export default async function handler(
         where: { userId: user.id, type: expectedType },
         orderBy: { startDate: "desc" },
         select: {
-          id: true,
           plan: true,
           amountPaidCents: true,
           expiryDate: true,
@@ -208,51 +236,6 @@ export default async function handler(
         },
       })
     );
-
-    if (!latest) {
-      return res.status(200).json({
-        ok: true,
-        user: {
-          id: user.id,
-          name: user.name,
-          email: user.email,
-          role: user.role,
-          onboardingCompleted: user.onboardingCompleted,
-          emailVerified: user.emailVerified,
-        },
-        membership: emptyMembership(),
-      });
-    }
-
-    const nowMs = Date.now();
-    const periodEndIso = toIso(latest.expiryDate);
-    const isActiveByDate = latest.expiryDate.getTime() > nowMs;
-    const paid = (latest.amountPaidCents ?? 0) > 0;
-
-    if (!isActiveByDate || latest.status !== MembershipStatus.ACTIVE) {
-      return res.status(200).json({
-        ok: true,
-        user: {
-          id: user.id,
-          name: user.name,
-          email: user.email,
-          role: user.role,
-          onboardingCompleted: user.onboardingCompleted,
-          emailVerified: user.emailVerified,
-        },
-        membership: {
-          plan: latest.plan ?? null,
-          kind: "NONE",
-          status: "expired",
-          active: false,
-          trialEndsAt: null,
-          currentPeriodEnd: periodEndIso,
-          cancelAtPeriodEnd: false,
-        },
-      });
-    }
-
-    const kind: MembershipSummary["kind"] = paid ? "PAID" : "TRIAL";
 
     return res.status(200).json({
       ok: true,
@@ -264,15 +247,7 @@ export default async function handler(
         onboardingCompleted: user.onboardingCompleted,
         emailVerified: user.emailVerified,
       },
-      membership: {
-        plan: latest.plan ?? null,
-        kind,
-        status: paid ? "active" : "trialing",
-        active: true,
-        trialEndsAt: paid ? null : periodEndIso,
-        currentPeriodEnd: periodEndIso,
-        cancelAtPeriodEnd: false,
-      },
+      membership: buildMembershipSummary(latest),
     });
   } catch (err: any) {
     console.error("GET /api/auth/me failed:", err?.message || err);
