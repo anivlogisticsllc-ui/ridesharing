@@ -1,4 +1,3 @@
-// app/account/billing/page.tsx
 "use client";
 
 import Link from "next/link";
@@ -7,6 +6,7 @@ import { useRouter } from "next/navigation";
 import { useSession } from "next-auth/react";
 
 type Role = "RIDER" | "DRIVER" | "ADMIN";
+
 function asRole(v: unknown): Role | null {
   return v === "RIDER" || v === "DRIVER" || v === "ADMIN" ? v : null;
 }
@@ -43,6 +43,33 @@ type DriverPayout = {
   createdAt: string;
 };
 
+type DriverTransaction = {
+  id: string;
+  rideId: string;
+  createdAt: string;
+  status: string;
+  grossAmountCents: number;
+  serviceFeeCents: number;
+  netAmountCents: number;
+  ride: {
+    id: string;
+    departureTime: string | null;
+    originCity: string | null;
+    destinationCity: string | null;
+    status: string | null;
+  } | null;
+};
+
+type DriverMembershipCharge = {
+  id: string;
+  amountCents: number;
+  currency: string;
+  status: string;
+  createdAt: string;
+  paidAt: string | null;
+  failedAt: string | null;
+};
+
 type RiderApiResponse =
   | {
       ok: true;
@@ -58,7 +85,21 @@ type DriverApiResponse =
   | {
       ok: true;
       payouts: DriverPayout[];
-      serviceFees?: { totalFeesCents?: number; rideCount?: number };
+      serviceFees: {
+        totalFeesCents: number;
+        currency: string;
+        rideCount: number;
+      };
+      earningsSummary: {
+        grossAmountCents: number;
+        serviceFeeCents: number;
+        netAmountCents: number;
+        pendingNetAmountCents: number;
+        paidNetAmountCents: number;
+        rideCount: number;
+      };
+      transactions: DriverTransaction[];
+      membershipCharges: DriverMembershipCharge[];
     }
   | { ok: false; error: string };
 
@@ -85,16 +126,22 @@ type MeApiResponse =
     }
   | { ok: false; error: string };
 
-type RiderRange = "7d" | "30d" | "this_month" | "all" | "custom";
+type RiderRange = "today" | "yesterday" | "7d" | "30d" | "this_month" | "all" | "custom";
 type RiderStatusFilter = "all" | "succeeded" | "completed" | "failed" | "refunded" | "pending";
 type RiderMethodFilter = "all" | "card" | "cash" | "unknown";
+
+type DriverRange = "today" | "yesterday" | "7d" | "30d" | "this_month" | "all" | "custom";
+type DriverStatusFilter = "all" | "completed" | "pending" | "failed" | "paid";
 
 function money(cents: number, currency: string) {
   const c = (currency || "USD").toUpperCase();
   const amount = (Number.isFinite(cents) ? cents : 0) / 100;
 
   try {
-    return new Intl.NumberFormat(undefined, { style: "currency", currency: c }).format(amount);
+    return new Intl.NumberFormat(undefined, {
+      style: "currency",
+      currency: c,
+    }).format(amount);
   } catch {
     return `${amount.toFixed(2)} ${c}`;
   }
@@ -113,19 +160,26 @@ function methodLabel(p: RiderPayment) {
     m.expMonth && m.expYear
       ? `Exp ${String(m.expMonth).padStart(2, "0")}/${String(m.expYear).slice(-2)}`
       : "";
+
   return [brand, last4, exp].filter(Boolean).join(" ");
 }
 
-function routeLabel(p: RiderPayment) {
+function riderRouteLabel(p: RiderPayment) {
   const from = p.ride?.originCity?.trim() || "Unknown";
   const to = p.ride?.destinationCity?.trim() || "Unknown";
   return `${from} → ${to}`;
 }
 
+function driverRouteLabel(t: DriverTransaction) {
+  const from = t.ride?.originCity?.trim() || "Unknown";
+  const to = t.ride?.destinationCity?.trim() || "Unknown";
+  return `${from} → ${to}`;
+}
+
 function statusPill(status: string) {
   const s = String(status || "").toUpperCase();
-  const isGood = ["SUCCEEDED", "PAID", "COMPLETED"].includes(s);
-  const isBad = ["FAILED", "CANCELED", "CANCELLED", "REFUNDED"].includes(s);
+  const isGood = ["SUCCEEDED", "PAID", "COMPLETED", "ACTIVE"].includes(s);
+  const isBad = ["FAILED", "CANCELED", "CANCELLED", "REFUNDED", "EXPIRED"].includes(s);
 
   const cls = isGood
     ? "bg-emerald-50 text-emerald-700 ring-1 ring-emerald-200"
@@ -140,12 +194,15 @@ function statusPill(status: string) {
   );
 }
 
-function membershipUi(m: MeApiResponse extends { ok: true } ? MeApiResponse["membership"] : any) {
+function membershipUi(
+  m: MeApiResponse extends { ok: true } ? MeApiResponse["membership"] : any
+) {
   const status = m?.status || "none";
 
   if (status === "active") {
     return { label: "Active", tone: "good" as const, cta: "Manage membership" };
   }
+
   if (status === "trialing") {
     const ends = m?.trialEndsAt ? new Date(m.trialEndsAt).toLocaleDateString() : null;
     return {
@@ -154,6 +211,7 @@ function membershipUi(m: MeApiResponse extends { ok: true } ? MeApiResponse["mem
       cta: "Manage membership",
     };
   }
+
   if (status === "expired") {
     const ended = m?.currentPeriodEnd ? new Date(m.currentPeriodEnd).toLocaleDateString() : null;
     return {
@@ -162,6 +220,7 @@ function membershipUi(m: MeApiResponse extends { ok: true } ? MeApiResponse["mem
       cta: "Activate membership",
     };
   }
+
   return { label: "Not active", tone: "warn" as const, cta: "Activate membership" };
 }
 
@@ -189,49 +248,68 @@ function yyyyMmDd(d: Date) {
 
 function parseDateInput(v: string) {
   if (!v) return null;
-  const d = new Date(v);
+
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(v);
+  if (!m) return null;
+
+  const year = Number(m[1]);
+  const month = Number(m[2]);
+  const day = Number(m[3]);
+
+  const d = new Date(year, month - 1, day);
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
-function matchesRange(rowDate: Date, range: RiderRange, from: string, to: string) {
+function matchesRange(rowDate: Date, range: RiderRange | DriverRange, from: string, to: string) {
+  const row = new Date(rowDate);
+  row.setHours(0, 0, 0, 0);
+
   const today = new Date();
   const startToday = new Date(today.getFullYear(), today.getMonth(), today.getDate());
 
   if (range === "all") return true;
 
+  if (range === "today") {
+    return row.getTime() === startToday.getTime();
+  }
+
+  if (range === "yesterday") {
+    const yesterday = new Date(startToday);
+    yesterday.setDate(yesterday.getDate() - 1);
+    return row.getTime() === yesterday.getTime();
+  }
+
   if (range === "7d") {
     const start = new Date(startToday);
     start.setDate(start.getDate() - 6);
-    return rowDate >= start;
+    return row >= start;
   }
 
   if (range === "30d") {
     const start = new Date(startToday);
     start.setDate(start.getDate() - 29);
-    return rowDate >= start;
+    return row >= start;
   }
 
   if (range === "this_month") {
     const start = new Date(today.getFullYear(), today.getMonth(), 1);
-    return rowDate >= start;
+    return row >= start;
   }
 
   if (range === "custom") {
     const fromDate = parseDateInput(from);
     const toDate = parseDateInput(to);
 
-    if (fromDate) fromDate.setHours(0, 0, 0, 0);
-    if (toDate) toDate.setHours(23, 59, 59, 999);
+    if (fromDate && row < fromDate) return false;
+    if (toDate && row > toDate) return false;
 
-    if (fromDate && rowDate < fromDate) return false;
-    if (toDate && rowDate > toDate) return false;
     return true;
   }
 
   return true;
 }
 
-function matchesStatus(status: string, filter: RiderStatusFilter) {
+function matchesRiderStatus(status: string, filter: RiderStatusFilter) {
   const s = String(status || "").toUpperCase();
 
   if (filter === "all") return true;
@@ -244,6 +322,18 @@ function matchesStatus(status: string, filter: RiderStatusFilter) {
   return true;
 }
 
+function matchesDriverStatus(status: string, filter: DriverStatusFilter) {
+  const s = String(status || "").toUpperCase();
+
+  if (filter === "all") return true;
+  if (filter === "completed") return s === "COMPLETED";
+  if (filter === "pending") return s === "PENDING" || s === "AUTHORIZED";
+  if (filter === "failed") return s === "FAILED";
+  if (filter === "paid") return s === "PAID" || s === "SUCCEEDED";
+
+  return true;
+}
+
 function matchesMethod(paymentType: RiderPayment["paymentType"], filter: RiderMethodFilter) {
   if (filter === "all") return true;
   if (filter === "card") return paymentType === "CARD";
@@ -252,7 +342,7 @@ function matchesMethod(paymentType: RiderPayment["paymentType"], filter: RiderMe
   return true;
 }
 
-function matchesQuery(p: RiderPayment, q: string) {
+function matchesRiderQuery(p: RiderPayment, q: string) {
   const s = q.trim().toLowerCase();
   if (!s) return true;
 
@@ -264,6 +354,23 @@ function matchesQuery(p: RiderPayment, q: string) {
     p.paymentType || "",
     p.paymentMethod?.brand || "",
     p.paymentMethod?.last4 || "",
+  ]
+    .join(" ")
+    .toLowerCase();
+
+  return hay.includes(s);
+}
+
+function matchesDriverQuery(t: DriverTransaction, q: string) {
+  const s = q.trim().toLowerCase();
+  if (!s) return true;
+
+  const hay = [
+    t.ride?.originCity || "",
+    t.ride?.destinationCity || "",
+    t.ride?.id || "",
+    t.rideId || "",
+    t.status || "",
   ]
     .join(" ")
     .toLowerCase();
@@ -285,19 +392,25 @@ export default function AccountBillingPage() {
   const [error, setError] = useState<string | null>(null);
 
   const [allRiderPayments, setAllRiderPayments] = useState<RiderPayment[]>([]);
-
-  const [driverPayouts, setDriverPayouts] = useState<DriverPayout[]>([]);
-  const [serviceFeeTotal, setServiceFeeTotal] = useState<number>(0);
-  const [serviceFeeCount, setServiceFeeCount] = useState<number>(0);
-
-  const [meMembership, setMeMembership] = useState<MeApiResponse extends { ok: true } ? any : any>(null);
+  const [driverBilling, setDriverBilling] = useState<DriverApiResponse | null>(null);
+  const [meMembership, setMeMembership] = useState<any>(null);
 
   const [range, setRange] = useState<RiderRange>("30d");
   const [statusFilter, setStatusFilter] = useState<RiderStatusFilter>("all");
   const [methodFilter, setMethodFilter] = useState<RiderMethodFilter>("all");
   const [q, setQ] = useState("");
-  const [from, setFrom] = useState(() => yyyyMmDd(new Date(new Date().setDate(new Date().getDate() - 29))));
+  const [from, setFrom] = useState(() =>
+    yyyyMmDd(new Date(new Date().setDate(new Date().getDate() - 29)))
+  );
   const [to, setTo] = useState(() => yyyyMmDd(new Date()));
+
+  const [driverRange, setDriverRange] = useState<DriverRange>("30d");
+  const [driverStatusFilter, setDriverStatusFilter] = useState<DriverStatusFilter>("all");
+  const [driverQ, setDriverQ] = useState("");
+  const [driverFrom, setDriverFrom] = useState(() =>
+    yyyyMmDd(new Date(new Date().setDate(new Date().getDate() - 29)))
+  );
+  const [driverTo, setDriverTo] = useState(() => yyyyMmDd(new Date()));
 
   const callbackUrl = useMemo(() => "/account/billing", []);
 
@@ -323,10 +436,11 @@ export default function AccountBillingPage() {
 
         const meRes = await fetch("/api/auth/me", { cache: "no-store" });
         const meJson = (await meRes.json().catch(() => null)) as MeApiResponse | null;
+
         if (meRes.ok && meJson && "ok" in meJson && meJson.ok) {
           if (!cancelled) setMeMembership(meJson.membership);
-        } else {
-          if (!cancelled) setMeMembership(null);
+        } else if (!cancelled) {
+          setMeMembership(null);
         }
 
         if (showRider || showBothSections) {
@@ -339,9 +453,7 @@ export default function AccountBillingPage() {
             throw new Error((json as any)?.error || "Failed to load rider billing");
           }
 
-          if (!cancelled) {
-            setAllRiderPayments(json.payments || []);
-          }
+          if (!cancelled) setAllRiderPayments(json.payments || []);
         } else if (!cancelled) {
           setAllRiderPayments([]);
         }
@@ -349,19 +461,14 @@ export default function AccountBillingPage() {
         if (showDriver || showBothSections) {
           const res = await fetch("/api/account/billing/driver", { cache: "no-store" });
           const json = (await res.json().catch(() => null)) as DriverApiResponse | null;
+
           if (!res.ok || !json || !("ok" in json) || !json.ok) {
             throw new Error((json as any)?.error || "Failed to load driver billing");
           }
 
-          if (!cancelled) {
-            setDriverPayouts(json.payouts || []);
-            setServiceFeeTotal(json.serviceFees?.totalFeesCents ?? 0);
-            setServiceFeeCount(json.serviceFees?.rideCount ?? 0);
-          }
+          if (!cancelled) setDriverBilling(json);
         } else if (!cancelled) {
-          setDriverPayouts([]);
-          setServiceFeeTotal(0);
-          setServiceFeeCount(0);
+          setDriverBilling(null);
         }
       } catch (e: any) {
         if (!cancelled) setError(e?.message || "Failed to load billing data");
@@ -371,6 +478,7 @@ export default function AccountBillingPage() {
     }
 
     load();
+
     return () => {
       cancelled = true;
     };
@@ -382,21 +490,82 @@ export default function AccountBillingPage() {
       if (Number.isNaN(rowDate.getTime())) return false;
 
       if (!matchesRange(rowDate, range, from, to)) return false;
-      if (!matchesStatus(p.status, statusFilter)) return false;
+      if (!matchesRiderStatus(p.status, statusFilter)) return false;
       if (!matchesMethod(p.paymentType, methodFilter)) return false;
-      if (!matchesQuery(p, q)) return false;
+      if (!matchesRiderQuery(p, q)) return false;
 
       return true;
     });
   }, [allRiderPayments, range, from, to, statusFilter, methodFilter, q]);
 
   const riderSummary = useMemo(() => {
-    const totalAmountCents = visibleRiderPayments.reduce((sum, p) => sum + (p.amountCents || 0), 0);
+    const totalAmountCents = visibleRiderPayments.reduce(
+      (sum, p) => sum + (p.amountCents || 0),
+      0
+    );
+
     return {
       count: visibleRiderPayments.length,
       totalAmountCents,
     };
   }, [visibleRiderPayments]);
+
+  const driverUi = useMemo(() => {
+    if (!driverBilling || !driverBilling.ok) return null;
+
+    return {
+      serviceFees: driverBilling.serviceFees,
+      earningsSummary: driverBilling.earningsSummary,
+      transactions: driverBilling.transactions,
+      payouts: driverBilling.payouts,
+      membershipCharges: driverBilling.membershipCharges,
+    };
+  }, [driverBilling]);
+
+  const visibleDriverTransactions = useMemo(() => {
+    if (!driverUi) return [];
+
+    return driverUi.transactions.filter((t) => {
+      const rowDate = new Date(t.createdAt);
+      if (Number.isNaN(rowDate.getTime())) return false;
+
+      if (!matchesRange(rowDate, driverRange, driverFrom, driverTo)) return false;
+      if (!matchesDriverStatus(t.status, driverStatusFilter)) return false;
+      if (!matchesDriverQuery(t, driverQ)) return false;
+
+      return true;
+    });
+  }, [driverUi, driverRange, driverFrom, driverTo, driverStatusFilter, driverQ]);
+
+  const filteredDriverSummary = useMemo(() => {
+    const grossAmountCents = visibleDriverTransactions.reduce((sum, t) => sum + (t.grossAmountCents || 0), 0);
+    const serviceFeeCents = visibleDriverTransactions.reduce((sum, t) => sum + (t.serviceFeeCents || 0), 0);
+    const netAmountCents = visibleDriverTransactions.reduce((sum, t) => sum + (t.netAmountCents || 0), 0);
+
+    const pendingNetAmountCents = visibleDriverTransactions
+      .filter((t) => {
+        const s = String(t.status || "").toUpperCase();
+        return s === "PENDING" || s === "AUTHORIZED";
+      })
+      .reduce((sum, t) => sum + (t.netAmountCents || 0), 0);
+
+    return {
+      rideCount: visibleDriverTransactions.length,
+      grossAmountCents,
+      serviceFeeCents,
+      netAmountCents,
+      pendingNetAmountCents,
+    };
+  }, [visibleDriverTransactions]);
+
+  const totalPaidOut = useMemo(() => {
+    if (!driverUi) return 0;
+
+    return driverUi.payouts.reduce((sum, p) => {
+      const s = String(p.status || "").toUpperCase();
+      return s === "PAID" ? sum + (p.amountCents || 0) : sum;
+    }, 0);
+  }, [driverUi]);
 
   const m = membershipUi(meMembership);
 
@@ -406,7 +575,7 @@ export default function AccountBillingPage() {
         <header className="space-y-2">
           <h1 className="text-2xl font-semibold text-slate-900">Account billing</h1>
           <p className="text-sm text-slate-600">
-            Ride payments, saved cards, service fees, and payouts. Membership is managed separately.
+            Ride payments, saved cards, membership charges, and driver earnings.
           </p>
         </header>
 
@@ -496,7 +665,11 @@ export default function AccountBillingPage() {
                   <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
                     <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Filter scope</p>
                     <p className="mt-2 text-sm font-medium text-slate-900">
-                      {range === "7d"
+                      {range === "today"
+                        ? "Today"
+                        : range === "yesterday"
+                        ? "Yesterday"
+                        : range === "7d"
                         ? "Last 7 days"
                         : range === "30d"
                         ? "Last 30 days"
@@ -519,6 +692,8 @@ export default function AccountBillingPage() {
                       onChange={(e) => setRange(e.target.value as RiderRange)}
                       className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
                     >
+                      <option value="today">Today</option>
+                      <option value="yesterday">Yesterday</option>
                       <option value="7d">Last 7 days</option>
                       <option value="30d">Last 30 days</option>
                       <option value="this_month">This month</option>
@@ -640,7 +815,7 @@ export default function AccountBillingPage() {
                               <td className="px-4 py-2 text-slate-700">
                                 {new Date(p.createdAt).toLocaleDateString()}
                               </td>
-                              <td className="px-4 py-2 text-slate-700">{routeLabel(p)}</td>
+                              <td className="px-4 py-2 text-slate-700">{riderRouteLabel(p)}</td>
                               <td className="px-4 py-2">{statusPill(p.status)}</td>
                               <td className="px-4 py-2 text-slate-700">{methodLabel(p)}</td>
                               <td className="px-4 py-2 text-right font-medium text-slate-900">
@@ -669,61 +844,309 @@ export default function AccountBillingPage() {
             )}
 
             {(showDriver || showBothSections) && (
-              <section className="space-y-4 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-                <div>
-                  <h2 className="text-sm font-semibold text-slate-900">Driver fees and payouts</h2>
-                  <p className="text-xs text-slate-500">Service fees collected and your payouts.</p>
-                </div>
-
-                <div className="grid gap-3 sm:grid-cols-2">
-                  <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
-                    <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Service fees</p>
-                    <p className="mt-2 text-xl font-semibold text-slate-900">
-                      {money(serviceFeeTotal, "USD")}
-                    </p>
-                    <p className="mt-1 text-[11px] text-slate-500">
-                      {serviceFeeCount > 0 ? `From ${serviceFeeCount} transactions` : "No transactions yet"}
+              <>
+                <section className="space-y-4 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                  <div>
+                    <h2 className="text-sm font-semibold text-slate-900">Driver earnings</h2>
+                    <p className="text-xs text-slate-500">
+                      Platform fees, your earned amount, and payout status.
                     </p>
                   </div>
 
-                  <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
-                    <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Payouts</p>
-                    <p className="mt-2 text-xl font-semibold text-slate-900">{driverPayouts.length}</p>
-                    <p className="mt-1 text-[11px] text-slate-500">Total payout records</p>
-                  </div>
-                </div>
+                  <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+                    <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
+                      <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                        Platform fees
+                      </p>
+                      <p className="mt-2 text-xl font-semibold text-slate-900">
+                        {money(filteredDriverSummary.serviceFeeCents, "USD")}
+                      </p>
+                      <p className="mt-1 text-[11px] text-slate-500">
+                        {filteredDriverSummary.rideCount
+                          ? `From ${filteredDriverSummary.rideCount} rides`
+                          : "No ride transactions yet"}
+                      </p>
+                    </div>
 
-                {driverPayouts.length === 0 ? (
-                  <p className="text-sm text-slate-500">No payouts yet.</p>
-                ) : (
-                  <div className="overflow-hidden rounded-xl border border-slate-200">
-                    <div className="overflow-auto">
-                      <table className="min-w-full text-sm">
-                        <thead className="bg-slate-50 text-xs uppercase text-slate-500">
-                          <tr>
-                            <th className="px-4 py-2 text-left">Date</th>
-                            <th className="px-4 py-2 text-left">Status</th>
-                            <th className="px-4 py-2 text-right">Amount</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {driverPayouts.map((p) => (
-                            <tr key={p.id} className="border-t border-slate-100">
-                              <td className="px-4 py-2 text-slate-700">
-                                {new Date(p.createdAt).toLocaleDateString()}
-                              </td>
-                              <td className="px-4 py-2">{statusPill(p.status)}</td>
-                              <td className="px-4 py-2 text-right font-medium text-slate-900">
-                                {money(p.amountCents, p.currency)}
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
+                    <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
+                      <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                        Your earnings
+                      </p>
+                      <p className="mt-2 text-xl font-semibold text-slate-900">
+                        {money(filteredDriverSummary.netAmountCents, "USD")}
+                      </p>
+                      <p className="mt-1 text-[11px] text-slate-500">Net of platform fees</p>
+                    </div>
+
+                    <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
+                      <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                        Available to payout
+                      </p>
+                      <p className="mt-2 text-xl font-semibold text-slate-900">
+                        {money(filteredDriverSummary.pendingNetAmountCents, "USD")}
+                      </p>
+                      <p className="mt-1 text-[11px] text-slate-500">Filtered pending earnings</p>
+                    </div>
+
+                    <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
+                      <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                        Paid out
+                      </p>
+                      <p className="mt-2 text-xl font-semibold text-slate-900">
+                        {money(totalPaidOut, "USD")}
+                      </p>
+                      <p className="mt-1 text-[11px] text-slate-500">
+                        {driverUi?.payouts.length
+                          ? `${driverUi.payouts.length} payout records`
+                          : "No payout records yet"}
+                      </p>
                     </div>
                   </div>
-                )}
-              </section>
+                </section>
+
+                <section className="space-y-4 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                  <div>
+                    <h2 className="text-sm font-semibold text-slate-900">Ride earnings</h2>
+                    <p className="text-xs text-slate-500">
+                      Gross fare, platform fee, and your net earnings for each completed ride.
+                    </p>
+                  </div>
+
+                  <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+                    <div>
+                      <label className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-slate-500">
+                        Date range
+                      </label>
+                      <select
+                        value={driverRange}
+                        onChange={(e) => setDriverRange(e.target.value as DriverRange)}
+                        className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                      >
+                        <option value="today">Today</option>
+                        <option value="yesterday">Yesterday</option>
+                        <option value="7d">Last 7 days</option>
+                        <option value="30d">Last 30 days</option>
+                        <option value="this_month">This month</option>
+                        <option value="all">All time</option>
+                        <option value="custom">Custom</option>
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-slate-500">
+                        Status
+                      </label>
+                      <select
+                        value={driverStatusFilter}
+                        onChange={(e) => setDriverStatusFilter(e.target.value as DriverStatusFilter)}
+                        className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                      >
+                        <option value="all">All</option>
+                        <option value="completed">Completed</option>
+                        <option value="pending">Pending</option>
+                        <option value="failed">Failed</option>
+                        <option value="paid">Paid</option>
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-slate-500">
+                        Search route
+                      </label>
+                      <input
+                        value={driverQ}
+                        onChange={(e) => setDriverQ(e.target.value)}
+                        placeholder="City, route, ride id..."
+                        className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                      />
+                    </div>
+
+                    <div className="flex items-end">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setDriverRange("30d");
+                          setDriverStatusFilter("all");
+                          setDriverQ("");
+                          setDriverFrom(
+                            yyyyMmDd(new Date(new Date().setDate(new Date().getDate() - 29)))
+                          );
+                          setDriverTo(yyyyMmDd(new Date()));
+                        }}
+                        className="w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm font-medium text-slate-700 hover:bg-slate-50"
+                      >
+                        Reset filters
+                      </button>
+                    </div>
+                  </div>
+
+                  {driverRange === "custom" ? (
+                    <div className="grid gap-3 md:grid-cols-2">
+                      <div>
+                        <label className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-slate-500">
+                          From
+                        </label>
+                        <input
+                          type="date"
+                          value={driverFrom}
+                          onChange={(e) => setDriverFrom(e.target.value)}
+                          className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                        />
+                      </div>
+
+                      <div>
+                        <label className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-slate-500">
+                          To
+                        </label>
+                        <input
+                          type="date"
+                          value={driverTo}
+                          onChange={(e) => setDriverTo(e.target.value)}
+                          className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm"
+                        />
+                      </div>
+                    </div>
+                  ) : null}
+
+                  {!driverUi || visibleDriverTransactions.length === 0 ? (
+                    <p className="text-sm text-slate-500">No ride earnings match the current filters.</p>
+                  ) : (
+                    <div className="overflow-hidden rounded-xl border border-slate-200">
+                      <div className="overflow-auto">
+                        <table className="min-w-full text-sm">
+                          <thead className="bg-slate-50 text-xs uppercase text-slate-500">
+                            <tr>
+                              <th className="px-4 py-2 text-left">Date</th>
+                              <th className="px-4 py-2 text-left">Route</th>
+                              <th className="px-4 py-2 text-left">Status</th>
+                              <th className="px-4 py-2 text-right">Gross</th>
+                              <th className="px-4 py-2 text-right">Fee</th>
+                              <th className="px-4 py-2 text-right">Your earnings</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {visibleDriverTransactions.map((t) => (
+                              <tr key={t.id} className="border-t border-slate-100">
+                                <td className="px-4 py-2 text-slate-700">
+                                  {new Date(t.createdAt).toLocaleDateString()}
+                                </td>
+                                <td className="px-4 py-2 text-slate-700">{driverRouteLabel(t)}</td>
+                                <td className="px-4 py-2">{statusPill(t.status)}</td>
+                                <td className="px-4 py-2 text-right font-medium text-slate-900">
+                                  {money(t.grossAmountCents, "USD")}
+                                </td>
+                                <td className="px-4 py-2 text-right text-slate-700">
+                                  {money(t.serviceFeeCents, "USD")}
+                                </td>
+                                <td className="px-4 py-2 text-right font-medium text-slate-900">
+                                  {money(t.netAmountCents, "USD")}
+                                </td>
+                              </tr>
+                            ))}
+
+                            <tr className="border-t-2 border-slate-200 bg-slate-50">
+                              <td className="px-4 py-3 text-slate-500" colSpan={3}>
+                                <span className="font-semibold text-slate-800">Total</span>
+                                <span className="ml-2 text-xs">
+                                  ({filteredDriverSummary.rideCount}{" "}
+                                  {filteredDriverSummary.rideCount === 1 ? "ride" : "rides"})
+                                </span>
+                              </td>
+                              <td className="px-4 py-3 text-right font-semibold text-slate-900">
+                                {money(filteredDriverSummary.grossAmountCents, "USD")}
+                              </td>
+                              <td className="px-4 py-3 text-right font-semibold text-slate-900">
+                                {money(filteredDriverSummary.serviceFeeCents, "USD")}
+                              </td>
+                              <td className="px-4 py-3 text-right font-semibold text-slate-900">
+                                {money(filteredDriverSummary.netAmountCents, "USD")}
+                              </td>
+                            </tr>
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
+                </section>
+
+                <section className="space-y-4 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                  <div>
+                    <h2 className="text-sm font-semibold text-slate-900">Payout history</h2>
+                    <p className="text-xs text-slate-500">
+                      Actual amounts paid out to the driver.
+                    </p>
+                  </div>
+
+                  {!driverUi || driverUi.payouts.length === 0 ? (
+                    <p className="text-sm text-slate-500">No payout records yet.</p>
+                  ) : (
+                    <div className="overflow-hidden rounded-xl border border-slate-200">
+                      <div className="overflow-auto">
+                        <table className="min-w-full text-sm">
+                          <thead className="bg-slate-50 text-xs uppercase text-slate-500">
+                            <tr>
+                              <th className="px-4 py-2 text-left">Date</th>
+                              <th className="px-4 py-2 text-left">Status</th>
+                              <th className="px-4 py-2 text-right">Amount</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {driverUi.payouts.map((p) => (
+                              <tr key={p.id} className="border-t border-slate-100">
+                                <td className="px-4 py-2 text-slate-700">
+                                  {new Date(p.createdAt).toLocaleDateString()}
+                                </td>
+                                <td className="px-4 py-2">{statusPill(p.status)}</td>
+                                <td className="px-4 py-2 text-right font-medium text-slate-900">
+                                  {money(p.amountCents, p.currency)}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
+                </section>
+
+                <section className="space-y-4 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+                  <div>
+                    <h2 className="text-sm font-semibold text-slate-900">Membership charges</h2>
+                    <p className="text-xs text-slate-500">Your membership billing history.</p>
+                  </div>
+
+                  {!driverUi || driverUi.membershipCharges.length === 0 ? (
+                    <p className="text-sm text-slate-500">No membership charges yet.</p>
+                  ) : (
+                    <div className="overflow-hidden rounded-xl border border-slate-200">
+                      <div className="overflow-auto">
+                        <table className="min-w-full text-sm">
+                          <thead className="bg-slate-50 text-xs uppercase text-slate-500">
+                            <tr>
+                              <th className="px-4 py-2 text-left">Date</th>
+                              <th className="px-4 py-2 text-left">Status</th>
+                              <th className="px-4 py-2 text-right">Amount</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {driverUi.membershipCharges.map((c) => (
+                              <tr key={c.id} className="border-t border-slate-100">
+                                <td className="px-4 py-2 text-slate-700">
+                                  {new Date(c.createdAt).toLocaleDateString()}
+                                </td>
+                                <td className="px-4 py-2">{statusPill(c.status)}</td>
+                                <td className="px-4 py-2 text-right font-medium text-slate-900">
+                                  {money(c.amountCents, c.currency)}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
+                </section>
+              </>
             )}
           </>
         )}

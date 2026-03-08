@@ -10,9 +10,9 @@ import {
   MembershipPlan,
   MembershipStatus,
   MembershipType,
-  PaymentMethod,
   UserRole,
 } from "@prisma/client";
+import type Stripe from "stripe";
 
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
@@ -56,25 +56,37 @@ function roleToMembershipType(role: UserRole): MembershipType | null {
   return null;
 }
 
-function addInterval(from: Date, interval: MembershipInterval) {
+function addInterval(from: Date, interval: MembershipInterval): Date {
   const d = new Date(from);
-
   switch (interval) {
     case MembershipInterval.MONTHLY:
-      d.setMonth(d.getMonth() + 1);
-      return d;
     default:
       d.setMonth(d.getMonth() + 1);
       return d;
   }
 }
 
-function latestChargeIdFromPi(pi: any): string | null {
+function latestChargeIdFromPi(pi: Stripe.PaymentIntent | null | undefined): string | null {
   const latestCharge = pi?.latest_charge;
   if (!latestCharge) return null;
   if (typeof latestCharge === "string") return latestCharge;
-  if (typeof latestCharge?.id === "string") return latestCharge.id;
-  return null;
+  return typeof latestCharge.id === "string" ? latestCharge.id : null;
+}
+
+function getStripeErrorMessage(err: any): string {
+  return err?.raw?.message || err?.message || "Internal server error";
+}
+
+function isStripePaymentFailure(err: any): boolean {
+  return (
+    err?.type === "StripeCardError" ||
+    err?.code === "card_declined" ||
+    err?.code === "insufficient_funds" ||
+    err?.code === "authentication_required" ||
+    err?.code === "expired_card" ||
+    err?.code === "incorrect_cvc" ||
+    err?.code === "processing_error"
+  );
 }
 
 async function requireUser() {
@@ -83,21 +95,11 @@ async function requireUser() {
   return userId ? { userId } : null;
 }
 
-async function getDefaultPaymentMethodForUser(userId: string): Promise<{
-  row: Pick<PaymentMethod, "id" | "stripePaymentMethodId" | "brand" | "last4" | "expMonth" | "expYear"> | null;
+async function getDefaultPaymentMethodForUser(args: {
+  userId: string;
   stripeCustomerId: string | null;
-  role: UserRole;
-} | null> {
-  const user = await prisma.user.findUnique({
-    where: { id: userId },
-    select: {
-      id: true,
-      role: true,
-      stripeCustomerId: true,
-    },
-  });
-
-  if (!user) return null;
+}) {
+  const { userId, stripeCustomerId } = args;
 
   const row = await prisma.paymentMethod.findFirst({
     where: {
@@ -118,8 +120,7 @@ async function getDefaultPaymentMethodForUser(userId: string): Promise<{
 
   return {
     row,
-    stripeCustomerId: user.stripeCustomerId ?? null,
-    role: user.role,
+    stripeCustomerId,
   };
 }
 
@@ -182,17 +183,20 @@ export async function POST() {
       return jsonError(400, "Please verify your email before activating membership.");
     }
 
-    const paymentInfo = await getDefaultPaymentMethodForUser(user.id);
-    if (!paymentInfo) {
-      return jsonError(404, "User not found.");
-    }
+    const paymentInfo = await getDefaultPaymentMethodForUser({
+      userId: user.id,
+      stripeCustomerId: user.stripeCustomerId ?? null,
+    });
 
     if (!paymentInfo.row?.stripePaymentMethodId || !paymentInfo.stripeCustomerId) {
       return jsonError(400, "A default card is required before activating membership.");
     }
 
-    const pricing = await getActivePricing(membershipType);
+    const paymentMethodId = paymentInfo.row.id;
+    const stripePaymentMethodId = paymentInfo.row.stripePaymentMethodId;
+    const stripeCustomerId = paymentInfo.stripeCustomerId;
 
+    const pricing = await getActivePricing(membershipType);
     if (!pricing.amountCents || pricing.amountCents < 50) {
       return jsonError(400, "Membership pricing is not configured correctly.");
     }
@@ -215,10 +219,6 @@ export async function POST() {
     });
 
     const now = new Date();
-
-    // Devil's advocate:
-    // We do NOT block if the user is currently active paid. We allow renewal/extension.
-    // Extension starts from the later of now or current expiry.
     const extensionBase =
       latestMembership?.expiryDate && latestMembership.expiryDate > now
         ? latestMembership.expiryDate
@@ -226,27 +226,53 @@ export async function POST() {
 
     const nextExpiry = addInterval(extensionBase, pricing.interval);
 
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount: pricing.amountCents,
-      currency: pricing.currency.toLowerCase(),
-      customer: paymentInfo.stripeCustomerId,
-      payment_method: paymentInfo.row.stripePaymentMethodId,
-      confirm: true,
-      off_session: true,
-      metadata: {
-        kind: "membership_activation",
-        userId: user.id,
-        membershipType,
-        pricingPlan: pricing.plan,
-      },
-    });
+    let paymentIntent: Stripe.PaymentIntent;
+    try {
+      paymentIntent = await stripe.paymentIntents.create({
+        amount: pricing.amountCents,
+        currency: pricing.currency.toLowerCase(),
+        customer: stripeCustomerId,
+        payment_method: stripePaymentMethodId,
+        confirm: true,
+        off_session: true,
+        metadata: {
+          kind: "membership_activation",
+          userId: user.id,
+          membershipType,
+          pricingPlan: pricing.plan,
+        },
+      });
+    } catch (err: any) {
+      const message = getStripeErrorMessage(err);
+
+      if (isStripePaymentFailure(err)) {
+        await prisma.membershipCharge.create({
+          data: {
+            userId: user.id,
+            membershipId: latestMembership?.id ?? null,
+            paymentMethodId,
+            amountCents: pricing.amountCents,
+            currency: pricing.currency,
+            status: MembershipChargeStatus.FAILED,
+            provider: "STRIPE",
+            providerRef: null,
+            failedAt: new Date(),
+          },
+        });
+
+        return jsonError(402, message);
+      }
+
+      console.error("POST /api/billing/membership/activate error:", err);
+      return jsonError(500, message);
+    }
 
     if (paymentIntent.status !== "succeeded") {
       const failedCharge = await prisma.membershipCharge.create({
         data: {
           userId: user.id,
           membershipId: latestMembership?.id ?? null,
-          paymentMethodId: paymentInfo.row.id,
+          paymentMethodId,
           amountCents: pricing.amountCents,
           currency: pricing.currency,
           status: MembershipChargeStatus.FAILED,
@@ -269,8 +295,6 @@ export async function POST() {
     }
 
     const result = await prisma.$transaction(async (tx) => {
-      let membershipId: string;
-
       if (latestMembership) {
         const updated = await tx.membership.update({
           where: { id: latestMembership.id },
@@ -294,13 +318,11 @@ export async function POST() {
           },
         });
 
-        membershipId = updated.id;
-
         const charge = await tx.membershipCharge.create({
           data: {
             userId: user.id,
             membershipId: updated.id,
-            paymentMethodId: paymentInfo.row!.id,
+            paymentMethodId,
             amountCents: pricing.amountCents,
             currency: pricing.currency,
             status: MembershipChargeStatus.SUCCEEDED,
@@ -347,13 +369,11 @@ export async function POST() {
         },
       });
 
-      membershipId = created.id;
-
       const charge = await tx.membershipCharge.create({
         data: {
           userId: user.id,
-          membershipId,
-          paymentMethodId: paymentInfo.row!.id,
+          membershipId: created.id,
+          paymentMethodId,
           amountCents: pricing.amountCents,
           currency: pricing.currency,
           status: MembershipChargeStatus.SUCCEEDED,
@@ -402,12 +422,6 @@ export async function POST() {
     return NextResponse.json(response);
   } catch (err: any) {
     console.error("POST /api/billing/membership/activate error:", err);
-
-    const stripeMessage =
-      err?.raw?.message ||
-      err?.message ||
-      "Internal server error";
-
-    return jsonError(500, stripeMessage);
+    return jsonError(500, getStripeErrorMessage(err));
   }
 }

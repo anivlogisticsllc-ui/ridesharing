@@ -47,6 +47,30 @@ type MembershipApiResponse =
   | { ok: true; user: UserSummary; membership: MembershipSummary; billing: BillingInfo }
   | { ok: false; error: string };
 
+type ActivateMembershipResponse =
+  | {
+      ok: true;
+      membership: {
+        id: string;
+        type: string;
+        plan: string;
+        status: string;
+        startDate: string;
+        expiryDate: string;
+        amountPaidCents: number;
+      };
+      charge: {
+        id: string;
+        amountCents: number;
+        currency: string;
+        status: string;
+        paidAt: string | null;
+        stripePaymentIntentId: string | null;
+        stripeChargeId: string | null;
+      };
+    }
+  | { ok: false; error: string };
+
 /* ---------- Helpers ---------- */
 
 function getProfileHref(user: { role: "RIDER" | "DRIVER" }) {
@@ -63,13 +87,16 @@ function LabelRow({ label, value }: { label: string; value: React.ReactNode }) {
 }
 
 function normalizeStatus(s: unknown): MembershipStatus | null {
-  if (s === "ACTIVE" || s === "EXPIRED" || s === "TRIAL" || s === "CANCELLED" || s === "NONE") return s;
+  if (s === "ACTIVE" || s === "EXPIRED" || s === "TRIAL" || s === "CANCELLED" || s === "NONE") {
+    return s;
+  }
   return null;
 }
 
 async function readApiError(res: Response) {
   const text = await res.text().catch(() => "");
   if (!text) return `Request failed (HTTP ${res.status}).`;
+
   try {
     const json = JSON.parse(text);
     return json?.error || json?.message || `Request failed (HTTP ${res.status}).`;
@@ -86,10 +113,12 @@ export default function MembershipPage() {
   const [data, setData] = useState<MembershipApiResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [actionSuccess, setActionSuccess] = useState<string | null>(null);
   const [activating, setActivating] = useState(false);
 
   async function load() {
     setLoading(true);
+
     try {
       const res = await fetch("/api/billing/membership", { cache: "no-store" });
 
@@ -105,7 +134,7 @@ export default function MembershipPage() {
       }
 
       if (json.ok) {
-        (json.membership as any).status = normalizeStatus((json.membership as any).status);
+        json.membership.status = normalizeStatus(json.membership.status);
       }
 
       setData(json);
@@ -116,11 +145,11 @@ export default function MembershipPage() {
     }
   }
 
-  async function startMembershipCheckout() {
-    // This is the clean hook point for Stripe Checkout.
-    // Implement: POST /api/billing/membership/checkout -> { ok: true, url: string }
+  async function activateMembership() {
     setActionError(null);
+    setActionSuccess(null);
     setActivating(true);
+
     try {
       const res = await fetch("/api/billing/membership/activate", {
         method: "POST",
@@ -128,32 +157,32 @@ export default function MembershipPage() {
         cache: "no-store",
       });
 
-      if (!res.ok) throw new Error(await readApiError(res));
-
-      const json = (await res.json().catch(() => null)) as any;
-      const url = typeof json?.url === "string" ? json.url : null;
-
-      if (!url) {
-        throw new Error(json?.error || "Checkout did not return a redirect URL.");
+      if (!res.ok) {
+        throw new Error(await readApiError(res));
       }
 
-      window.location.href = url;
+      const json = (await res.json().catch(() => null)) as ActivateMembershipResponse | null;
+      if (!json || !json.ok) {
+        throw new Error(json?.error || "Membership activation failed.");
+      }
+
+      setActionSuccess(
+        `Membership activated successfully. Charged ${formatUsdFromCents(
+          json.charge.amountCents
+        )}.`
+      );
+
+      await load();
+      router.refresh();
     } catch (e: any) {
-      setActionError(e?.message || "Could not start membership checkout.");
+      setActionError(e?.message || "Could not activate membership.");
     } finally {
       setActivating(false);
     }
   }
 
   useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      if (cancelled) return;
-      await load();
-    })();
-    return () => {
-      cancelled = true;
-    };
+    void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [router]);
 
@@ -164,7 +193,7 @@ export default function MembershipPage() {
 
     const membership: MembershipSummary = {
       ...rawMembership,
-      status: normalizeStatus((rawMembership as any).status),
+      status: normalizeStatus(rawMembership.status),
     };
 
     const { state, label, endsAtLabel } = computeMembershipState(membership as any);
@@ -202,10 +231,12 @@ export default function MembershipPage() {
 
     const helpLine = (() => {
       if (state === "ACTIVE") return "Your membership is active.";
-      if (state === "TRIAL")
+      if (state === "TRIAL") {
         return "During trial, CASH requests require a backup card on file. After trial ends, you’ll need a paid membership to continue.";
-      if (state === "EXPIRED")
+      }
+      if (state === "EXPIRED") {
         return "Your trial ended. Activate a paid membership to continue requesting rides.";
+      }
       return "Activate a membership to access member-only features.";
     })();
 
@@ -239,6 +270,7 @@ export default function MembershipPage() {
 
   if (!data || data.ok === false) {
     const errMsg = data?.ok === false ? data.error : "Could not load membership.";
+
     return (
       <main style={pageStyle}>
         <Card>
@@ -249,7 +281,7 @@ export default function MembershipPage() {
             <Link href="/" style={linkBtn}>
               Back to home
             </Link>
-            <button type="button" style={linkBtn} onClick={() => load()}>
+            <button type="button" style={linkBtn} onClick={() => void load()}>
               Reload
             </button>
           </div>
@@ -261,7 +293,7 @@ export default function MembershipPage() {
   if (!ui) return null;
 
   const activateLabel =
-    ui.state === "TRIAL" ? "Activate paid membership" : ui.state === "ACTIVE" ? "Manage membership" : "Activate membership";
+    ui.state === "TRIAL" ? "Activate paid membership" : "Activate membership";
 
   return (
     <main style={pageStyle}>
@@ -289,14 +321,38 @@ export default function MembershipPage() {
             </p>
           ) : null}
 
+          {actionSuccess ? (
+            <div
+              style={{
+                marginTop: 8,
+                border: "1px solid #bbf7d0",
+                background: "#f0fdf4",
+                color: "#166534",
+                padding: 12,
+                borderRadius: 10,
+              }}
+            >
+              <div style={{ fontWeight: 700, fontSize: 13 }}>Success</div>
+              <div style={{ fontSize: 13, marginTop: 4 }}>{actionSuccess}</div>
+            </div>
+          ) : null}
+
           {actionError ? (
-            <div style={{ marginTop: 8, border: "1px solid #fecaca", background: "#fef2f2", color: "#b91c1c", padding: 12, borderRadius: 10 }}>
+            <div
+              style={{
+                marginTop: 8,
+                border: "1px solid #fecaca",
+                background: "#fef2f2",
+                color: "#b91c1c",
+                padding: 12,
+                borderRadius: 10,
+              }}
+            >
               <div style={{ fontWeight: 700, fontSize: 13 }}>Action failed</div>
               <div style={{ fontSize: 13, marginTop: 4 }}>{actionError}</div>
             </div>
           ) : null}
 
-          {/* Primary actions */}
           <div style={{ marginTop: 12, display: "flex", gap: 10, flexWrap: "wrap" }}>
             <Link href="/account/billing" style={linkBtn}>
               Manage billing
@@ -309,7 +365,7 @@ export default function MembershipPage() {
             {ui.showActivate ? (
               <button
                 type="button"
-                onClick={startMembershipCheckout}
+                onClick={activateMembership}
                 disabled={activating}
                 style={{
                   ...linkBtn,

@@ -3,7 +3,12 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import { getServerSession } from "next-auth";
 import { authOptions } from "./auth/[...nextauth]";
 import { prisma } from "@/lib/prisma";
-import { BookingStatus, RideStatus, UserRole, PaymentType } from "@prisma/client";
+import {
+  BookingStatus,
+  PaymentType,
+  RideStatus,
+  UserRole,
+} from "@prisma/client";
 import { guardMembership } from "@/lib/guardMembership";
 
 type ApiResponse =
@@ -11,13 +16,27 @@ type ApiResponse =
   | { ok: false; error: string };
 
 function computeReceipt(baseCents: number, cashDiscountBps: number) {
+  const safeBase = Number.isFinite(baseCents) ? Math.max(0, Math.round(baseCents)) : 0;
+  const safeBps = Number.isFinite(cashDiscountBps)
+    ? Math.max(0, Math.min(5000, Math.round(cashDiscountBps)))
+    : 0;
+
   const discountCents =
-    cashDiscountBps > 0 ? Math.round(baseCents * (cashDiscountBps / 10000)) : 0;
-  const finalAmountCents = Math.max(0, baseCents - discountCents);
-  return { baseAmountCents: baseCents, discountCents, finalAmountCents };
+    safeBps > 0 ? Math.round(safeBase * (safeBps / 10000)) : 0;
+
+  const finalAmountCents = Math.max(0, safeBase - discountCents);
+
+  return {
+    baseAmountCents: safeBase,
+    discountCents,
+    finalAmountCents,
+  };
 }
 
-async function authorizeBookingAfterAccept(req: NextApiRequest, bookingId: string) {
+async function authorizeBookingAfterAccept(
+  req: NextApiRequest,
+  bookingId: string
+) {
   const baseUrl = process.env.NEXTAUTH_URL || `http://${req.headers.host}`;
 
   const r = await fetch(`${baseUrl}/api/billing/authorize-booking`, {
@@ -30,14 +49,22 @@ async function authorizeBookingAfterAccept(req: NextApiRequest, bookingId: strin
   });
 
   const json = await r.json().catch(() => null);
+
   if (!r.ok) {
     console.error("authorize-booking failed:", r.status, json);
-    return { ok: false as const, error: json?.error || `authorize-booking failed (${r.status})` };
+    return {
+      ok: false as const,
+      error: json?.error || `authorize-booking failed (${r.status})`,
+    };
   }
+
   return { ok: true as const, json };
 }
 
-export default async function handler(req: NextApiRequest, res: NextApiResponse<ApiResponse>) {
+export default async function handler(
+  req: NextApiRequest,
+  res: NextApiResponse<ApiResponse>
+) {
   try {
     if (req.method !== "POST") {
       res.setHeader("Allow", "POST");
@@ -48,20 +75,29 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     const driverId = (session?.user as any)?.id as string | undefined;
     const role = (session?.user as any)?.role as UserRole | undefined;
 
-    if (!driverId) return res.status(401).json({ ok: false, error: "Not authenticated" });
-    if (role !== UserRole.DRIVER) {
-      return res.status(403).json({ ok: false, error: "Only drivers can accept rider requests." });
+    if (!driverId) {
+      return res.status(401).json({ ok: false, error: "Not authenticated" });
     }
 
-    // Driver verification gate
+    if (role !== UserRole.DRIVER) {
+      return res.status(403).json({
+        ok: false,
+        error: "Only drivers can accept rider requests.",
+      });
+    }
+
     const profile = await prisma.driverProfile.findUnique({
       where: { userId: driverId },
       select: { verificationStatus: true },
     });
 
     if (!profile) {
-      return res.status(403).json({ ok: false, error: "Driver profile missing. Complete driver setup first." });
+      return res.status(403).json({
+        ok: false,
+        error: "Driver profile missing. Complete driver setup first.",
+      });
     }
+
     if (profile.verificationStatus !== "APPROVED") {
       return res.status(403).json({
         ok: false,
@@ -69,16 +105,25 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       });
     }
 
-    // Membership gate (DRIVER)
-    const gate = await guardMembership({ userId: driverId, role: UserRole.DRIVER, allowTrial: true });
+    const gate = await guardMembership({
+      userId: driverId,
+      role: UserRole.DRIVER,
+      allowTrial: true,
+    });
+
     if (!gate.ok) {
-      return res.status(403).json({ ok: false, error: gate.error || "Membership required." });
+      return res.status(403).json({
+        ok: false,
+        error: gate.error || "Membership required.",
+      });
     }
 
     const { rideId } = (req.body ?? {}) as { rideId?: string };
-    if (!rideId) return res.status(400).json({ ok: false, error: "rideId is required." });
 
-    // Prevent multiple active rides
+    if (!rideId) {
+      return res.status(400).json({ ok: false, error: "rideId is required." });
+    }
+
     const activeRide = await prisma.ride.findFirst({
       where: {
         driverId,
@@ -91,34 +136,50 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     if (activeRide) {
       return res.status(400).json({
         ok: false,
-        error: "You already have an active ride. Complete it before accepting a new one.",
+        error:
+          "You already have an active ride. Complete it before accepting a new one.",
       });
     }
 
     const result = await prisma.$transaction(async (tx) => {
       const ride = await tx.ride.findUnique({
         where: { id: rideId },
-        select: { id: true, riderId: true, status: true, driverId: true, totalPriceCents: true },
+        select: {
+          id: true,
+          riderId: true,
+          status: true,
+          driverId: true,
+          totalPriceCents: true,
+        },
       });
 
-      if (!ride || !ride.riderId) throw new Error("Ride not found.");
-      if (ride.status === RideStatus.COMPLETED || ride.status === RideStatus.IN_ROUTE) {
+      if (!ride || !ride.riderId) {
+        throw new Error("Ride not found.");
+      }
+
+      if (
+        ride.status === RideStatus.COMPLETED ||
+        ride.status === RideStatus.IN_ROUTE
+      ) {
         throw new Error("This ride is no longer available to accept.");
       }
+
       if (ride.driverId && ride.driverId !== driverId) {
         const e = new Error("Ride was already accepted by another driver.");
         (e as any).code = "TAKEN";
         throw e;
       }
 
-      // Race-safe accept
       const updated = await tx.ride.updateMany({
         where: {
           id: ride.id,
           OR: [{ driverId: null }, { driverId }],
           status: { notIn: [RideStatus.COMPLETED, RideStatus.IN_ROUTE] },
         },
-        data: { driverId, status: RideStatus.ACCEPTED },
+        data: {
+          driverId,
+          status: RideStatus.ACCEPTED,
+        },
       });
 
       if (updated.count === 0) {
@@ -127,14 +188,13 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         throw e;
       }
 
-      // Reuse rider booking (payment choice lives there)
       const existing = await tx.booking.findFirst({
         where: {
           rideId: ride.id,
           riderId: ride.riderId,
           status: { in: [BookingStatus.PENDING, BookingStatus.ACCEPTED] },
         },
-        orderBy: { createdAt: "asc" as any },
+        orderBy: { createdAt: "asc" as const },
         select: {
           id: true,
           status: true,
@@ -146,7 +206,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         },
       });
 
-      // If already accepted: ensure conversation exists and return
       if (existing?.status === BookingStatus.ACCEPTED) {
         const convo = await tx.conversation.upsert({
           where: { bookingId: existing.id },
@@ -158,24 +217,38 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
             bookingId: existing.id,
           },
         });
-        return { bookingId: existing.id, conversationId: convo.id };
+
+        return {
+          bookingId: existing.id,
+          conversationId: convo.id,
+          paymentType: existing.paymentType ?? PaymentType.CARD,
+        };
       }
 
       const baseAmountCents = ride.totalPriceCents ?? 0;
-
       let bookingId: string;
+      let acceptedPaymentType: PaymentType = PaymentType.CARD;
 
       if (existing) {
         const needsSnapshot =
-          !(typeof existing.baseAmountCents === "number" && existing.baseAmountCents > 0) ||
-          !(typeof existing.finalAmountCents === "number" && existing.finalAmountCents > 0);
+          !(typeof existing.baseAmountCents === "number" &&
+            existing.baseAmountCents > 0) ||
+          !(typeof existing.finalAmountCents === "number" &&
+            existing.finalAmountCents > 0);
 
-        const cashBps = typeof existing.cashDiscountBps === "number" ? existing.cashDiscountBps : 0;
+        const cashBps =
+          typeof existing.cashDiscountBps === "number"
+            ? existing.cashDiscountBps
+            : 0;
 
         const receipt =
           existing.paymentType === PaymentType.CASH
             ? computeReceipt(baseAmountCents, cashBps)
-            : { baseAmountCents, discountCents: 0, finalAmountCents: baseAmountCents };
+            : {
+                baseAmountCents,
+                discountCents: 0,
+                finalAmountCents: baseAmountCents,
+              };
 
         const updatedBooking = await tx.booking.update({
           where: { id: existing.id },
@@ -190,12 +263,21 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
                 }
               : {}),
           } as any,
+          select: {
+            id: true,
+            paymentType: true,
+          },
         });
 
         bookingId = updatedBooking.id;
+        acceptedPaymentType = updatedBooking.paymentType ?? PaymentType.CARD;
       } else {
-        // Fallback if missing booking (should be rare)
-        const receipt = { baseAmountCents, discountCents: 0, finalAmountCents: baseAmountCents };
+        const receipt = {
+          baseAmountCents,
+          discountCents: 0,
+          finalAmountCents: baseAmountCents,
+        };
+
         const created = await tx.booking.create({
           data: {
             rideId: ride.id,
@@ -209,8 +291,14 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
             discountCents: receipt.discountCents,
             finalAmountCents: receipt.finalAmountCents,
           } as any,
+          select: {
+            id: true,
+            paymentType: true,
+          },
         });
+
         bookingId = created.id;
+        acceptedPaymentType = created.paymentType ?? PaymentType.CARD;
       }
 
       const conversation = await tx.conversation.create({
@@ -222,16 +310,40 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
         },
       });
 
-      return { bookingId, conversationId: conversation.id };
+      return {
+        bookingId,
+        conversationId: conversation.id,
+        paymentType: acceptedPaymentType,
+      };
     });
 
-    return res.status(201).json({ ok: true, bookingId: result.bookingId, conversationId: result.conversationId });
+    if (result.paymentType === PaymentType.CARD) {
+      const authz = await authorizeBookingAfterAccept(req, result.bookingId);
+
+      if (!authz.ok) {
+        return res.status(402).json({
+          ok: false,
+          error: authz.error || "Card authorization failed after accepting ride.",
+        });
+      }
+    }
+
+    return res.status(201).json({
+      ok: true,
+      bookingId: result.bookingId,
+      conversationId: result.conversationId,
+    });
   } catch (err: any) {
     console.error("Error in /api/book-ride:", err);
+
     const msg = String(err?.message || "");
     if (msg.includes("already accepted") || err?.code === "TAKEN") {
       return res.status(409).json({ ok: false, error: msg });
     }
-    return res.status(500).json({ ok: false, error: "Failed to accept ride. Please try again." });
+
+    return res.status(500).json({
+      ok: false,
+      error: "Failed to accept ride. Please try again.",
+    });
   }
 }

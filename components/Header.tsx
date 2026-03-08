@@ -263,10 +263,10 @@ export function Header() {
                           Driver portal
                         </MenuLink>
                         <MenuLink href={ROUTES.driver.payments} onClick={closeMenu}>
-                          Payments (soon)
+                          Driver Payments
                         </MenuLink>
                         <MenuLink href={ROUTES.driver.payouts} onClick={closeMenu}>
-                          Payouts (soon)
+                          Driver Payouts
                         </MenuLink>
                       </div>
                     </>
@@ -280,7 +280,7 @@ export function Header() {
                           Rider portal
                         </MenuLink>
                         <MenuLink href={ROUTES.rider.payments} onClick={closeMenu}>
-                          Payments (soon)
+                          Rider Payments
                         </MenuLink>
                       </div>
                     </>
