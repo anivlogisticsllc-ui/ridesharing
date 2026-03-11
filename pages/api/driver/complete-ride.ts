@@ -52,8 +52,7 @@ function asMessage(err: unknown) {
 }
 
 function clampInt(v: unknown): number | null {
-  const n =
-    typeof v === "number" ? v : typeof v === "string" ? Number(v) : NaN;
+  const n = typeof v === "number" ? v : typeof v === "string" ? Number(v) : NaN;
   if (!Number.isFinite(n)) return null;
   return Math.max(0, Math.round(n));
 }
@@ -82,6 +81,18 @@ function computeDriverSplit(collectedAmountCents: number) {
   const netAmountCents = Math.max(0, grossAmountCents - serviceFeeCents);
 
   return { grossAmountCents, serviceFeeCents, netAmountCents };
+}
+
+function restoreUndiscountedAmount(discountedAmountCents: number, cashDiscountBps: number) {
+  const discounted = Math.max(0, Math.round(discountedAmountCents));
+  const bps = clampCashDiscountBps(cashDiscountBps);
+
+  if (bps <= 0) return discounted;
+
+  const multiplier = (10000 - bps) / 10000;
+  if (multiplier <= 0) return discounted;
+
+  return Math.max(0, Math.round(discounted / multiplier));
 }
 
 async function getDefaultPaymentMethodForUser(userId: string) {
@@ -523,11 +534,14 @@ export default async function handler(
       );
     }
 
+    const providedFareCents = clampInt(body.fareCents);
+    const existingRideFareCents = clampInt(ride.totalPriceCents);
+
     const finalFareCents =
-      clampInt(body.fareCents) && clampInt(body.fareCents)! >= 50
-        ? clampInt(body.fareCents)!
-        : clampInt(ride.totalPriceCents) && clampInt(ride.totalPriceCents)! >= 50
-        ? clampInt(ride.totalPriceCents)!
+      providedFareCents && providedFareCents >= 50
+        ? providedFareCents
+        : existingRideFareCents && existingRideFareCents >= 50
+        ? existingRideFareCents
         : null;
 
     if (!finalFareCents) {
@@ -555,9 +569,30 @@ export default async function handler(
 
     const paymentType = (booking.paymentType ?? PaymentType.CARD) as PaymentType;
 
-    // CASH selected, driver reports unpaid -> charge backup card, no discount
     if (paymentType === PaymentType.CASH && body.unpaid === true) {
-      const receipt = computeReceipt(finalFareCents, 0);
+      const originalCashDiscountBps = clampCashDiscountBps(
+        (booking as any).originalCashDiscountBps ??
+          (booking as any).cashDiscountBps ??
+          0
+      );
+
+      const existingBaseAmountCents =
+        typeof (booking as any).baseAmountCents === "number" && (booking as any).baseAmountCents > 0
+          ? Math.round((booking as any).baseAmountCents)
+          : 0;
+
+      const restoredBaseFromDiscount = restoreUndiscountedAmount(
+        finalFareCents,
+        originalCashDiscountBps
+      );
+
+      const correctedBaseAmountCents = Math.max(
+        finalFareCents,
+        existingBaseAmountCents,
+        restoredBaseFromDiscount
+      );
+
+      const receipt = computeReceipt(correctedBaseAmountCents, 0);
 
       const charge = await chargeSavedCardOffSession({
         riderId,
@@ -577,21 +612,31 @@ export default async function handler(
         });
       }
 
-      await prisma.booking.update({
-        where: { id: booking.id },
-        data: {
-          paymentType: PaymentType.CARD,
-          cashDiscountBps: 0,
-          currency: "USD",
-          baseAmountCents: receipt.baseAmountCents,
-          discountCents: receipt.discountCents,
-          finalAmountCents: receipt.finalAmountCents,
-          cashNotPaidAt: completionTime,
-          cashNotPaidReportedById: driverId,
-          cashDiscountRevokedAt: completionTime,
-          cashDiscountRevokedReason: "Driver reported unpaid cash (RIDER_REFUSED_CASH)",
-          fallbackCardChargedAt: completionTime,
-        } as any,
+      await prisma.$transaction(async (tx) => {
+        await tx.ride.update({
+          where: { id: ride.id },
+          data: {
+            totalPriceCents: receipt.finalAmountCents,
+          },
+        });
+
+        await tx.booking.update({
+          where: { id: booking.id },
+          data: {
+            paymentType: PaymentType.CARD,
+            cashDiscountBps: 0,
+            currency: "USD",
+            baseAmountCents: receipt.baseAmountCents,
+            discountCents: receipt.discountCents,
+            finalAmountCents: receipt.finalAmountCents,
+            cashNotPaidAt: completionTime,
+            cashNotPaidReportedById: driverId,
+            cashNotPaidNote: body.note?.trim() || null,
+            cashDiscountRevokedAt: completionTime,
+            cashDiscountRevokedReason: "Driver reported unpaid cash (RIDER_REFUSED_CASH)",
+            fallbackCardChargedAt: completionTime,
+          } as any,
+        });
       });
 
       await writeFallbackCardRidePayment({
@@ -640,7 +685,6 @@ export default async function handler(
       return;
     }
 
-    // CASH paid successfully -> record discounted cash amount
     if (paymentType === PaymentType.CASH) {
       const bps =
         typeof (booking as any).cashDiscountBps === "number"
@@ -652,10 +696,12 @@ export default async function handler(
       await prisma.booking.update({
         where: { id: booking.id },
         data: {
+          paymentType: PaymentType.CASH,
           currency: "USD",
           baseAmountCents: receipt.baseAmountCents,
           discountCents: receipt.discountCents,
           finalAmountCents: receipt.finalAmountCents,
+          cashNotPaidNote: body.note?.trim() || null,
         } as any,
       });
 
@@ -704,7 +750,6 @@ export default async function handler(
       return;
     }
 
-    // CARD ride -> capture existing authorization
     const capture = await captureAuthorizedCardPayment({
       rideId: ride.id,
       amountToCaptureCents: finalFareCents,

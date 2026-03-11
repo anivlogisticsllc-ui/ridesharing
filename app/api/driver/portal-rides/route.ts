@@ -26,13 +26,9 @@ type PortalRide = {
   tripCompletedAt: string | null;
   distanceMiles: number | null;
 
-  // Driver-facing amount to display (should be booking.finalAmountCents when available)
+  // Driver-facing amount to display
+  // Prefer booking.finalAmountCents when available
   fareCents: number;
-
-  // OC info (return even if PAID/WAIVED/etc)
-  hasOutstandingCharge: boolean;
-  outstandingChargeId: string | null;
-  outstandingChargeStatus: string | null;
 };
 
 type ApiResponse =
@@ -79,7 +75,10 @@ export async function GET() {
     }
 
     const accepted = await prisma.ride.findMany({
-      where: { driverId: userId, status: { in: ["ACCEPTED", "IN_ROUTE"] } },
+      where: {
+        driverId: userId,
+        status: { in: ["ACCEPTED", "IN_ROUTE"] },
+      },
       orderBy: { departureTime: "asc" },
       include: {
         bookings: {
@@ -99,12 +98,20 @@ export async function GET() {
           take: 1,
           select: { id: true },
         },
-        rider: { select: { name: true, publicId: true } },
+        rider: {
+          select: {
+            name: true,
+            publicId: true,
+          },
+        },
       },
     });
 
     const completed = await prisma.ride.findMany({
-      where: { driverId: userId, status: "COMPLETED" },
+      where: {
+        driverId: userId,
+        status: "COMPLETED",
+      },
       orderBy: { tripCompletedAt: "desc" },
       include: {
         bookings: {
@@ -124,22 +131,27 @@ export async function GET() {
           take: 1,
           select: { id: true },
         },
-        rider: { select: { name: true, publicId: true } },
+        rider: {
+          select: {
+            name: true,
+            publicId: true,
+          },
+        },
       },
     });
 
     const allRides = [...accepted, ...completed];
 
-    // Unread counts
     const conversationIds = Array.from(
       new Set(
         allRides
-          .map((r) => r.conversations?.[0]?.id ?? null)
-          .filter((v): v is string => typeof v === "string" && v.length > 0)
+          .map((ride) => ride.conversations?.[0]?.id ?? null)
+          .filter((value): value is string => typeof value === "string" && value.length > 0)
       )
     );
 
     const unreadByConversationId: Record<string, number> = {};
+
     if (conversationIds.length) {
       const rows = await prisma.$queryRaw<{ conversationId: string; unreadCount: bigint }[]>(
         Prisma.sql`
@@ -157,77 +169,58 @@ export async function GET() {
         `
       );
 
-      for (const r of rows) unreadByConversationId[r.conversationId] = Number(r.unreadCount);
+      for (const row of rows) {
+        unreadByConversationId[row.conversationId] = Number(row.unreadCount);
+      }
     }
 
-    // OC rows by bookingId (ALL statuses)
-    const bookingIds = Array.from(
-      new Set(
-        allRides
-          .map((r) => r.bookings?.[0]?.id ?? null)
-          .filter((v): v is string => typeof v === "string" && v.length > 0)
-      )
-    );
-
-    const ocByBookingId: Record<string, { id: string; status: string }> = {};
-    if (bookingIds.length) {
-      const charges = await prisma.outstandingCharge.findMany({
-        where: { bookingId: { in: bookingIds } },
-        select: { id: true, bookingId: true, status: true },
-      });
-
-      for (const c of charges) ocByBookingId[c.bookingId] = { id: c.id, status: c.status };
-    }
-
-    const mapRide = (r: (typeof accepted)[number]): PortalRide => {
-      const b = r.bookings?.[0] ?? null;
-      const conversationId = r.conversations?.[0]?.id ?? null;
-
-      const oc = b?.id ? ocByBookingId[b.id] ?? null : null;
+    const mapRide = (ride: (typeof accepted)[number]): PortalRide => {
+      const booking = ride.bookings?.[0] ?? null;
+      const conversationId = ride.conversations?.[0]?.id ?? null;
 
       const fareCents = computeFareCents({
-        rideTotalCents: (r as any).totalPriceCents,
-        bookingFinalAmountCents: b?.finalAmountCents ?? null,
+        rideTotalCents: ride.totalPriceCents,
+        bookingFinalAmountCents: booking?.finalAmountCents ?? null,
       });
 
       return {
-        rideId: r.id,
-        originCity: (r as any).originCity,
-        destinationCity: (r as any).destinationCity,
-        departureTime: (r as any).departureTime.toISOString(),
-        status: (r as any).status,
+        rideId: ride.id,
+        originCity: ride.originCity,
+        destinationCity: ride.destinationCity,
+        departureTime: ride.departureTime.toISOString(),
+        status: ride.status,
 
-        riderName: r.rider?.name ?? null,
-        riderPublicId: r.rider?.publicId ?? null,
+        riderName: ride.rider?.name ?? null,
+        riderPublicId: ride.rider?.publicId ?? null,
 
         conversationId,
         unreadCount: conversationId ? unreadByConversationId[conversationId] ?? 0 : 0,
 
-        bookingId: b?.id ?? null,
-        paymentType: b?.paymentType ?? null,
-        cashDiscountBps: b?.cashDiscountBps ?? null,
+        bookingId: booking?.id ?? null,
+        paymentType: booking?.paymentType ?? null,
+        cashDiscountBps: booking?.cashDiscountBps ?? null,
 
-        tripStartedAt: (r as any).tripStartedAt ? (r as any).tripStartedAt.toISOString() : null,
-        tripCompletedAt: (r as any).tripCompletedAt ? (r as any).tripCompletedAt.toISOString() : null,
-        distanceMiles: (r as any).distanceMiles ?? null,
+        tripStartedAt: ride.tripStartedAt ? ride.tripStartedAt.toISOString() : null,
+        tripCompletedAt: ride.tripCompletedAt ? ride.tripCompletedAt.toISOString() : null,
+        distanceMiles: ride.distanceMiles ?? null,
 
         fareCents,
-
-        // show OC badge if row exists at all; UI can render status label (PAID/OPEN/etc)
-        hasOutstandingCharge: Boolean(oc?.id),
-        outstandingChargeId: oc?.id ?? null,
-        outstandingChargeStatus: oc?.status ?? null,
       };
     };
 
     return NextResponse.json(
-      { ok: true, accepted: accepted.map(mapRide), completed: completed.map(mapRide) } satisfies ApiResponse,
+      {
+        ok: true,
+        accepted: accepted.map(mapRide),
+        completed: completed.map(mapRide),
+      } satisfies ApiResponse,
       { status: 200 }
     );
   } catch (err) {
     console.error("GET /api/driver/portal-rides error:", err);
-    return NextResponse.json({ ok: false, error: "Internal server error" } satisfies ApiResponse, {
-      status: 500,
-    });
+    return NextResponse.json(
+      { ok: false, error: "Internal server error" } satisfies ApiResponse,
+      { status: 500 }
+    );
   }
 }

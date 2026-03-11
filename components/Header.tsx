@@ -3,9 +3,29 @@
 import Link from "next/link";
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useSession, signIn, signOut } from "next-auth/react";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 
 type Role = "RIDER" | "DRIVER" | "ADMIN";
+
+type NotificationItem = {
+  id: string;
+  type: string;
+  title: string;
+  message: string;
+  readAt: string | null;
+  createdAt: string;
+  rideId: string | null;
+  bookingId: string | null;
+  metadata: unknown;
+};
+
+type NotificationsApiResponse =
+  | {
+      ok: true;
+      unreadCount: number;
+      notifications: NotificationItem[];
+    }
+  | { ok: false; error: string };
 
 function asRole(v: unknown): Role | null {
   return v === "RIDER" || v === "DRIVER" || v === "ADMIN" ? v : null;
@@ -52,7 +72,33 @@ type SessionUserLike = {
   email?: string | null;
 };
 
+function formatRelative(dateIso: string) {
+  const d = new Date(dateIso);
+  if (Number.isNaN(d.getTime())) return "";
+
+  const diffMs = Date.now() - d.getTime();
+  const diffMin = Math.floor(diffMs / 60000);
+
+  if (diffMin < 1) return "just now";
+  if (diffMin < 60) return `${diffMin}m ago`;
+
+  const diffHr = Math.floor(diffMin / 60);
+  if (diffHr < 24) return `${diffHr}h ago`;
+
+  const diffDay = Math.floor(diffHr / 24);
+  if (diffDay < 7) return `${diffDay}d ago`;
+
+  return d.toLocaleDateString();
+}
+
+function notificationHref(n: NotificationItem) {
+  if (n.bookingId) return `/receipt/${n.bookingId}`;
+  if (n.rideId) return `/rider/trips/${n.rideId}`;
+  return "/rider/portal";
+}
+
 export function Header() {
+  const router = useRouter();
   const { data: session, status } = useSession();
   const pathname = usePathname();
 
@@ -87,6 +133,62 @@ export function Header() {
   const [open, setOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement | null>(null);
 
+  const [notifications, setNotifications] = useState<NotificationItem[]>([]);
+  const [unreadCount, setUnreadCount] = useState(0);
+  const [notifLoading, setNotifLoading] = useState(false);
+
+  async function loadNotifications() {
+    if (!session) return;
+
+    try {
+      setNotifLoading(true);
+      const res = await fetch("/api/notifications?take=8", { cache: "no-store" });
+      const json = (await res.json().catch(() => null)) as NotificationsApiResponse | null;
+
+      if (!res.ok || !json || !json.ok) return;
+
+      setNotifications(json.notifications);
+      setUnreadCount(json.unreadCount);
+    } catch (err) {
+      console.error("[header] load notifications failed:", err);
+    } finally {
+      setNotifLoading(false);
+    }
+  }
+
+  async function markNotificationRead(id: string) {
+    try {
+      await fetch("/api/notifications/read", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ id }),
+      });
+
+      setNotifications((prev) =>
+        prev.map((n) => (n.id === id ? { ...n, readAt: n.readAt ?? new Date().toISOString() } : n))
+      );
+      setUnreadCount((prev) => Math.max(0, prev - 1));
+    } catch (err) {
+      console.error("[header] mark notification read failed:", err);
+    }
+  }
+
+  async function markAllNotificationsRead() {
+    try {
+      await fetch("/api/notifications/read", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ all: true }),
+      });
+
+      const now = new Date().toISOString();
+      setNotifications((prev) => prev.map((n) => ({ ...n, readAt: n.readAt ?? now })));
+      setUnreadCount(0);
+    } catch (err) {
+      console.error("[header] mark all notifications read failed:", err);
+    }
+  }
+
   useEffect(() => {
     function onDocMouseDown(e: MouseEvent) {
       if (!open) return;
@@ -108,7 +210,6 @@ export function Header() {
     };
   }, [open]);
 
-  // Close on browser back/forward (counts as an external event callback, lint is fine with it)
   useEffect(() => {
     function onPopState() {
       setOpen(false);
@@ -116,6 +217,18 @@ export function Header() {
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
   }, []);
+
+  useEffect(() => {
+    if (status !== "authenticated") return;
+    loadNotifications();
+    const id = window.setInterval(loadNotifications, 30000);
+    return () => window.clearInterval(id);
+  }, [status]);
+
+  useEffect(() => {
+    if (!open || !session) return;
+    loadNotifications();
+  }, [open, session]);
 
   const profileHref = isDriver
     ? ROUTES.driver.profile
@@ -132,6 +245,12 @@ export function Header() {
 
   function closeMenu() {
     setOpen(false);
+  }
+
+  async function handleNotificationClick(n: NotificationItem) {
+    await markNotificationRead(n.id);
+    setOpen(false);
+    router.push(notificationHref(n));
   }
 
   return (
@@ -198,9 +317,16 @@ export function Header() {
                 aria-label="User menu"
                 title="Account"
               >
-                <span className="flex h-5 w-5 items-center justify-center rounded-full bg-indigo-600 text-[10px] font-semibold text-white">
+                <span className="relative flex h-5 w-5 items-center justify-center rounded-full bg-indigo-600 text-[10px] font-semibold text-white">
                   {initials || "U"}
+
+                  {unreadCount > 0 ? (
+                    <span className="absolute -right-1 -top-1 flex h-4 min-w-[16px] items-center justify-center rounded-full bg-rose-600 px-1 text-[9px] font-bold text-white ring-2 ring-white">
+                      {unreadCount > 9 ? "9+" : unreadCount}
+                    </span>
+                  ) : null}
                 </span>
+
                 <span className="max-w-[180px] truncate">{rawName}</span>
                 <span className="text-[10px] text-slate-500">▾</span>
               </button>
@@ -208,11 +334,74 @@ export function Header() {
               {open ? (
                 <div
                   role="menu"
-                  className="absolute right-0 z-[9999] mt-2 w-72 overflow-hidden rounded-xl border border-slate-200 bg-white shadow-lg"
+                  className="absolute right-0 z-[9999] mt-2 w-80 overflow-hidden rounded-xl border border-slate-200 bg-white shadow-lg"
                 >
                   <div className="px-3 py-2">
                     <div className="truncate text-xs font-semibold text-slate-900">{rawName}</div>
                     <div className="text-[11px] text-slate-500">Role: {roleLabel}</div>
+                  </div>
+
+                  <div className="h-px bg-slate-200" />
+
+                  <div className="px-3 py-2">
+                    <div className="mb-2 flex items-center justify-between">
+                      <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                        Notifications
+                      </div>
+
+                      {unreadCount > 0 ? (
+                        <button
+                          type="button"
+                          onClick={markAllNotificationsRead}
+                          className="text-[11px] font-medium text-indigo-600 hover:text-indigo-700"
+                        >
+                          Mark all read
+                        </button>
+                      ) : null}
+                    </div>
+
+                    {notifLoading ? (
+                      <div className="py-2 text-xs text-slate-500">Loading…</div>
+                    ) : notifications.length === 0 ? (
+                      <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-500">
+                        No notifications yet.
+                      </div>
+                    ) : (
+                      <div className="max-h-72 space-y-2 overflow-y-auto">
+                        {notifications.map((n) => (
+                          <button
+                            key={n.id}
+                            type="button"
+                            onClick={() => void handleNotificationClick(n)}
+                            className={[
+                              "w-full rounded-lg border px-3 py-2 text-left transition",
+                              n.readAt
+                                ? "border-slate-200 bg-white hover:bg-slate-50"
+                                : "border-rose-200 bg-rose-50 hover:bg-rose-100",
+                            ].join(" ")}
+                          >
+                            <div className="flex items-start justify-between gap-2">
+                              <div className="min-w-0">
+                                <div className="text-xs font-semibold text-slate-900">
+                                  {n.title}
+                                </div>
+                                <div className="mt-1 line-clamp-2 text-[11px] text-slate-600">
+                                  {n.message}
+                                </div>
+                              </div>
+
+                              {!n.readAt ? (
+                                <span className="mt-1 h-2.5 w-2.5 shrink-0 rounded-full bg-rose-600" />
+                              ) : null}
+                            </div>
+
+                            <div className="mt-2 text-[10px] text-slate-400">
+                              {formatRelative(n.createdAt)}
+                            </div>
+                          </button>
+                        ))}
+                      </div>
+                    )}
                   </div>
 
                   <div className="h-px bg-slate-200" />

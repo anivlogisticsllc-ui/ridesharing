@@ -9,78 +9,87 @@ datasource db {
 }
 
 model User {
-  id                         String                   @id @default(cuid())
-  email                      String                   @unique
-  name                       String?
-  role                       UserRole                 @default(RIDER)
-  phone                      String?
-  passwordHash               String
-  photoUrl                   String?
-  bio                        String?
-  ratingAverage              Float                    @default(0)
-  ratingCount                Int                      @default(0)
-  isVerifiedDriver           Boolean                  @default(false)
-  memberSince                DateTime                 @default(now())
-  accountStatus              AccountStatus            @default(ACTIVE)
-  createdAt                  DateTime                 @default(now())
-  updatedAt                  DateTime                 @updatedAt
-  emailVerified              Boolean                  @default(false)
-  addressLine1               String?
-  addressLine2               String?
-  city                       String?
-  country                    String?                  @default("US")
-  onboardingCompleted        Boolean                  @default(false)
-  postalCode                 String?
-  state                      String?
-  stripeCustomerId           String?                  @unique
-  stripeDefaultPaymentId     String?
-  membershipActive           Boolean                  @default(false)
-  membershipPlan             String?
-  trialEndsAt                DateTime?
-  publicId                   String?                  @unique
-  onboardingStep             Int?
-  isAdmin                    Boolean                  @default(false)
-  freeMembershipEndsAt       DateTime?                @db.Timestamptz(6)
-  bookings                   Booking[]                @relation("RiderBookings")
-  driverConversations        Conversation[]           @relation("DriverConversations")
-  riderConversations         Conversation[]           @relation("RiderConversations")
-  driverProfile              DriverProfile?
-  emailVerificationTokens    EmailVerificationToken[]
-  memberships                Membership[]
-  messages                   Message[]                @relation("UserMessages")
-  passwordResetTokens        PasswordResetToken[]
-  paymentMethods             PaymentMethod[]
-  payouts                    Payout[]
-  rides                      Ride[]                   @relation("DriverRides")
-  riderRides                 Ride[]                   @relation("RiderRides")
-  ridePayments               RidePayment[]
-  transactions               Transaction[]            @relation("DriverTransactions")
-  outstandingCharges         OutstandingCharge[]      @relation("UserOutstandingCharges")
-  reportedOutstandingCharges OutstandingCharge[]      @relation("DriverReportedOutstandingCharges")
-  pmStripeProbeFailedAt      DateTime?
-  pmStripeProbeFailCount     Int                      @default(0)
-  pmStripeLastVerifiedAt     DateTime?
-  // What rider selected at booking time
-  requestedPaymentType       PaymentType? // "CASH" | "CARD"
+  id                     String        @id @default(cuid())
+  email                  String        @unique
+  name                   String?
+  role                   UserRole      @default(RIDER)
+  phone                  String?
+  passwordHash           String
+  photoUrl               String?
+  bio                    String?
+  ratingAverage          Float         @default(0)
+  ratingCount            Int           @default(0)
+  isVerifiedDriver       Boolean       @default(false)
+  memberSince            DateTime      @default(now())
+  accountStatus          AccountStatus @default(ACTIVE)
+  createdAt              DateTime      @default(now())
+  updatedAt              DateTime      @updatedAt
+  emailVerified          Boolean       @default(false)
+  addressLine1           String?
+  addressLine2           String?
+  city                   String?
+  country                String?       @default("US")
+  onboardingCompleted    Boolean       @default(false)
+  postalCode             String?
+  state                  String?
+  stripeCustomerId       String?       @unique
+  stripeDefaultPaymentId String?
+  membershipActive       Boolean       @default(false)
+  membershipPlan         String?
+  trialEndsAt            DateTime?
+  publicId               String?       @unique
+  onboardingStep         Int?
+  isAdmin                Boolean       @default(false)
+  freeMembershipEndsAt   DateTime?     @db.Timestamptz(6)
+  pmStripeProbeFailedAt  DateTime?
+  pmStripeProbeFailCount Int           @default(0)
+  pmStripeLastVerifiedAt DateTime?
 
-  // What we actually collected at the end (may differ)
-  finalPaymentType PaymentType? // "CASH" | "CARD"
+  // Historical / rider preference bookkeeping
+  requestedPaymentType PaymentType?
+  finalPaymentType     PaymentType?
 
   // Cash discount bookkeeping
-  cashDiscountEligible    Boolean @default(false)
-  cashDiscountApplied     Boolean @default(false)
-  cashDiscountAmountCents Int     @default(0)
+  cashDiscountEligible    Boolean   @default(false)
+  cashDiscountApplied     Boolean   @default(false)
+  cashDiscountAmountCents Int       @default(0)
+  cashDiscountRevoked     Boolean   @default(false)
+  cashDiscountRevokedAt   DateTime?
+  cashNotPaid             Boolean   @default(false)
+  cashNotPaidReason       String?
+  cashReceivedMarkedAt    DateTime?
+  cashReceivedMarkedById  String?
 
-  // If discount was removed because cash wasn’t paid
-  cashDiscountRevoked   Boolean   @default(false)
-  cashDiscountRevokedAt DateTime?
-  cashNotPaid           Boolean   @default(false)
-  cashNotPaidReason     String?
+  // Driver compliance / penalties
+  cashRideViolationCount     Int       @default(0)
+  cashRideBlockedUntil       DateTime?
+  cashRidePermanentlyBlocked Boolean   @default(false)
+  removedAt                  DateTime?
+  removedReason              String?
 
-  // “Evidence” / audit metadata
-  cashReceivedMarkedAt   DateTime?
-  cashReceivedMarkedById String? // userId (driver/admin) if you want
-  membershipCharges      MembershipCharge[]
+  // Relations
+  bookings                Booking[]                @relation("RiderBookings")
+  driverConversations     Conversation[]           @relation("DriverConversations")
+  riderConversations      Conversation[]           @relation("RiderConversations")
+  driverProfile           DriverProfile?
+  emailVerificationTokens EmailVerificationToken[]
+  memberships             Membership[]
+  membershipCharges       MembershipCharge[]
+  messages                Message[]                @relation("UserMessages")
+  notifications           Notification[]
+  passwordResetTokens     PasswordResetToken[]
+  paymentMethods          PaymentMethod[]
+  payouts                 Payout[]
+  rides                   Ride[]                   @relation("DriverRides")
+  riderRides              Ride[]                   @relation("RiderRides")
+  ridePayments            RidePayment[]
+  transactions            Transaction[]            @relation("DriverTransactions")
+
+  riderDisputes    Dispute[] @relation("RiderDisputes")
+  driverDisputes   Dispute[] @relation("DriverDisputes")
+  resolvedDisputes Dispute[] @relation("ResolvedDisputes")
+
+  adminAuditLogs AdminAuditLog[] @relation("AdminAuditActor")
 }
 
 model DriverProfile {
@@ -194,37 +203,40 @@ model EmailVerificationToken {
 }
 
 model Ride {
-  id                 String              @id @default(cuid())
-  driverId           String?
-  originCity         String
-  originLat          Float
-  originLng          Float
-  destinationCity    String
-  destinationLat     Float
-  destinationLng     Float
-  departureTime      DateTime
-  distanceMiles      Float
-  vehicleMake        String?
-  vehicleModel       String?
-  vehicleColor       String?
-  licensePlate       String?
-  preferencesJson    Json?
-  status             RideStatus          @default(OPEN)
-  createdAt          DateTime            @default(now())
-  updatedAt          DateTime            @updatedAt
-  riderId            String?
-  passengerCount     Int                 @default(1)
-  totalPriceCents    Int                 @default(0)
-  tripCompletedAt    DateTime?
-  tripStartedAt      DateTime?
-  clientRequestId    String?             @unique
-  bookings           Booking[]
-  conversations      Conversation[]
-  driver             User?               @relation("DriverRides", fields: [driverId], references: [id])
-  rider              User?               @relation("RiderRides", fields: [riderId], references: [id])
-  ridePayments       RidePayment[]
-  transactions       Transaction[]
-  outstandingCharges OutstandingCharge[] @relation("RideOutstandingCharges")
+  id              String     @id @default(cuid())
+  driverId        String?
+  originCity      String
+  originLat       Float
+  originLng       Float
+  destinationCity String
+  destinationLat  Float
+  destinationLng  Float
+  departureTime   DateTime
+  distanceMiles   Float
+  vehicleMake     String?
+  vehicleModel    String?
+  vehicleColor    String?
+  licensePlate    String?
+  preferencesJson Json?
+  status          RideStatus @default(OPEN)
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+  riderId         String?
+  passengerCount  Int        @default(1)
+  totalPriceCents Int        @default(0)
+  tripCompletedAt DateTime?
+  tripStartedAt   DateTime?
+  clientRequestId String?    @unique
+
+  bookings      Booking[]
+  conversations Conversation[]
+  disputes      Dispute[]
+  notifications Notification[]
+  ridePayments  RidePayment[]
+  transactions  Transaction[]
+
+  driver User? @relation("DriverRides", fields: [driverId], references: [id])
+  rider  User? @relation("RiderRides", fields: [riderId], references: [id])
 
   @@index([driverId, status])
   @@index([riderId, status])
@@ -254,7 +266,7 @@ model Booking {
   stripePaymentIntentId     String? @unique
   stripePaymentIntentStatus String?
 
-  // ---------- NEW: original intent + override audit ----------
+  // Original intent + override audit
   originalPaymentType     PaymentType?
   originalCashDiscountBps Int?         @default(0)
 
@@ -262,20 +274,18 @@ model Booking {
   cashNotPaidByUserId       String?
   cashDiscountRevokedAt     DateTime?
   cashDiscountRevokedReason String?
+  fallbackCardChargedAt     DateTime?
 
-  // optional: when you actually charged the backup card
-  fallbackCardChargedAt DateTime?
+  cashNotPaidNote         String?
+  cashNotPaidReportedById String?
+  cashNotPaidReason       String?
 
-  // relations...
-  ride              Ride               @relation(fields: [rideId], references: [id])
-  rider             User?              @relation("RiderBookings", fields: [riderId], references: [id])
-  conversation      Conversation?
-  outstandingCharge OutstandingCharge?
-  rideAuditLogs     RideAuditLog[]
-
-  cashNotPaidNote         String? // NEW: driver/admin note
-  cashNotPaidReportedById String? // NEW: who wrote the note (driver or admin)
-  cashNotPaidReason       String? // e.g. RIDER_REFUSED_CASH | RIDER_NO_CASH | OTHER
+  ride          Ride           @relation(fields: [rideId], references: [id])
+  rider         User?          @relation("RiderBookings", fields: [riderId], references: [id])
+  conversation  Conversation?
+  disputes      Dispute[]
+  notifications Notification[]
+  rideAuditLogs RideAuditLog[]
 
   @@index([rideId])
   @@index([riderId])
@@ -295,11 +305,12 @@ model Conversation {
   bookingId        String?   @unique
   driverLastReadAt DateTime? @db.Timestamp(6)
   riderLastReadAt  DateTime? @db.Timestamp(6)
-  booking          Booking?  @relation(fields: [bookingId], references: [id])
-  driver           User      @relation("DriverConversations", fields: [driverId], references: [id])
-  ride             Ride      @relation(fields: [rideId], references: [id])
-  rider            User      @relation("RiderConversations", fields: [riderId], references: [id])
-  messages         Message[]
+
+  booking  Booking?  @relation(fields: [bookingId], references: [id])
+  driver   User      @relation("DriverConversations", fields: [driverId], references: [id])
+  ride     Ride      @relation(fields: [rideId], references: [id])
+  rider    User      @relation("RiderConversations", fields: [riderId], references: [id])
+  messages Message[]
 
   @@index([rideId])
   @@index([driverId])
@@ -307,14 +318,15 @@ model Conversation {
 }
 
 model Message {
-  id             String       @id @default(cuid())
-  createdAt      DateTime     @default(now())
-  updatedAt      DateTime     @updatedAt
+  id             String   @id @default(cuid())
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
   conversationId String
   senderId       String
   body           String
-  conversation   Conversation @relation(fields: [conversationId], references: [id])
-  sender         User         @relation("UserMessages", fields: [senderId], references: [id])
+
+  conversation Conversation @relation(fields: [conversationId], references: [id])
+  sender       User         @relation("UserMessages", fields: [senderId], references: [id])
 
   @@index([conversationId])
   @@index([senderId])
@@ -330,8 +342,9 @@ model Transaction {
   netAmountCents   Int
   status           TransactionStatus @default(PENDING)
   createdAt        DateTime          @default(now())
-  driver           User              @relation("DriverTransactions", fields: [driverId], references: [id])
-  ride             Ride              @relation(fields: [rideId], references: [id])
+
+  driver User @relation("DriverTransactions", fields: [driverId], references: [id])
+  ride   Ride @relation(fields: [rideId], references: [id])
 
   @@index([driverId])
   @@index([rideId])
@@ -342,27 +355,29 @@ model PasswordResetToken {
   token     String   @id
   userId    String
   expiresAt DateTime
-  user      User     @relation(fields: [userId], references: [id])
+
+  user User @relation(fields: [userId], references: [id])
 
   @@index([userId])
 }
 
 model PaymentMethod {
-  id                      String             @id @default(cuid())
+  id                      String   @id @default(cuid())
   userId                  String
-  provider                String             @default("STRIPE")
+  provider                String   @default("STRIPE")
   providerPaymentMethodId String?
   brand                   String?
   last4                   String?
   expMonth                Int?
   expYear                 Int?
-  isDefault               Boolean            @default(false)
-  createdAt               DateTime           @default(now())
-  updatedAt               DateTime           @updatedAt
+  isDefault               Boolean  @default(false)
+  createdAt               DateTime @default(now())
+  updatedAt               DateTime @updatedAt
   stripePaymentMethodId   String?
-  user                    User               @relation(fields: [userId], references: [id])
-  ridePayments            RidePayment[]      @relation("RidePaymentPaymentMethod")
-  membershipCharges       MembershipCharge[]
+
+  user              User               @relation(fields: [userId], references: [id])
+  ridePayments      RidePayment[]      @relation("RidePaymentPaymentMethod")
+  membershipCharges MembershipCharge[]
 
   @@unique([userId, stripePaymentMethodId])
   @@index([userId])
@@ -392,10 +407,12 @@ model RidePayment {
   stripeChargeId        String?           @unique
   stripeCustomerId      String?
   stripePaymentIntentId String?           @unique
-  refunds               Refund[]
-  paymentMethod         PaymentMethod?    @relation("RidePaymentPaymentMethod", fields: [paymentMethodId], references: [id])
-  ride                  Ride              @relation(fields: [rideId], references: [id], onDelete: Cascade)
-  rider                 User              @relation(fields: [riderId], references: [id], onDelete: Cascade)
+
+  paymentMethod PaymentMethod? @relation("RidePaymentPaymentMethod", fields: [paymentMethodId], references: [id])
+  ride          Ride           @relation(fields: [rideId], references: [id], onDelete: Cascade)
+  rider         User           @relation(fields: [riderId], references: [id], onDelete: Cascade)
+  refunds       Refund[]
+  disputes      Dispute[]
 
   @@index([riderId])
   @@index([rideId])
@@ -414,7 +431,8 @@ model Refund {
   providerRef   String?      @unique
   createdAt     DateTime     @default(now())
   updatedAt     DateTime     @updatedAt
-  ridePayment   RidePayment  @relation(fields: [ridePaymentId], references: [id])
+
+  ridePayment RidePayment @relation(fields: [ridePaymentId], references: [id])
 
   @@index([ridePaymentId])
 }
@@ -429,24 +447,103 @@ model Payout {
   providerRef String?      @unique
   createdAt   DateTime     @default(now())
   updatedAt   DateTime     @updatedAt
-  driver      User         @relation(fields: [driverId], references: [id])
+
+  driver User @relation(fields: [driverId], references: [id])
 
   @@index([driverId])
 }
 
 model RideAuditLog {
-  id        String  @id @default(cuid())
-  bookingId String
-  booking   Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
-
-  type    String // e.g. "CASH_SELECTED", "CASH_NOT_PAID", "DISCOUNT_REVOKED", "CARD_CHARGED"
-  message String?
-  meta    Json?
-
-  actorUserId String? // driver/admin/system user id
+  id          String   @id @default(cuid())
+  bookingId   String
+  type        String
+  message     String?
+  meta        Json?
+  actorUserId String?
   createdAt   DateTime @default(now())
 
+  booking Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+
   @@index([bookingId, createdAt])
+}
+
+model Notification {
+  id        String           @id @default(cuid())
+  userId    String
+  rideId    String?
+  bookingId String?
+  type      NotificationType
+  title     String
+  message   String
+  metadata  Json?
+  readAt    DateTime?
+  createdAt DateTime         @default(now())
+  updatedAt DateTime         @updatedAt
+
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  ride    Ride?    @relation(fields: [rideId], references: [id], onDelete: SetNull)
+  booking Booking? @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+
+  @@index([userId, readAt])
+  @@index([userId, type])
+  @@index([rideId])
+  @@index([bookingId])
+}
+
+model Dispute {
+  id                String           @id @default(cuid())
+  rideId            String
+  bookingId         String
+  ridePaymentId     String?
+  riderId           String
+  driverId          String?
+  reason            DisputeReason
+  status            DisputeStatus    @default(OPEN)
+  riderStatement    String
+  adminDecision     DisputeDecision?
+  adminNotes        String?
+  resolvedAt        DateTime?
+  resolvedByAdminId String?
+  refundIssued      Boolean          @default(false)
+  refundAmountCents Int?
+  refundIssuedAt    DateTime?
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+
+  ride            Ride            @relation(fields: [rideId], references: [id], onDelete: Cascade)
+  booking         Booking         @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  ridePayment     RidePayment?    @relation(fields: [ridePaymentId], references: [id], onDelete: SetNull)
+  rider           User            @relation("RiderDisputes", fields: [riderId], references: [id], onDelete: Cascade)
+  driver          User?           @relation("DriverDisputes", fields: [driverId], references: [id], onDelete: SetNull)
+  resolvedByAdmin User?           @relation("ResolvedDisputes", fields: [resolvedByAdminId], references: [id], onDelete: SetNull)
+  adminAuditLogs  AdminAuditLog[]
+
+  @@index([rideId])
+  @@index([bookingId])
+  @@index([ridePaymentId])
+  @@index([riderId, status])
+  @@index([driverId, status])
+  @@index([status, createdAt])
+}
+
+model AdminAuditLog {
+  id          String          @id @default(cuid())
+  adminUserId String
+  disputeId   String?
+  actionType  AdminActionType
+  targetType  AdminTargetType
+  targetId    String
+  notes       String?
+  metadata    Json?
+  createdAt   DateTime        @default(now())
+
+  adminUser User     @relation("AdminAuditActor", fields: [adminUserId], references: [id], onDelete: Cascade)
+  dispute   Dispute? @relation(fields: [disputeId], references: [id], onDelete: SetNull)
+
+  @@index([adminUserId, createdAt])
+  @@index([disputeId])
+  @@index([targetType, targetId])
+  @@index([actionType, createdAt])
 }
 
 enum UserRole {
@@ -529,20 +626,6 @@ enum PaymentType {
   CASH
 }
 
-enum OutstandingChargeStatus {
-  OPEN
-  PAID
-  DISPUTED
-  WAIVED
-  CANCELED
-}
-
-enum OutstandingChargeReason {
-  RIDER_REFUSED_CASH
-  RIDER_NO_CASH
-  OTHER
-}
-
 enum MembershipInterval {
   MONTHLY
 }
@@ -555,40 +638,51 @@ enum MembershipChargeStatus {
   REFUNDED
 }
 
-model OutstandingCharge {
-  id String @id @default(cuid())
+enum NotificationType {
+  CASH_UNPAID_FALLBACK_CHARGED
+  DISPUTE_OPENED
+  DISPUTE_STATUS_UPDATED
+  DISPUTE_RESOLVED_RIDER
+  DISPUTE_RESOLVED_DRIVER
+  REFUND_ISSUED
+  DRIVER_CASH_BLOCKED_30_DAYS
+  DRIVER_REMOVED_FOR_REPEAT_CASH_FRAUD
+}
 
-  riderId   String
-  rideId    String
-  bookingId String
+enum DisputeReason {
+  CASH_ALREADY_PAID
+  UNAUTHORIZED_FALLBACK_CHARGE
+  OTHER
+}
 
-  fareCents           Int
-  convenienceFeeCents Int
-  totalCents          Int
-  currency            String @default("USD")
+enum DisputeStatus {
+  OPEN
+  UNDER_REVIEW
+  RESOLVED_RIDER
+  RESOLVED_DRIVER
+  CLOSED
+}
 
-  status OutstandingChargeStatus @default(OPEN)
+enum DisputeDecision {
+  RIDER_FAVORED
+  DRIVER_FAVORED
+  NO_ACTION
+}
 
-  reportedByDriverId String
-  reason             OutstandingChargeReason
-  note               String?
+enum AdminActionType {
+  DISPUTE_MARKED_UNDER_REVIEW
+  DISPUTE_RESOLVED_RIDER
+  DISPUTE_RESOLVED_DRIVER
+  FALLBACK_CHARGE_REFUNDED
+  DRIVER_CASH_BLOCKED_30_DAYS
+  DRIVER_REMOVED_FOR_REPEAT_CASH_FRAUD
+}
 
-  stripePaymentIntentId String? @unique
-
-  createdAt  DateTime  @default(now())
-  updatedAt  DateTime  @updatedAt
-  paidAt     DateTime?
-  disputedAt DateTime?
-  resolvedAt DateTime?
-
-  //  IMPORTANT: name the relations and keep names consistent with User/Ride
-  rider   User    @relation("UserOutstandingCharges", fields: [riderId], references: [id], onDelete: Cascade)
-  driver  User    @relation("DriverReportedOutstandingCharges", fields: [reportedByDriverId], references: [id], onDelete: Cascade)
-  ride    Ride    @relation("RideOutstandingCharges", fields: [rideId], references: [id], onDelete: Cascade)
-  booking Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
-
-  @@unique([bookingId])
-  @@index([riderId, status])
-  @@index([reportedByDriverId, status])
-  @@index([rideId])
+enum AdminTargetType {
+  DISPUTE
+  RIDE
+  BOOKING
+  USER
+  RIDE_PAYMENT
+  REFUND
 }

@@ -17,11 +17,15 @@ function toStr(v: unknown): string {
 }
 
 function asCents(v: unknown): number | null {
-  if (typeof v === "number" && Number.isFinite(v)) return Math.max(0, Math.round(v));
+  if (typeof v === "number" && Number.isFinite(v)) {
+    return Math.max(0, Math.round(v));
+  }
+
   if (typeof v === "string" && v.trim() !== "") {
     const n = Number(v);
     return Number.isFinite(n) ? Math.max(0, Math.round(n)) : null;
   }
+
   return null;
 }
 
@@ -37,7 +41,8 @@ type RouteContext = { params: Promise<{ rideId: string }> };
 export async function GET(req: NextRequest, { params }: RouteContext) {
   try {
     const token = await getToken({ req });
-    const userId = toStr((token as any)?.sub || (token as any)?.id).trim();
+    const userId = toStr((token as { sub?: unknown; id?: unknown } | null)?.sub).trim()
+      || toStr((token as { sub?: unknown; id?: unknown } | null)?.id).trim();
 
     if (!userId) {
       return NextResponse.json(
@@ -50,6 +55,7 @@ export async function GET(req: NextRequest, { params }: RouteContext) {
 
     // NOTE: route segment is [rideId], but UI is passing bookingId. Keeping behavior as bookingId.
     const bookingId = toStr(rideId).trim();
+
     if (!bookingId) {
       return NextResponse.json(
         { ok: false, error: "Missing bookingId" } satisfies ReceiptResponse,
@@ -63,7 +69,9 @@ export async function GET(req: NextRequest, { params }: RouteContext) {
         id: true,
         status: true,
         paymentType: true,
+        originalPaymentType: true,
         cashDiscountBps: true,
+        originalCashDiscountBps: true,
         createdAt: true,
 
         riderId: true,
@@ -74,6 +82,17 @@ export async function GET(req: NextRequest, { params }: RouteContext) {
         discountCents: true,
         finalAmountCents: true,
         currency: true,
+
+        cashNotPaidAt: true,
+        cashNotPaidByUserId: true,
+        cashNotPaidReportedById: true,
+        cashNotPaidReason: true,
+        cashNotPaidNote: true,
+        cashDiscountRevokedAt: true,
+        cashDiscountRevokedReason: true,
+        fallbackCardChargedAt: true,
+        stripePaymentIntentId: true,
+        stripePaymentIntentStatus: true,
 
         ride: {
           select: {
@@ -89,25 +108,20 @@ export async function GET(req: NextRequest, { params }: RouteContext) {
             totalPriceCents: true,
 
             driverId: true,
-            driver: { select: { id: true, name: true, email: true } },
-            rider: { select: { id: true, name: true, email: true } },
-          },
-        },
-
-        outstandingCharge: {
-          select: {
-            id: true,
-            status: true,
-            fareCents: true,
-            convenienceFeeCents: true,
-            totalCents: true,
-            currency: true,
-            createdAt: true,
-            paidAt: true,
-            disputedAt: true,
-            resolvedAt: true,
-            reason: true,
-            note: true,
+            driver: {
+              select: {
+                id: true,
+                name: true,
+                email: true,
+              },
+            },
+            rider: {
+              select: {
+                id: true,
+                name: true,
+                email: true,
+              },
+            },
           },
         },
       },
@@ -122,7 +136,6 @@ export async function GET(req: NextRequest, { params }: RouteContext) {
 
     const ride = booking.ride;
 
-    // Receipt only after ride completed
     if (ride.status !== RideStatus.COMPLETED) {
       return NextResponse.json(
         { ok: false, error: "Receipt is only available for completed rides." } satisfies ReceiptResponse,
@@ -130,7 +143,6 @@ export async function GET(req: NextRequest, { params }: RouteContext) {
       );
     }
 
-    // Allow rider on booking OR driver on ride
     const isDriver = ride.driverId === userId;
     const isRider = booking.riderId === userId || ride.rider?.id === userId;
 
@@ -141,32 +153,30 @@ export async function GET(req: NextRequest, { params }: RouteContext) {
       );
     }
 
-    // Amount logic:
-    // If OutstandingCharge exists, it is the source of truth for "unpaid cash ride" scenario.
-    const oc = booking.outstandingCharge;
+    const fallbackCharged = Boolean(booking.cashNotPaidAt && booking.fallbackCardChargedAt);
 
-    const fareCents =
-      oc?.fareCents ??
+    const baseFareCents =
       asCents(booking.baseAmountCents) ??
       asCents(booking.finalAmountCents) ??
       asCents(ride.totalPriceCents) ??
       0;
 
-    const convenienceFeeCents = oc?.convenienceFeeCents ?? 0;
-    const discountCents = oc ? 0 : asCents(booking.discountCents) ?? 0;
+    const discountCents = fallbackCharged ? 0 : asCents(booking.discountCents) ?? 0;
 
     const totalCents =
-      oc?.totalCents ??
       asCents(booking.finalAmountCents) ??
-      Math.max(0, fareCents - discountCents);
+      Math.max(0, baseFareCents - discountCents);
 
     const receipt = {
       booking: {
         id: booking.id,
         status: booking.status,
         createdAt: booking.createdAt,
+
         paymentType: paymentLabel(booking.paymentType),
+        originalPaymentType: paymentLabel(booking.originalPaymentType),
         cashDiscountBps: booking.cashDiscountBps ?? 0,
+        originalCashDiscountBps: booking.originalCashDiscountBps ?? 0,
         currency: (booking.currency || "USD").toUpperCase(),
 
         riderId: booking.riderId,
@@ -184,31 +194,36 @@ export async function GET(req: NextRequest, { params }: RouteContext) {
         tripCompletedAt: ride.tripCompletedAt,
         passengerCount: ride.passengerCount,
         distanceMiles: ride.distanceMiles,
-        driver: ride.driver ? { name: ride.driver.name, email: ride.driver.email } : null,
+        driver: ride.driver
+          ? {
+              name: ride.driver.name,
+              email: ride.driver.email,
+            }
+          : null,
       },
 
       money: {
-        baseFareCents: fareCents,
+        baseFareCents,
         discountCents,
-        convenienceFeeCents,
+        convenienceFeeCents: 0,
         totalPriceCents: totalCents,
-        source: oc ? "OUTSTANDING_CHARGE" : "BOOKING",
+        source: fallbackCharged ? "BOOKING_FALLBACK_CARD" : "BOOKING",
       },
 
-      outstandingCharge: oc
+      cashFallback: fallbackCharged
         ? {
-            id: oc.id,
-            status: oc.status,
-            fareCents: oc.fareCents,
-            convenienceFeeCents: oc.convenienceFeeCents,
-            totalCents: oc.totalCents,
-            currency: (oc.currency || booking.currency || "USD").toUpperCase(),
-            reason: oc.reason,
-            note: oc.note,
-            createdAt: oc.createdAt,
-            paidAt: oc.paidAt,
-            disputedAt: oc.disputedAt,
-            resolvedAt: oc.resolvedAt,
+            originalPaymentType: paymentLabel(booking.originalPaymentType),
+            currentPaymentType: paymentLabel(booking.paymentType),
+            cashNotPaidAt: booking.cashNotPaidAt,
+            cashNotPaidByUserId: booking.cashNotPaidByUserId ?? booking.cashNotPaidReportedById ?? null,
+            cashNotPaidReportedById: booking.cashNotPaidReportedById ?? null,
+            cashNotPaidReason: booking.cashNotPaidReason ?? null,
+            cashNotPaidNote: booking.cashNotPaidNote ?? null,
+            cashDiscountRevokedAt: booking.cashDiscountRevokedAt,
+            cashDiscountRevokedReason: booking.cashDiscountRevokedReason ?? null,
+            fallbackCardChargedAt: booking.fallbackCardChargedAt,
+            stripePaymentIntentId: booking.stripePaymentIntentId ?? null,
+            stripePaymentIntentStatus: booking.stripePaymentIntentStatus ?? null,
           }
         : null,
     };

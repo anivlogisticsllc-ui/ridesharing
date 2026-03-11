@@ -2,7 +2,7 @@
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { prisma } from "@/lib/prisma";
-import { RideStatus } from "@prisma/client";
+import { PaymentType, RideStatus } from "@prisma/client";
 import EmailReceiptButton from "./EmailReceiptButton";
 import PrintButton from "./PrintButton";
 import AutoPrint from "./AutoPrint";
@@ -20,6 +20,12 @@ function clampCents(v: unknown): number {
   return typeof v === "number" && Number.isFinite(v) ? Math.max(0, Math.round(v)) : 0;
 }
 
+function paymentLabel(pt: PaymentType | null | undefined): string | null {
+  if (pt === PaymentType.CARD) return "CARD";
+  if (pt === PaymentType.CASH) return "CASH";
+  return null;
+}
+
 export default async function ReceiptPage({ params }: Props) {
   const { bookingId } = await params;
   if (!bookingId) notFound();
@@ -28,12 +34,16 @@ export default async function ReceiptPage({ params }: Props) {
     where: { id: bookingId },
     include: {
       rider: true,
-      ride: { include: { driver: true } },
-      outstandingCharge: true, // <-- IMPORTANT
+      ride: {
+        include: {
+          driver: true,
+        },
+      },
     },
   });
 
   if (!booking?.ride) notFound();
+
   const ride = booking.ride;
 
   if (ride.status !== RideStatus.COMPLETED) {
@@ -52,44 +62,48 @@ export default async function ReceiptPage({ params }: Props) {
 
   const distance = ride.distanceMiles ?? null;
 
-  // ---------------- Money source of truth ----------------
-  const oc = booking.outstandingCharge;
-
-  const useOutstandingCharge = !!oc;
+  const fallbackCharged = Boolean(booking.cashNotPaidAt && booking.fallbackCardChargedAt);
+  const originallyCash = booking.originalPaymentType === PaymentType.CASH;
+  const switchedToCardFallback =
+    originallyCash && booking.paymentType === PaymentType.CARD && fallbackCharged;
 
   let baseCents = 0;
   let discountCents = 0;
   let convenienceFeeCents = 0;
   let finalCents = 0;
-  let paymentLabel: string | null = null;
+  let displayedPaymentLabel: string | null = null;
 
-  if (useOutstandingCharge) {
-    baseCents = clampCents(oc!.fareCents);
-    discountCents = 0;
-    convenienceFeeCents = clampCents(oc!.convenienceFeeCents);
-    finalCents = clampCents(oc!.totalCents);
-    paymentLabel = "CASH";
+  const storedBase =
+    typeof booking.baseAmountCents === "number" && booking.baseAmountCents > 0
+      ? booking.baseAmountCents
+      : ride.totalPriceCents ?? 0;
+
+  const storedDiscount =
+    switchedToCardFallback
+      ? 0
+      : typeof booking.discountCents === "number"
+        ? booking.discountCents
+        : 0;
+
+  const storedFinal =
+    typeof booking.finalAmountCents === "number" && booking.finalAmountCents > 0
+      ? booking.finalAmountCents
+      : Math.max(0, storedBase - storedDiscount);
+
+  const netAfterDiscount = Math.max(0, storedBase - storedDiscount);
+  const fee = Math.max(0, storedFinal - netAfterDiscount);
+
+  baseCents = clampCents(storedBase);
+  discountCents = clampCents(storedDiscount);
+  finalCents = clampCents(storedFinal);
+  convenienceFeeCents = clampCents(fee);
+
+  if (switchedToCardFallback) {
+    displayedPaymentLabel = "CARD (fallback after unpaid CASH)";
+  } else if (originallyCash && booking.paymentType === PaymentType.CASH) {
+    displayedPaymentLabel = "CASH";
   } else {
-    const base =
-      typeof (booking as any).baseAmountCents === "number" && (booking as any).baseAmountCents > 0
-        ? (booking as any).baseAmountCents
-        : ride.totalPriceCents ?? 0;
-
-    const disc = typeof (booking as any).discountCents === "number" ? (booking as any).discountCents : 0;
-
-    const final =
-      typeof (booking as any).finalAmountCents === "number" && (booking as any).finalAmountCents > 0
-        ? (booking as any).finalAmountCents
-        : Math.max(0, base - disc);
-
-    const netAfterDiscount = Math.max(0, base - disc);
-    const fee = Math.max(0, final - netAfterDiscount);
-
-    baseCents = clampCents(base);
-    discountCents = clampCents(disc);
-    finalCents = clampCents(final);
-    convenienceFeeCents = clampCents(fee);
-    paymentLabel = booking.paymentType ?? "n/a";
+    displayedPaymentLabel = paymentLabel(booking.paymentType) ?? "n/a";
   }
 
   const showDiscount = discountCents > 0;
@@ -106,9 +120,10 @@ export default async function ReceiptPage({ params }: Props) {
             <p className="text-xs text-slate-500">
               Booking ID: <span className="font-mono">{booking.id}</span>
             </p>
-            {useOutstandingCharge ? (
+
+            {switchedToCardFallback ? (
               <p className="mt-1 text-[11px] text-slate-500">
-                Unpaid cash ride: includes outstanding-charge convenience fee.
+                Originally booked as cash. Driver reported cash was not received, and the saved card was charged.
               </p>
             ) : null}
           </div>
@@ -124,7 +139,9 @@ export default async function ReceiptPage({ params }: Props) {
             <p className="text-sm font-semibold text-slate-900">
               {ride.originCity} → {ride.destinationCity}
             </p>
-            <p className="text-xs text-slate-500">Completed: {ride.tripCompletedAt?.toLocaleString() ?? "n/a"}</p>
+            <p className="text-xs text-slate-500">
+              Completed: {ride.tripCompletedAt?.toLocaleString() ?? "n/a"}
+            </p>
           </div>
 
           <div className="mt-4 grid gap-4 sm:grid-cols-2">
@@ -156,7 +173,7 @@ export default async function ReceiptPage({ params }: Props) {
 
             <div>
               <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Payment</p>
-              <p className="mt-1 text-sm font-semibold text-slate-900">{paymentLabel ?? "n/a"}</p>
+              <p className="mt-1 text-sm font-semibold text-slate-900">{displayedPaymentLabel ?? "n/a"}</p>
             </div>
 
             <div className="sm:text-right">
@@ -187,6 +204,19 @@ export default async function ReceiptPage({ params }: Props) {
               <span className="font-semibold">${moneyFromCents(finalCents)}</span>
             </div>
           </div>
+
+          {switchedToCardFallback ? (
+            <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900">
+              <p className="font-semibold">Cash fallback charge</p>
+              <div className="mt-2 space-y-1 text-xs">
+                <p>Cash not paid at: {booking.cashNotPaidAt?.toLocaleString() ?? "n/a"}</p>
+                <p>Cash discount revoked at: {booking.cashDiscountRevokedAt?.toLocaleString() ?? "n/a"}</p>
+                <p>Fallback card charged at: {booking.fallbackCardChargedAt?.toLocaleString() ?? "n/a"}</p>
+                <p>Reason: {booking.cashNotPaidReason ?? "n/a"}</p>
+                {booking.cashNotPaidNote ? <p>Note: {booking.cashNotPaidNote}</p> : null}
+              </div>
+            </div>
+          ) : null}
         </section>
 
         <p className="text-xs text-slate-500">Tip: this page is printable. Use “Print” to save as PDF.</p>

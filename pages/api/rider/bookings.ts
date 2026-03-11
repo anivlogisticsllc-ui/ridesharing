@@ -8,7 +8,6 @@ import { BookingStatus, PaymentType } from "@prisma/client";
 type ApiBooking = {
   id: string;
   bookingId: string | null;
-
   status: BookingStatus;
 
   rideId: string;
@@ -30,58 +29,37 @@ type ApiBooking = {
 
   paymentType?: PaymentType | null;
   cashDiscountBps?: number | null;
-
   baseTotalPriceCents?: number | null;
   effectiveTotalPriceCents?: number | null;
-    // --- cash override audit (NEW) ---
-  originalPaymentType?: PaymentType | null;
-  originalCashDiscountBps?: number | null;
-
-  cashNotPaidAt?: string | null;
-  cashNotPaidByUserId?: string | null;
-  cashDiscountRevokedAt?: string | null;
-  cashDiscountRevokedReason?: string | null;
-
-  fallbackCardChargedAt?: string | null;
 };
 
 type ApiResponse =
   | { ok: true; bookings: ApiBooking[] }
   | { ok: false; error: string };
 
-function getSessionUserId(session: unknown): string | null {
-  const id = (session as any)?.user?.id;
-  return typeof id === "string" && id.length > 0 ? id : null;
-}
-
-function toIsoOrNull(d: Date | null | undefined): string | null {
-  return d ? d.toISOString() : null;
-}
-
-function cents(v: unknown): number | null {
-  return typeof v === "number" && Number.isFinite(v) ? Math.max(0, Math.round(v)) : null;
-}
-
-function bps(v: unknown): number | null {
-  if (typeof v !== "number" || !Number.isFinite(v)) return null;
-  return Math.min(10000, Math.max(0, Math.round(v)));
-}
-
-function applyCashDiscount(baseCents: number, paymentType: PaymentType | null, cashDiscountBps: number | null): number {
+function applyCashDiscount(
+  baseCents: number,
+  paymentType: PaymentType | null,
+  cashDiscountBps: number | null
+) {
+  if (!Number.isFinite(baseCents)) return baseCents;
   if (paymentType !== PaymentType.CASH) return baseCents;
-  const d = typeof cashDiscountBps === "number" ? cashDiscountBps : 0;
-  const multiplier = (10000 - d) / 10000;
+
+  const bps = Number.isFinite(cashDiscountBps ?? NaN) ? Number(cashDiscountBps) : 0;
+  const multiplier = Math.max(0, 10000 - bps) / 10000;
   return Math.round(baseCents * multiplier);
 }
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse<ApiResponse>) {
   if (req.method !== "GET") {
-    res.setHeader("Allow", "GET");
     return res.status(405).json({ ok: false, error: "Method not allowed" });
   }
 
   const session = await getServerSession(req, res, authOptions);
-  const userId = getSessionUserId(session);
+  const userId =
+    typeof (session?.user as { id?: unknown } | undefined)?.id === "string"
+      ? (session?.user as { id: string }).id
+      : undefined;
 
   if (!userId) {
     return res.status(401).json({ ok: false, error: "Not authenticated" });
@@ -100,53 +78,35 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
             departureTime: true,
             status: true,
             distanceMiles: true,
-            totalPriceCents: true, // legacy estimate
+            totalPriceCents: true,
             passengerCount: true,
             tripStartedAt: true,
             tripCompletedAt: true,
-            driver: { select: { name: true, publicId: true } },
+            driver: {
+              select: {
+                name: true,
+                publicId: true,
+              },
+            },
           },
         },
-        conversation: { select: { id: true } },
-        outstandingCharge: {
-          select: { id: true, totalCents: true },
+        conversation: {
+          select: {
+            id: true,
+          },
         },
       },
     });
 
     const shapedBookings: ApiBooking[] = bookings.map((b) => {
-      const baseAmountCents = cents(b.baseAmountCents);
-      const discountCents = cents(b.discountCents) ?? 0;
-      const finalAmountCents = cents(b.finalAmountCents);
-      const rideEstimateCents = cents(b.ride.totalPriceCents);
+      const base = b.ride.totalPriceCents ?? null;
 
-      const paymentType: PaymentType | null = b.paymentType ?? null;
-      const cashDiscountBps = bps(b.cashDiscountBps);
-
-      // Base shown in UI: prefer booking.baseAmountCents, otherwise ride estimate
-      const base = baseAmountCents ?? rideEstimateCents;
-
-      // Effective:
-      // 1) OutstandingCharge wins (unpaid cash scenario)
-      // 2) booking.finalAmountCents if present
-      // 3) else compute from base - discount (cash discount applied to base)
-      let effective: number | null = null;
-
-      const ocTotal = cents(b.outstandingCharge?.totalCents);
-      if (ocTotal != null) {
-        effective = ocTotal;
-      } else if (finalAmountCents != null) {
-        effective = finalAmountCents;
-      } else if (base != null) {
-        const discountedBase =
-          paymentType === PaymentType.CASH
-            ? applyCashDiscount(base, paymentType, cashDiscountBps)
-            : base;
-
-        effective = Math.max(0, discountedBase - discountCents);
-      } else {
-        effective = null;
-      }
+      const effective =
+        typeof b.finalAmountCents === "number"
+          ? b.finalAmountCents
+          : base == null
+            ? null
+            : applyCashDiscount(base, b.paymentType ?? null, b.cashDiscountBps ?? null);
 
       return {
         id: b.id,
@@ -167,72 +127,66 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
         distanceMiles: b.ride.distanceMiles,
         passengerCount: b.ride.passengerCount,
-        tripStartedAt: toIsoOrNull(b.ride.tripStartedAt),
-        tripCompletedAt: toIsoOrNull(b.ride.tripCompletedAt),
+        tripStartedAt: b.ride.tripStartedAt ? b.ride.tripStartedAt.toISOString() : null,
+        tripCompletedAt: b.ride.tripCompletedAt ? b.ride.tripCompletedAt.toISOString() : null,
 
-        paymentType,
-        cashDiscountBps,
-
+        paymentType: b.paymentType ?? null,
+        cashDiscountBps: b.cashDiscountBps ?? null,
         baseTotalPriceCents: base,
         effectiveTotalPriceCents: effective,
-        
-        originalPaymentType: b.originalPaymentType ?? null,
-        originalCashDiscountBps: bps(b.originalCashDiscountBps),
-
-        cashNotPaidAt: toIsoOrNull(b.cashNotPaidAt),
-        cashNotPaidByUserId: b.cashNotPaidByUserId ?? null,
-        cashDiscountRevokedAt: toIsoOrNull(b.cashDiscountRevokedAt),
-        cashDiscountRevokedReason: b.cashDiscountRevokedReason ?? null,
-
-        fallbackCardChargedAt: toIsoOrNull(b.fallbackCardChargedAt),
       };
     });
 
     const ridesWithoutBookings = await prisma.ride.findMany({
-      where: { riderId: userId, bookings: { none: {} } },
+      where: {
+        riderId: userId,
+        bookings: { none: {} },
+      },
       orderBy: { createdAt: "desc" },
-      include: { driver: { select: { name: true, publicId: true } } },
+      include: {
+        driver: {
+          select: {
+            name: true,
+            publicId: true,
+          },
+        },
+      },
     });
 
-    const shapedRideOnly: ApiBooking[] = ridesWithoutBookings.map((r) => {
-      const base = cents(r.totalPriceCents);
+    const shapedRideOnly: ApiBooking[] = ridesWithoutBookings.map((r) => ({
+      id: `ride-${r.id}`,
+      bookingId: null,
+      status: BookingStatus.PENDING,
 
-      return {
-        id: `ride-${r.id}`,
-        bookingId: null,
-        status: BookingStatus.PENDING,
+      rideId: r.id,
+      originCity: r.originCity,
+      destinationCity: r.destinationCity,
+      departureTime: r.departureTime.toISOString(),
+      rideStatus: r.status,
 
-        rideId: r.id,
-        originCity: r.originCity,
-        destinationCity: r.destinationCity,
-        departureTime: r.departureTime.toISOString(),
-        rideStatus: r.status,
+      driverName: r.driver?.name ?? null,
+      driverPublicId: r.driver?.publicId ?? null,
+      conversationId: null,
 
-        driverName: r.driver?.name ?? null,
-        driverPublicId: r.driver?.publicId ?? null,
-        conversationId: null,
+      isRideOnly: true,
 
-        isRideOnly: true,
+      distanceMiles: r.distanceMiles,
+      passengerCount: r.passengerCount,
+      tripStartedAt: r.tripStartedAt ? r.tripStartedAt.toISOString() : null,
+      tripCompletedAt: r.tripCompletedAt ? r.tripCompletedAt.toISOString() : null,
 
-        distanceMiles: r.distanceMiles,
-        passengerCount: r.passengerCount,
-        tripStartedAt: toIsoOrNull(r.tripStartedAt),
-        tripCompletedAt: toIsoOrNull(r.tripCompletedAt),
-
-        paymentType: null,
-        cashDiscountBps: null,
-
-        baseTotalPriceCents: base,
-        effectiveTotalPriceCents: base,
-      };
-    });
+      paymentType: null,
+      cashDiscountBps: null,
+      baseTotalPriceCents: r.totalPriceCents,
+      effectiveTotalPriceCents: r.totalPriceCents,
+    }));
 
     const combined = [...shapedBookings, ...shapedRideOnly];
 
     combined.sort((a, b) => {
-      const da = Date.parse(a.departureTime);
-      const db = Date.parse(b.departureTime);
-      return (Number.isNaN(db) ? 0 : db) - (Number.isNaN(da) ? 0 : da);
+      const da = new Date(a.departureTime).getTime();
+      const db = new Date(b.departureTime).getTime();
+      return db - da;
     });
 
     return res.status(200).json({ ok: true, bookings: combined });

@@ -62,6 +62,18 @@ function derivePaymentType(args: {
   return "UNKNOWN";
 }
 
+function isFallbackCardCharge(args: {
+  paymentType: PaymentType | null | undefined;
+  cashNotPaidAt?: Date | null;
+  fallbackCardChargedAt?: Date | null;
+}) {
+  return (
+    args.paymentType === PaymentType.CARD &&
+    Boolean(args.cashNotPaidAt) &&
+    Boolean(args.fallbackCardChargedAt)
+  );
+}
+
 export default async function handler(
   req: NextApiRequest,
   res: NextApiResponse<RiderBillingResponse>
@@ -113,40 +125,99 @@ export default async function handler(
       },
     });
 
-    const mappedPayments: RiderBillingRow[] = ridePayments.map((p) => ({
-      id: p.id,
-      createdAt: p.createdAt.toISOString(),
-      status: String(p.status || "").toUpperCase(),
-      currency: normalizeCurrency(p.currency),
-      amountCents:
-        typeof p.finalAmountCents === "number" && p.finalAmountCents > 0
+    const rideIdsFromPayments = Array.from(
+      new Set(ridePayments.map((p) => p.rideId).filter((v): v is string => Boolean(v)))
+    );
+
+    const bookingsForPaidRides = rideIdsFromPayments.length
+      ? await prisma.booking.findMany({
+          where: {
+            riderId: userId,
+            rideId: { in: rideIdsFromPayments },
+          },
+          orderBy: { updatedAt: "desc" },
+          select: {
+            id: true,
+            rideId: true,
+            paymentType: true,
+            finalAmountCents: true,
+            baseAmountCents: true,
+            currency: true,
+            cashNotPaidAt: true,
+            fallbackCardChargedAt: true,
+          },
+        })
+      : [];
+
+    const bookingByRideId = new Map<
+      string,
+      {
+        id: string;
+        rideId: string;
+        paymentType: PaymentType | null;
+        finalAmountCents: number | null;
+        baseAmountCents: number | null;
+        currency: string | null;
+        cashNotPaidAt: Date | null;
+        fallbackCardChargedAt: Date | null;
+      }
+    >();
+
+    for (const b of bookingsForPaidRides) {
+      if (!bookingByRideId.has(b.rideId)) {
+        bookingByRideId.set(b.rideId, b);
+      }
+    }
+
+    const mappedPayments: RiderBillingRow[] = ridePayments.map((p) => {
+      const booking = bookingByRideId.get(p.rideId);
+
+      const overriddenPaymentType =
+        booking?.paymentType ??
+        (p.paymentType as PaymentType | null | undefined) ??
+        null;
+
+      const amountCents =
+        typeof booking?.finalAmountCents === "number" && booking.finalAmountCents > 0
+          ? booking.finalAmountCents
+          : typeof p.finalAmountCents === "number" && p.finalAmountCents > 0
           ? p.finalAmountCents
-          : p.amountCents,
-      paymentType: derivePaymentType({
-        paymentType: p.paymentType,
-        hasPaymentMethod: Boolean(p.paymentMethod),
-        stripePaymentIntentId: p.stripePaymentIntentId,
-      }),
-      ride: p.ride
-        ? {
-            id: p.ride.id,
-            departureTime: toIso(p.ride.departureTime as any),
-            originCity: (p.ride as any).originCity ?? null,
-            destinationCity: (p.ride as any).destinationCity ?? null,
-            status: (p.ride as any).status ?? null,
-          }
-        : null,
-      paymentMethod: p.paymentMethod
-        ? {
-            id: p.paymentMethod.id,
-            provider: p.paymentMethod.provider,
-            brand: p.paymentMethod.brand,
-            last4: p.paymentMethod.last4,
-            expMonth: p.paymentMethod.expMonth,
-            expYear: p.paymentMethod.expYear,
-          }
-        : null,
-    }));
+          : p.amountCents;
+
+      const currency = normalizeCurrency(booking?.currency ?? p.currency);
+
+      return {
+        id: p.id,
+        createdAt: p.createdAt.toISOString(),
+        status: String(p.status || "").toUpperCase(),
+        currency,
+        amountCents,
+        paymentType: derivePaymentType({
+          paymentType: overriddenPaymentType,
+          hasPaymentMethod: Boolean(p.paymentMethod),
+          stripePaymentIntentId: p.stripePaymentIntentId,
+        }),
+        ride: p.ride
+          ? {
+              id: p.ride.id,
+              departureTime: toIso(p.ride.departureTime as any),
+              originCity: (p.ride as any).originCity ?? null,
+              destinationCity: (p.ride as any).destinationCity ?? null,
+              status: (p.ride as any).status ?? null,
+            }
+          : null,
+        paymentMethod: p.paymentMethod
+          ? {
+              id: p.paymentMethod.id,
+              provider: p.paymentMethod.provider,
+              brand: p.paymentMethod.brand,
+              last4: p.paymentMethod.last4,
+              expMonth: p.paymentMethod.expMonth,
+              expYear: p.paymentMethod.expYear,
+            }
+          : null,
+      };
+    });
 
     const rideIdsWithPayments = new Set(
       mappedPayments.map((p) => p.ride?.id).filter((v): v is string => Boolean(v))
@@ -176,12 +247,11 @@ export default async function handler(
     const fallbackRows: RiderBillingRow[] = completedBookings
       .filter((b) => b.ride && !rideIdsWithPayments.has(b.ride.id))
       .map((b): RiderBillingRow => {
-        const paymentType: RiderPaymentType =
-          b.paymentType === PaymentType.CASH
-            ? "CASH"
-            : b.paymentType === PaymentType.CARD
-            ? "CARD"
-            : "UNKNOWN";
+        const paymentType: RiderPaymentType = derivePaymentType({
+          paymentType: b.paymentType,
+          hasPaymentMethod: false,
+          stripePaymentIntentId: null,
+        });
 
         const amountCents =
           typeof b.finalAmountCents === "number" && b.finalAmountCents > 0
