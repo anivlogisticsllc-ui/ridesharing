@@ -1,4 +1,5 @@
-// app/admin/page.tsx
+// FILE: app/admin/page.tsx
+
 "use client";
 
 import Link from "next/link";
@@ -30,7 +31,9 @@ function StatCard(props: { label: string; value: number | string; hint?: string 
   const { label, value, hint } = props;
   return (
     <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-      <div className="text-[11px] font-medium uppercase tracking-wide text-slate-500">{label}</div>
+      <div className="text-[11px] font-medium uppercase tracking-wide text-slate-500">
+        {label}
+      </div>
       <div className="mt-2 text-2xl font-semibold text-slate-900">{value}</div>
       {hint ? <div className="mt-2 text-xs text-slate-500">{hint}</div> : null}
     </div>
@@ -53,7 +56,7 @@ export default function AdminDashboardPage() {
   const router = useRouter();
   const { data: session, status } = useSession();
 
-  const role = asRole((session?.user as any)?.role);
+  const role = asRole((session?.user as { role?: unknown } | undefined)?.role);
 
   const [metrics, setMetrics] = useState<Metrics | null>(null);
   const [loading, setLoading] = useState(true);
@@ -83,7 +86,7 @@ export default function AdminDashboardPage() {
 
       if (!res.ok || !data || !("ok" in data) || !data.ok) {
         setMetrics(null);
-        setError((data as any)?.error || `Failed to load metrics (HTTP ${res.status})`);
+        setError((data as { error?: string } | null)?.error || `Failed to load metrics (HTTP ${res.status})`);
         return;
       }
 
@@ -113,7 +116,6 @@ export default function AdminDashboardPage() {
     }
 
     void load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status, session, role, router, callbackUrl]);
 
   const cards = useMemo(() => {
@@ -146,6 +148,7 @@ export default function AdminDashboardPage() {
             <TabLink href="/admin/users">Users</TabLink>
             <TabLink href="/admin/drivers">Drivers</TabLink>
             <TabLink href="/admin/riders">Riders</TabLink>
+            <TabLink href="/admin/disputes">Disputes</TabLink>
             <TabLink href="/admin/metrics">Metrics</TabLink>
             <TabLink href="/admin/rides">Rides</TabLink>
 
@@ -214,6 +217,13 @@ export default function AdminDashboardPage() {
                     Riders
                   </Link>{" "}
                   for role-specific lists.
+                </li>
+                <li>
+                  Go to{" "}
+                  <Link className="underline" href="/admin/disputes">
+                    Disputes
+                  </Link>{" "}
+                  to review rider claims, driver reports, and admin decisions.
                 </li>
                 <li>
                   Go to{" "}

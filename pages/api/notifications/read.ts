@@ -1,11 +1,18 @@
+// OATH: Clean replacement file
+// FILE: pages/api/notifications/read.ts
+
 import type { NextApiRequest, NextApiResponse } from "next";
 import { getServerSession } from "next-auth";
+
 import { authOptions } from "../auth/[...nextauth]";
 import { prisma } from "@/lib/prisma";
 
 type Body = {
   id?: string;
   all?: boolean;
+  bookingId?: string;
+  type?: string;
+  disputeId?: string;
 };
 
 type ApiResponse =
@@ -50,15 +57,49 @@ export default async function handler(
     }
 
     const id = typeof body.id === "string" ? body.id.trim() : "";
-    if (!id) {
-      return res.status(400).json({ ok: false, error: "Notification id is required" });
+    if (id) {
+      const result = await prisma.notification.updateMany({
+        where: {
+          id,
+          userId,
+          readAt: null,
+        },
+        data: {
+          readAt: now,
+        },
+      });
+
+      return res.status(200).json({ ok: true, updatedCount: result.count });
+    }
+
+    const bookingId =
+      typeof body.bookingId === "string" ? body.bookingId.trim() : "";
+    const type = typeof body.type === "string" ? body.type.trim() : "";
+    const disputeId =
+      typeof body.disputeId === "string" ? body.disputeId.trim() : "";
+
+    if (!bookingId && !disputeId) {
+      return res.status(400).json({
+        ok: false,
+        error:
+          "Notification id is required, or provide bookingId/disputeId filter.",
+      });
     }
 
     const result = await prisma.notification.updateMany({
       where: {
-        id,
         userId,
         readAt: null,
+        ...(bookingId ? { bookingId } : {}),
+        ...(type ? { type: type as never } : {}),
+        ...(disputeId
+          ? {
+              metadata: {
+                path: ["disputeId"],
+                equals: disputeId,
+              },
+            }
+          : {}),
       },
       data: {
         readAt: now,

@@ -1,4 +1,3 @@
-// pages/api/driver/report-unpaid.ts
 import type { NextApiRequest, NextApiResponse } from "next";
 import { getServerSession } from "next-auth";
 import { authOptions } from "../auth/[...nextauth]";
@@ -6,10 +5,10 @@ import { prisma } from "@/lib/prisma";
 import { sendEmail } from "@/lib/email";
 import {
   BookingStatus,
+  NotificationType,
   PaymentType,
   RideStatus,
   UserRole,
-  NotificationType,
 } from "@prisma/client";
 import { guardMembership } from "@/lib/guardMembership";
 import { stripe } from "@/lib/stripe";
@@ -49,6 +48,17 @@ function escapeHtml(s: string) {
 
 function moneyFromCents(cents: number) {
   return (Math.max(0, Math.round(cents)) / 100).toFixed(2);
+}
+
+function getAppUrl() {
+  const raw = process.env.APP_URL || process.env.NEXT_PUBLIC_APP_URL || process.env.NEXTAUTH_URL;
+
+  if (raw && raw.trim()) return raw.replace(/\/$/, "");
+
+  const vercel = process.env.VERCEL_URL;
+  if (vercel && vercel.trim()) return `https://${vercel.replace(/\/$/, "")}`;
+
+  return "http://localhost:3000";
 }
 
 async function createFallbackChargeNotification(args: {
@@ -98,6 +108,7 @@ async function sendFallbackChargeAlertEmailSafe(args: {
     destinationCity: string;
     departureTime: Date | string;
   };
+  bookingId: string;
   amountCents: number;
   note?: string | null;
 }) {
@@ -107,6 +118,10 @@ async function sendFallbackChargeAlertEmailSafe(args: {
       args.ride.departureTime instanceof Date
         ? args.ride.departureTime.toLocaleString()
         : String(args.ride.departureTime);
+
+    const disputeUrl = `${getAppUrl()}/rider/disputes/${encodeURIComponent(
+      args.bookingId
+    )}`;
 
     const subject = "Cash ride updated to card charge";
 
@@ -141,8 +156,19 @@ async function sendFallbackChargeAlertEmailSafe(args: {
           <div style="margin-top:8px;font-size:11px;color:#94a3b8;">Ride ID: ${escapeHtml(args.ride.id)}</div>
         </div>
 
-        <p style="margin:0;font-size:12px;color:#64748b;">
-          If this is incorrect, you can dispute the charge in your RideShare account.
+        <p style="margin:0 0 12px;font-size:12px;color:#64748b;">
+          If this is incorrect, you can dispute the charge below.
+        </p>
+
+        <p style="margin:0 0 14px;">
+          <a href="${escapeHtml(disputeUrl)}"
+             style="background:#2563eb;color:white;padding:10px 16px;text-decoration:none;border-radius:8px;display:inline-block;font-weight:600;font-size:14px;">
+            Dispute this charge
+          </a>
+        </p>
+
+        <p style="margin:0;font-size:12px;color:#94a3b8;word-break:break-all;">
+          ${escapeHtml(disputeUrl)}
         </p>
       </div>
     `;
@@ -160,7 +186,7 @@ async function sendFallbackChargeAlertEmailSafe(args: {
       args.note?.trim() ? `Driver note: ${args.note.trim()}` : "",
       `Ride ID: ${args.ride.id}`,
       "",
-      "If this is incorrect, you can dispute the charge in your RideShare account.",
+      `Dispute this charge: ${disputeUrl}`,
     ]
       .filter(Boolean)
       .join("\n");
@@ -184,9 +210,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
   try {
     const session = await getServerSession(req, res, authOptions);
-    const user = session?.user as any;
+    const user = session?.user as { id?: unknown; role?: unknown } | undefined;
 
-    if (!user?.id) return res.status(401).json({ ok: false, error: "Not authenticated" });
+    if (!user?.id) {
+      return res.status(401).json({ ok: false, error: "Not authenticated" });
+    }
+
     if (user.role !== UserRole.DRIVER) {
       return res.status(403).json({ ok: false, error: "Only drivers can report unpaid rides." });
     }
@@ -198,6 +227,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       role: UserRole.DRIVER,
       allowTrial: true,
     });
+
     if (!gate.ok) {
       return res.status(403).json({ ok: false, error: gate.error || "Membership required." });
     }
@@ -205,7 +235,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     const body = (req.body ?? {}) as Body;
 
     const rideId = typeof body.rideId === "string" ? body.rideId.trim() : "";
-    if (!rideId) return res.status(400).json({ ok: false, error: "rideId is required" });
+    if (!rideId) {
+      return res.status(400).json({ ok: false, error: "rideId is required" });
+    }
 
     if (!isValidReason(body.reason)) {
       return res.status(400).json({ ok: false, error: "reason is required" });
@@ -253,10 +285,14 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       },
     });
 
-    if (!ride) return res.status(404).json({ ok: false, error: "Ride not found for this driver." });
+    if (!ride) {
+      return res.status(404).json({ ok: false, error: "Ride not found for this driver." });
+    }
+
     if (ride.status !== RideStatus.COMPLETED) {
       return res.status(400).json({ ok: false, error: "Ride must be COMPLETED." });
     }
+
     if (!ride.tripCompletedAt) {
       return res.status(400).json({ ok: false, error: "Ride missing tripCompletedAt." });
     }
@@ -283,38 +319,52 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       return res.status(400).json({ ok: false, error: "Unpaid report is only valid for CASH rides." });
     }
 
-    const fareBaseline = clampCents(booking.baseAmountCents) ?? clampCents(ride.totalPriceCents) ?? 0;
+    const fareBaseline =
+      clampCents(booking.baseAmountCents) ?? clampCents(ride.totalPriceCents) ?? 0;
     const chargeCents = Math.max(0, Math.round(fareBaseline));
+
     if (chargeCents < 50) {
       return res.status(400).json({ ok: false, error: "Missing/invalid fare amount." });
     }
 
     const rider = ride.rider;
-    if (!rider?.id) return res.status(400).json({ ok: false, error: "Missing rider on ride." });
+    if (!rider?.id) {
+      return res.status(400).json({ ok: false, error: "Missing rider on ride." });
+    }
 
     const customerId = rider.stripeCustomerId ?? null;
     if (!customerId) {
-      return res.status(409).json({ ok: false, error: "Rider has no backup card on file. Cannot charge." });
+      return res.status(409).json({
+        ok: false,
+        error: "Rider has no backup card on file. Cannot charge.",
+      });
     }
 
     let defaultPm: string | null = rider.stripeDefaultPaymentId ?? null;
 
     if (!defaultPm) {
       const customer = await stripe.customers.retrieve(customerId);
-      if (!customer || (customer as any).deleted) {
+      if (!customer || (customer as { deleted?: boolean }).deleted) {
         return res.status(409).json({ ok: false, error: "Billing customer missing." });
       }
-      defaultPm = (customer as any)?.invoice_settings?.default_payment_method ?? null;
+
+      defaultPm =
+        ((customer as { invoice_settings?: { default_payment_method?: string | null } })
+          .invoice_settings?.default_payment_method as string | null) ?? null;
     }
 
     if (!defaultPm) {
-      return res.status(409).json({ ok: false, error: "Rider has no default payment method. Cannot charge." });
+      return res.status(409).json({
+        ok: false,
+        error: "Rider has no default payment method. Cannot charge.",
+      });
     }
 
     const now = new Date();
 
     let piId = "";
     let piStatus = "";
+
     try {
       const pi = await stripe.paymentIntents.create({
         amount: chargeCents,
@@ -332,51 +382,65 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
           note: note ?? "",
         },
       });
+
       piId = pi.id;
       piStatus = String(pi.status ?? "");
-    } catch (e: any) {
-      const msg = e?.message ? String(e.message) : "Card charge failed.";
+    } catch (e: unknown) {
+      const msg =
+        typeof e === "object" && e !== null && "message" in e && typeof (e as { message?: unknown }).message === "string"
+          ? String((e as { message: string }).message)
+          : "Card charge failed.";
+
       return res.status(402).json({ ok: false, error: msg });
     }
 
-    await prisma.booking.update({
-      where: { id: booking.id },
-      data: {
-        cashNotPaidAt: now,
-        cashNotPaidByUserId: driverId,
-        cashNotPaidNote: note || null,
-        cashNotPaidReportedById: driverId,
-        cashNotPaidReason: reason,
+    await prisma.$transaction(async (tx) => {
+      await tx.booking.update({
+        where: { id: booking.id },
+        data: {
+          cashNotPaidAt: now,
+          cashNotPaidByUserId: driverId,
+          cashNotPaidNote: note || null,
+          cashNotPaidReportedById: driverId,
+          cashNotPaidReason: reason,
+          cashDiscountRevokedAt: now,
+          cashDiscountRevokedReason: `Driver reported unpaid cash (${reason})`,
+          fallbackCardChargedAt: now,
+          stripePaymentIntentId: piId,
+          stripePaymentIntentStatus: piStatus || "unknown",
+          paymentType: PaymentType.CARD,
+          cashDiscountBps: 0,
+          discountCents: 0,
+          baseAmountCents: chargeCents,
+          finalAmountCents: chargeCents,
+        },
+      });
 
-        cashDiscountRevokedAt: now,
-        cashDiscountRevokedReason: `Driver reported unpaid cash (${reason})`,
-
-        fallbackCardChargedAt: now,
-
-        stripePaymentIntentId: piId,
-        stripePaymentIntentStatus: piStatus || "unknown",
-
-        paymentType: PaymentType.CARD,
-        cashDiscountBps: 0,
-        discountCents: 0,
-        baseAmountCents: chargeCents,
-        finalAmountCents: chargeCents,
-      },
-    });
-
-    await createFallbackChargeNotification({
-      riderId: rider.id,
-      rideId: ride.id,
-      bookingId: booking.id,
-      driverId,
-      amountCents: chargeCents,
-      fallbackChargedAt: now,
-      reason,
-      note,
+      await tx.notification.create({
+        data: {
+          userId: rider.id,
+          rideId: ride.id,
+          bookingId: booking.id,
+          type: NotificationType.CASH_UNPAID_FALLBACK_CHARGED,
+          title: "Cash ride updated to card charge",
+          message: `Your driver reported that cash was not received for this ride. Your backup card was charged $${moneyFromCents(
+            chargeCents
+          )}. If this is incorrect, you can dispute the charge.`,
+          metadata: {
+            amountCents: chargeCents,
+            originalPaymentType: "CASH",
+            finalPaymentType: "CARD",
+            driverId,
+            reason,
+            note: note || null,
+            fallbackChargedAt: now.toISOString(),
+          },
+        },
+      });
     });
 
     if (rider.email) {
-      sendFallbackChargeAlertEmailSafe({
+      void sendFallbackChargeAlertEmailSafe({
         riderEmail: rider.email,
         riderName: rider.name,
         driverName: ride.driver?.name ?? null,
@@ -386,10 +450,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
           destinationCity: ride.destinationCity,
           departureTime: ride.departureTime,
         },
+        bookingId: booking.id,
         amountCents: chargeCents,
         note,
-      }).catch((err) => {
-        console.error("[fallback-charge-email] Failed:", err);
       });
     }
 

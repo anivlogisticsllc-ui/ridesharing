@@ -1,3 +1,6 @@
+// OATH: Clean replacement file
+// FILE: components/Header.tsx
+
 "use client";
 
 import Link from "next/link";
@@ -6,6 +9,12 @@ import { useSession, signIn, signOut } from "next-auth/react";
 import { usePathname, useRouter } from "next/navigation";
 
 type Role = "RIDER" | "DRIVER" | "ADMIN";
+
+type NotificationMetadata = {
+  disputeId?: string;
+  bookingId?: string;
+  rideId?: string;
+} | null;
 
 type NotificationItem = {
   id: string;
@@ -26,6 +35,12 @@ type NotificationsApiResponse =
       notifications: NotificationItem[];
     }
   | { ok: false; error: string };
+
+type SessionUserLike = {
+  role?: unknown;
+  name?: string | null;
+  email?: string | null;
+};
 
 function asRole(v: unknown): Role | null {
   return v === "RIDER" || v === "DRIVER" || v === "ADMIN" ? v : null;
@@ -48,6 +63,7 @@ const ROUTES = {
     portal: "/rider/portal",
     profile: "/rider/profile",
     payments: "/rider/payments",
+    disputes: "/rider/disputes",
   },
 
   driver: {
@@ -56,6 +72,7 @@ const ROUTES = {
     profile: "/driver/profile",
     payments: "/driver/payments",
     payouts: "/driver/payouts",
+    disputes: "/driver/disputes",
   },
 
   admin: {
@@ -63,14 +80,9 @@ const ROUTES = {
     metrics: "/admin/metrics",
     users: "/admin/users",
     riders: "/admin/riders",
+    disputes: "/admin/disputes",
   },
 } as const;
-
-type SessionUserLike = {
-  role?: unknown;
-  name?: string | null;
-  email?: string | null;
-};
 
 function formatRelative(dateIso: string) {
   const d = new Date(dateIso);
@@ -91,16 +103,31 @@ function formatRelative(dateIso: string) {
   return d.toLocaleDateString();
 }
 
-function notificationHref(n: NotificationItem) {
-  if (n.bookingId) return `/receipt/${n.bookingId}`;
-  if (n.rideId) return `/rider/trips/${n.rideId}`;
-  return "/rider/portal";
+function isDisputeNotification(type: string) {
+  return (
+    type === "DISPUTE_OPENED" ||
+    type === "DISPUTE_STATUS_UPDATED" ||
+    type === "DISPUTE_RESOLVED_RIDER" ||
+    type === "DISPUTE_RESOLVED_DRIVER"
+  );
+}
+
+function asNotificationMetadata(value: unknown): NotificationMetadata {
+  if (!value || typeof value !== "object") return null;
+
+  const obj = value as Record<string, unknown>;
+
+  return {
+    disputeId: typeof obj.disputeId === "string" ? obj.disputeId : undefined,
+    bookingId: typeof obj.bookingId === "string" ? obj.bookingId : undefined,
+    rideId: typeof obj.rideId === "string" ? obj.rideId : undefined,
+  };
 }
 
 export function Header() {
   const router = useRouter();
-  const { data: session, status } = useSession();
   const pathname = usePathname();
+  const { data: session, status } = useSession();
 
   const user = (session?.user as SessionUserLike | undefined) ?? undefined;
 
@@ -122,6 +149,7 @@ export function Header() {
 
   const linkClass = (href: string) => {
     const isActive = href === "/" ? pathname === "/" : pathname?.startsWith(href);
+
     return [
       "relative text-xs font-medium transition-colors",
       isActive
@@ -129,6 +157,39 @@ export function Header() {
         : "text-slate-600 hover:text-slate-900",
     ].join(" ");
   };
+
+  function notificationHref(n: NotificationItem) {
+    const metadata = asNotificationMetadata(n.metadata);
+
+    if (n.type === "CASH_UNPAID_FALLBACK_CHARGED" && n.bookingId) {
+      return `/rider/disputes/${encodeURIComponent(n.bookingId)}`;
+    }
+
+    if (isDisputeNotification(n.type)) {
+      if (isAdmin && metadata?.disputeId) {
+        return `/admin/disputes/${encodeURIComponent(metadata.disputeId)}`;
+      }
+
+      if (isDriver && n.bookingId) {
+        return `/driver/disputes/${encodeURIComponent(n.bookingId)}`;
+      }
+
+      if (isRider && n.bookingId) {
+        return `/rider/disputes/${encodeURIComponent(n.bookingId)}`;
+      }
+
+      if (isAdmin) {
+        return ROUTES.admin.disputes;
+      }
+    }
+
+    if (n.bookingId) return `/receipt/${n.bookingId}`;
+    if (n.rideId) return `/rider/trips/${n.rideId}`;
+
+    if (isAdmin) return ROUTES.admin.home;
+    if (isDriver) return ROUTES.driver.portal;
+    return ROUTES.rider.portal;
+  }
 
   const [open, setOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement | null>(null);
@@ -142,12 +203,18 @@ export function Header() {
 
     try {
       setNotifLoading(true);
-      const res = await fetch("/api/notifications?take=8", { cache: "no-store" });
+
+      const res = await fetch("/api/notifications?take=8", {
+        cache: "no-store",
+      });
+
       const json = (await res.json().catch(() => null)) as NotificationsApiResponse | null;
 
       if (!res.ok || !json || !json.ok) return;
 
-      setNotifications(json.notifications);
+      const unreadOnly = json.notifications.filter((n) => !n.readAt);
+
+      setNotifications(unreadOnly);
       setUnreadCount(json.unreadCount);
     } catch (err) {
       console.error("[header] load notifications failed:", err);
@@ -163,11 +230,6 @@ export function Header() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id }),
       });
-
-      setNotifications((prev) =>
-        prev.map((n) => (n.id === id ? { ...n, readAt: n.readAt ?? new Date().toISOString() } : n))
-      );
-      setUnreadCount((prev) => Math.max(0, prev - 1));
     } catch (err) {
       console.error("[header] mark notification read failed:", err);
     }
@@ -181,8 +243,7 @@ export function Header() {
         body: JSON.stringify({ all: true }),
       });
 
-      const now = new Date().toISOString();
-      setNotifications((prev) => prev.map((n) => ({ ...n, readAt: n.readAt ?? now })));
+      setNotifications([]);
       setUnreadCount(0);
     } catch (err) {
       console.error("[header] mark all notifications read failed:", err);
@@ -194,7 +255,10 @@ export function Header() {
       if (!open) return;
       const el = menuRef.current;
       if (!el) return;
-      if (e.target instanceof Node && !el.contains(e.target)) setOpen(false);
+
+      if (e.target instanceof Node && !el.contains(e.target)) {
+        setOpen(false);
+      }
     }
 
     function onKeyDown(e: KeyboardEvent) {
@@ -204,6 +268,7 @@ export function Header() {
 
     document.addEventListener("mousedown", onDocMouseDown);
     document.addEventListener("keydown", onKeyDown);
+
     return () => {
       document.removeEventListener("mousedown", onDocMouseDown);
       document.removeEventListener("keydown", onKeyDown);
@@ -214,20 +279,26 @@ export function Header() {
     function onPopState() {
       setOpen(false);
     }
+
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
   }, []);
 
   useEffect(() => {
     if (status !== "authenticated") return;
-    loadNotifications();
-    const id = window.setInterval(loadNotifications, 30000);
+
+    void loadNotifications();
+
+    const id = window.setInterval(() => {
+      void loadNotifications();
+    }, 30000);
+
     return () => window.clearInterval(id);
   }, [status]);
 
   useEffect(() => {
     if (!open || !session) return;
-    loadNotifications();
+    void loadNotifications();
   }, [open, session]);
 
   const profileHref = isDriver
@@ -248,7 +319,16 @@ export function Header() {
   }
 
   async function handleNotificationClick(n: NotificationItem) {
+    const wasUnread = !n.readAt;
+
     await markNotificationRead(n.id);
+
+    setNotifications((prev) => prev.filter((item) => item.id !== n.id));
+
+    if (wasUnread) {
+      setUnreadCount((prev) => Math.max(0, prev - 1));
+    }
+
     setOpen(false);
     router.push(notificationHref(n));
   }
@@ -257,7 +337,11 @@ export function Header() {
     <header className="relative z-50 border-b border-slate-200 bg-white">
       <div className="mx-auto flex h-14 max-w-6xl items-center justify-between px-4">
         <div className="flex items-center gap-4">
-          <Link href={ROUTES.home} className="flex items-center gap-2" onClick={closeMenu}>
+          <Link
+            href={ROUTES.home}
+            className="flex items-center gap-2"
+            onClick={closeMenu}
+          >
             <div className="flex h-8 w-8 items-center justify-center rounded-full bg-indigo-600 text-xs font-semibold text-white">
               R
             </div>
@@ -265,7 +349,11 @@ export function Header() {
           </Link>
 
           <nav className="ml-4 hidden gap-4 md:flex">
-            <Link href={ROUTES.home} className={linkClass(ROUTES.home)} onClick={closeMenu}>
+            <Link
+              href={ROUTES.home}
+              className={linkClass(ROUTES.home)}
+              onClick={closeMenu}
+            >
               Home
             </Link>
 
@@ -299,7 +387,11 @@ export function Header() {
               </Link>
             )}
 
-            <Link href={ROUTES.about} className={linkClass(ROUTES.about)} onClick={closeMenu}>
+            <Link
+              href={ROUTES.about}
+              className={linkClass(ROUTES.about)}
+              onClick={closeMenu}
+            >
               About
             </Link>
           </nav>
@@ -337,7 +429,9 @@ export function Header() {
                   className="absolute right-0 z-[9999] mt-2 w-80 overflow-hidden rounded-xl border border-slate-200 bg-white shadow-lg"
                 >
                   <div className="px-3 py-2">
-                    <div className="truncate text-xs font-semibold text-slate-900">{rawName}</div>
+                    <div className="truncate text-xs font-semibold text-slate-900">
+                      {rawName}
+                    </div>
                     <div className="text-[11px] text-slate-500">Role: {roleLabel}</div>
                   </div>
 
@@ -352,7 +446,7 @@ export function Header() {
                       {unreadCount > 0 ? (
                         <button
                           type="button"
-                          onClick={markAllNotificationsRead}
+                          onClick={() => void markAllNotificationsRead()}
                           className="text-[11px] font-medium text-indigo-600 hover:text-indigo-700"
                         >
                           Mark all read
@@ -373,12 +467,7 @@ export function Header() {
                             key={n.id}
                             type="button"
                             onClick={() => void handleNotificationClick(n)}
-                            className={[
-                              "w-full rounded-lg border px-3 py-2 text-left transition",
-                              n.readAt
-                                ? "border-slate-200 bg-white hover:bg-slate-50"
-                                : "border-rose-200 bg-rose-50 hover:bg-rose-100",
-                            ].join(" ")}
+                            className="w-full rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-left transition hover:bg-rose-100"
                           >
                             <div className="flex items-start justify-between gap-2">
                               <div className="min-w-0">
@@ -390,9 +479,7 @@ export function Header() {
                                 </div>
                               </div>
 
-                              {!n.readAt ? (
-                                <span className="mt-1 h-2.5 w-2.5 shrink-0 rounded-full bg-rose-600" />
-                              ) : null}
+                              <span className="mt-1 h-2.5 w-2.5 shrink-0 rounded-full bg-rose-600" />
                             </div>
 
                             <div className="mt-2 text-[10px] text-slate-400">
@@ -420,6 +507,9 @@ export function Header() {
                         </MenuLink>
                         <MenuLink href={ROUTES.admin.riders} onClick={closeMenu}>
                           Riders
+                        </MenuLink>
+                        <MenuLink href={ROUTES.admin.disputes} onClick={closeMenu}>
+                          Disputes
                         </MenuLink>
                       </div>
                       <div className="h-px bg-slate-200" />
@@ -457,6 +547,9 @@ export function Header() {
                         <MenuLink href={ROUTES.driver.payouts} onClick={closeMenu}>
                           Driver Payouts
                         </MenuLink>
+                        <MenuLink href={ROUTES.driver.disputes} onClick={closeMenu}>
+                          Driver disputes
+                        </MenuLink>
                       </div>
                     </>
                   ) : null}
@@ -470,6 +563,9 @@ export function Header() {
                         </MenuLink>
                         <MenuLink href={ROUTES.rider.payments} onClick={closeMenu}>
                           Rider Payments
+                        </MenuLink>
+                        <MenuLink href={ROUTES.rider.disputes} onClick={closeMenu}>
+                          Rider disputes
                         </MenuLink>
                       </div>
                     </>
