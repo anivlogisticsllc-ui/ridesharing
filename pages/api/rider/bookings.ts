@@ -1,9 +1,11 @@
-// pages/api/rider/bookings.ts
+// OATH: Clean replacement file
+// FILE: pages/api/rider/bookings.ts
+
 import type { NextApiRequest, NextApiResponse } from "next";
 import { getServerSession } from "next-auth";
 import { authOptions } from "../auth/[...nextauth]";
 import { prisma } from "../../../lib/prisma";
-import { BookingStatus, PaymentType } from "@prisma/client";
+import { BookingStatus, DisputeStatus, PaymentType } from "@prisma/client";
 
 type ApiBooking = {
   id: string;
@@ -45,12 +47,56 @@ function applyCashDiscount(
   if (!Number.isFinite(baseCents)) return baseCents;
   if (paymentType !== PaymentType.CASH) return baseCents;
 
-  const bps = Number.isFinite(cashDiscountBps ?? NaN) ? Number(cashDiscountBps) : 0;
+  const bps =
+    typeof cashDiscountBps === "number" && Number.isFinite(cashDiscountBps)
+      ? cashDiscountBps
+      : 0;
+
   const multiplier = Math.max(0, 10000 - bps) / 10000;
   return Math.round(baseCents * multiplier);
 }
 
-export default async function handler(req: NextApiRequest, res: NextApiResponse<ApiResponse>) {
+function safeNonNegativeInt(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? Math.round(value)
+    : null;
+}
+
+function deriveOriginalAmountCents(b: {
+  finalAmountCents?: number | null;
+  baseAmountCents?: number | null;
+  ride: { totalPriceCents?: number | null };
+  paymentType?: PaymentType | null;
+  cashDiscountBps?: number | null;
+}) {
+  const finalAmountCents = safeNonNegativeInt(b.finalAmountCents);
+  if (finalAmountCents !== null) return finalAmountCents;
+
+  const baseAmountCents = safeNonNegativeInt(b.baseAmountCents);
+  if (baseAmountCents !== null) {
+    return applyCashDiscount(
+      baseAmountCents,
+      b.paymentType ?? null,
+      b.cashDiscountBps ?? null
+    );
+  }
+
+  const rideAmountCents = safeNonNegativeInt(b.ride.totalPriceCents);
+  if (rideAmountCents !== null) {
+    return applyCashDiscount(
+      rideAmountCents,
+      b.paymentType ?? null,
+      b.cashDiscountBps ?? null
+    );
+  }
+
+  return null;
+}
+
+export default async function handler(
+  req: NextApiRequest,
+  res: NextApiResponse<ApiResponse>
+) {
   if (req.method !== "GET") {
     return res.status(405).json({ ok: false, error: "Method not allowed" });
   }
@@ -98,15 +144,51 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       },
     });
 
-    const shapedBookings: ApiBooking[] = bookings.map((b) => {
-      const base = b.ride.totalPriceCents ?? null;
+    const rideIds = Array.from(
+      new Set(bookings.map((b) => b.rideId).filter((v): v is string => Boolean(v)))
+    );
 
-      const effective =
-        typeof b.finalAmountCents === "number"
-          ? b.finalAmountCents
-          : base == null
-            ? null
-            : applyCashDiscount(base, b.paymentType ?? null, b.cashDiscountBps ?? null);
+    const disputes = rideIds.length
+      ? await prisma.dispute.findMany({
+          where: {
+            riderId: userId,
+            rideId: { in: rideIds },
+            status: DisputeStatus.RESOLVED_RIDER,
+            refundIssued: true,
+          },
+          orderBy: { refundIssuedAt: "desc" },
+          select: {
+            id: true,
+            rideId: true,
+            refundAmountCents: true,
+          },
+        })
+      : [];
+
+    const refundByRideId = new Map<string, number>();
+
+    for (const d of disputes) {
+      const refund = safeNonNegativeInt(d.refundAmountCents) ?? 0;
+      if (!refundByRideId.has(d.rideId)) {
+        refundByRideId.set(d.rideId, refund);
+      }
+    }
+
+    const shapedBookings: ApiBooking[] = bookings.map((b) => {
+      const originalAmountCents = deriveOriginalAmountCents({
+        finalAmountCents: b.finalAmountCents,
+        baseAmountCents: b.baseAmountCents,
+        ride: { totalPriceCents: b.ride.totalPriceCents },
+        paymentType: b.paymentType ?? null,
+        cashDiscountBps: b.cashDiscountBps ?? null,
+      });
+
+      const refundAmountCents = refundByRideId.get(b.ride.id) ?? 0;
+
+      const effectiveAfterRefund =
+        typeof originalAmountCents === "number"
+          ? Math.max(0, originalAmountCents - refundAmountCents)
+          : null;
 
       return {
         id: b.id,
@@ -127,13 +209,21 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
         distanceMiles: b.ride.distanceMiles,
         passengerCount: b.ride.passengerCount,
-        tripStartedAt: b.ride.tripStartedAt ? b.ride.tripStartedAt.toISOString() : null,
-        tripCompletedAt: b.ride.tripCompletedAt ? b.ride.tripCompletedAt.toISOString() : null,
+        tripStartedAt: b.ride.tripStartedAt
+          ? b.ride.tripStartedAt.toISOString()
+          : null,
+        tripCompletedAt: b.ride.tripCompletedAt
+          ? b.ride.tripCompletedAt.toISOString()
+          : null,
 
         paymentType: b.paymentType ?? null,
         cashDiscountBps: b.cashDiscountBps ?? null,
-        baseTotalPriceCents: base,
-        effectiveTotalPriceCents: effective,
+
+        // original charged amount before rider-favor refund
+        baseTotalPriceCents: originalAmountCents,
+
+        // rider-visible amount after refund credit
+        effectiveTotalPriceCents: effectiveAfterRefund,
       };
     });
 
@@ -177,8 +267,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
       paymentType: null,
       cashDiscountBps: null,
-      baseTotalPriceCents: r.totalPriceCents,
-      effectiveTotalPriceCents: r.totalPriceCents,
+      baseTotalPriceCents: safeNonNegativeInt(r.totalPriceCents),
+      effectiveTotalPriceCents: safeNonNegativeInt(r.totalPriceCents),
     }));
 
     const combined = [...shapedBookings, ...shapedRideOnly];

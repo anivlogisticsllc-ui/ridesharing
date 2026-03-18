@@ -3,7 +3,12 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import { getServerSession } from "next-auth";
 import { authOptions } from "../../auth/[...nextauth]";
 import { prisma } from "../../../../lib/prisma";
-import { BookingStatus, PaymentType, RideStatus } from "@prisma/client";
+import {
+  BookingStatus,
+  DisputeStatus,
+  PaymentType,
+  RideStatus,
+} from "@prisma/client";
 
 type RiderPaymentType = "CARD" | "CASH" | "UNKNOWN";
 
@@ -14,6 +19,10 @@ type RiderBillingRow = {
   currency: string;
   amountCents: number;
   paymentType: RiderPaymentType;
+  refundIssued?: boolean;
+  refundAmountCents?: number;
+  refundIssuedAt?: string | null;
+  originalAmountCents?: number;
   ride: {
     id: string;
     departureTime: string | null;
@@ -50,6 +59,10 @@ function normalizeCurrency(v: string | null | undefined) {
   return (v || "USD").toUpperCase();
 }
 
+function asCents(v: unknown): number {
+  return typeof v === "number" && Number.isFinite(v) ? Math.max(0, Math.round(v)) : 0;
+}
+
 function derivePaymentType(args: {
   paymentType: unknown;
   hasPaymentMethod: boolean;
@@ -60,18 +73,6 @@ function derivePaymentType(args: {
   if (args.hasPaymentMethod) return "CARD";
   if (args.stripePaymentIntentId) return "CARD";
   return "UNKNOWN";
-}
-
-function isFallbackCardCharge(args: {
-  paymentType: PaymentType | null | undefined;
-  cashNotPaidAt?: Date | null;
-  fallbackCardChargedAt?: Date | null;
-}) {
-  return (
-    args.paymentType === PaymentType.CARD &&
-    Boolean(args.cashNotPaidAt) &&
-    Boolean(args.fallbackCardChargedAt)
-  );
 }
 
 export default async function handler(
@@ -85,8 +86,8 @@ export default async function handler(
     }
 
     const session = await getServerSession(req, res, authOptions);
-    const userId = (session?.user as any)?.id as string | undefined;
-    const role = (session?.user as any)?.role as "RIDER" | "DRIVER" | undefined;
+    const userId = (session?.user as { id?: string } | undefined)?.id;
+    const role = (session?.user as { role?: "RIDER" | "DRIVER" | "ADMIN" } | undefined)?.role;
 
     if (!userId) {
       return res.status(401).json({ ok: false, error: "Not authenticated" });
@@ -125,29 +126,26 @@ export default async function handler(
       },
     });
 
-    const rideIdsFromPayments = Array.from(
-      new Set(ridePayments.map((p) => p.rideId).filter((v): v is string => Boolean(v)))
-    );
-
-    const bookingsForPaidRides = rideIdsFromPayments.length
-      ? await prisma.booking.findMany({
-          where: {
-            riderId: userId,
-            rideId: { in: rideIdsFromPayments },
-          },
-          orderBy: { updatedAt: "desc" },
+    const completedBookings = await prisma.booking.findMany({
+      where: {
+        riderId: userId,
+        status: { in: [BookingStatus.ACCEPTED, BookingStatus.COMPLETED] },
+        ride: { status: RideStatus.COMPLETED },
+      },
+      orderBy: { updatedAt: "desc" },
+      take: 1000,
+      include: {
+        ride: {
           select: {
             id: true,
-            rideId: true,
-            paymentType: true,
-            finalAmountCents: true,
-            baseAmountCents: true,
-            currency: true,
-            cashNotPaidAt: true,
-            fallbackCardChargedAt: true,
+            departureTime: true,
+            originCity: true,
+            destinationCity: true,
+            status: true,
           },
-        })
-      : [];
+        },
+      },
+    });
 
     const bookingByRideId = new Map<
       string,
@@ -155,34 +153,109 @@ export default async function handler(
         id: string;
         rideId: string;
         paymentType: PaymentType | null;
+        originalPaymentType: PaymentType | null;
         finalAmountCents: number | null;
         baseAmountCents: number | null;
         currency: string | null;
-        cashNotPaidAt: Date | null;
-        fallbackCardChargedAt: Date | null;
+        updatedAt: Date;
+        ride: {
+          id: string;
+          departureTime: Date | null;
+          originCity: string | null;
+          destinationCity: string | null;
+          status: RideStatus | null;
+        } | null;
       }
     >();
 
-    for (const b of bookingsForPaidRides) {
-      if (!bookingByRideId.has(b.rideId)) {
-        bookingByRideId.set(b.rideId, b);
+    for (const b of completedBookings) {
+      if (b.rideId && !bookingByRideId.has(b.rideId)) {
+        bookingByRideId.set(b.rideId, {
+          id: b.id,
+          rideId: b.rideId,
+          paymentType: b.paymentType,
+          originalPaymentType: b.originalPaymentType,
+          finalAmountCents: b.finalAmountCents,
+          baseAmountCents: b.baseAmountCents,
+          currency: b.currency,
+          updatedAt: b.updatedAt,
+          ride: b.ride
+            ? {
+                id: b.ride.id,
+                departureTime: b.ride.departureTime,
+                originCity: b.ride.originCity,
+                destinationCity: b.ride.destinationCity,
+                status: b.ride.status,
+              }
+            : null,
+        });
+      }
+    }
+
+    const bookingIds = completedBookings.map((b) => b.id);
+    const rideIds = completedBookings
+      .map((b) => b.rideId)
+      .filter((v): v is string => Boolean(v));
+
+    const disputes =
+      bookingIds.length || rideIds.length
+        ? await prisma.dispute.findMany({
+            where: {
+              status: DisputeStatus.RESOLVED_RIDER,
+              refundIssued: true,
+              OR: [
+                ...(bookingIds.length ? [{ bookingId: { in: bookingIds } }] : []),
+                ...(rideIds.length ? [{ rideId: { in: rideIds } }] : []),
+              ],
+            },
+            orderBy: [
+              { refundIssuedAt: "desc" },
+              { createdAt: "desc" },
+            ],
+            select: {
+              id: true,
+              bookingId: true,
+              rideId: true,
+              refundAmountCents: true,
+              refundIssuedAt: true,
+              createdAt: true,
+            },
+          })
+        : [];
+
+    const refundByRideId = new Map<
+      string,
+      {
+        disputeId: string;
+        refundAmountCents: number;
+        refundIssuedAt: Date | null;
+      }
+    >();
+
+    for (const d of disputes) {
+      if (!d.rideId) continue;
+      if (!refundByRideId.has(d.rideId)) {
+        refundByRideId.set(d.rideId, {
+          disputeId: d.id,
+          refundAmountCents: asCents(d.refundAmountCents),
+          refundIssuedAt: d.refundIssuedAt ?? null,
+        });
       }
     }
 
     const mappedPayments: RiderBillingRow[] = ridePayments.map((p) => {
-      const booking = bookingByRideId.get(p.rideId);
+      const booking = p.rideId ? bookingByRideId.get(p.rideId) : undefined;
+      const refund = p.rideId ? refundByRideId.get(p.rideId) : undefined;
 
       const overriddenPaymentType =
         booking?.paymentType ??
         (p.paymentType as PaymentType | null | undefined) ??
         null;
 
-      const amountCents =
-        typeof booking?.finalAmountCents === "number" && booking.finalAmountCents > 0
-          ? booking.finalAmountCents
-          : typeof p.finalAmountCents === "number" && p.finalAmountCents > 0
-          ? p.finalAmountCents
-          : p.amountCents;
+      const originalAmountCents =
+        asCents(booking?.finalAmountCents) ||
+        asCents(p.finalAmountCents) ||
+        asCents(p.amountCents);
 
       const currency = normalizeCurrency(booking?.currency ?? p.currency);
 
@@ -191,19 +264,23 @@ export default async function handler(
         createdAt: p.createdAt.toISOString(),
         status: String(p.status || "").toUpperCase(),
         currency,
-        amountCents,
+        amountCents: originalAmountCents,
         paymentType: derivePaymentType({
           paymentType: overriddenPaymentType,
           hasPaymentMethod: Boolean(p.paymentMethod),
           stripePaymentIntentId: p.stripePaymentIntentId,
         }),
+        refundIssued: Boolean(refund && refund.refundAmountCents > 0),
+        refundAmountCents: refund?.refundAmountCents ?? 0,
+        refundIssuedAt: toIso(refund?.refundIssuedAt),
+        originalAmountCents,
         ride: p.ride
           ? {
               id: p.ride.id,
-              departureTime: toIso(p.ride.departureTime as any),
-              originCity: (p.ride as any).originCity ?? null,
-              destinationCity: (p.ride as any).destinationCity ?? null,
-              status: (p.ride as any).status ?? null,
+              departureTime: toIso(p.ride.departureTime as Date | null | undefined),
+              originCity: p.ride.originCity ?? null,
+              destinationCity: p.ride.destinationCity ?? null,
+              status: p.ride.status ?? null,
             }
           : null,
         paymentMethod: p.paymentMethod
@@ -223,57 +300,36 @@ export default async function handler(
       mappedPayments.map((p) => p.ride?.id).filter((v): v is string => Boolean(v))
     );
 
-    const completedBookings = await prisma.booking.findMany({
-      where: {
-        riderId: userId,
-        status: BookingStatus.COMPLETED,
-        ride: { status: RideStatus.COMPLETED },
-      },
-      orderBy: { updatedAt: "desc" },
-      take,
-      include: {
-        ride: {
-          select: {
-            id: true,
-            departureTime: true,
-            originCity: true,
-            destinationCity: true,
-            status: true,
-          },
-        },
-      },
-    });
-
     const fallbackRows: RiderBillingRow[] = completedBookings
       .filter((b) => b.ride && !rideIdsWithPayments.has(b.ride.id))
-      .map((b): RiderBillingRow => {
-        const paymentType: RiderPaymentType = derivePaymentType({
-          paymentType: b.paymentType,
-          hasPaymentMethod: false,
-          stripePaymentIntentId: null,
-        });
-
-        const amountCents =
-          typeof b.finalAmountCents === "number" && b.finalAmountCents > 0
-            ? b.finalAmountCents
-            : typeof b.baseAmountCents === "number" && b.baseAmountCents > 0
-            ? b.baseAmountCents
-            : 0;
+      .map((b) => {
+        const refund = b.rideId ? refundByRideId.get(b.rideId) : undefined;
+        const originalAmountCents =
+          asCents(b.finalAmountCents) ||
+          asCents(b.baseAmountCents);
 
         return {
           id: `booking_${b.id}`,
           createdAt: b.updatedAt.toISOString(),
           status: "COMPLETED",
           currency: normalizeCurrency(b.currency),
-          amountCents,
-          paymentType,
+          amountCents: originalAmountCents,
+          paymentType: derivePaymentType({
+            paymentType: b.paymentType,
+            hasPaymentMethod: false,
+            stripePaymentIntentId: null,
+          }),
+          refundIssued: Boolean(refund && refund.refundAmountCents > 0),
+          refundAmountCents: refund?.refundAmountCents ?? 0,
+          refundIssuedAt: toIso(refund?.refundIssuedAt),
+          originalAmountCents,
           ride: b.ride
             ? {
                 id: b.ride.id,
-                departureTime: toIso(b.ride.departureTime as any),
-                originCity: (b.ride as any).originCity ?? null,
-                destinationCity: (b.ride as any).destinationCity ?? null,
-                status: (b.ride as any).status ?? null,
+                departureTime: toIso(b.ride.departureTime as Date | null | undefined),
+                originCity: b.ride.originCity ?? null,
+                destinationCity: b.ride.destinationCity ?? null,
+                status: b.ride.status ?? null,
               }
             : null,
           paymentMethod: null,
@@ -281,9 +337,45 @@ export default async function handler(
       })
       .filter((row) => row.amountCents > 0);
 
-    const all = [...mappedPayments, ...fallbackRows].sort(
-      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
-    );
+    const refundRows: RiderBillingRow[] = disputes
+      .filter((d) => asCents(d.refundAmountCents) > 0)
+      .map((d) => {
+        const booking = d.rideId ? bookingByRideId.get(d.rideId) : undefined;
+
+        return {
+          id: `refund_${d.id}`,
+          createdAt: (d.refundIssuedAt ?? d.createdAt).toISOString(),
+          status: "REFUNDED",
+          currency: normalizeCurrency(booking?.currency),
+          amountCents: -asCents(d.refundAmountCents),
+          paymentType: "CARD",
+          refundIssued: true,
+          refundAmountCents: asCents(d.refundAmountCents),
+          refundIssuedAt: toIso(d.refundIssuedAt),
+          originalAmountCents: booking?.finalAmountCents
+            ? asCents(booking.finalAmountCents)
+            : undefined,
+          ride: booking?.ride
+            ? {
+                id: booking.ride.id,
+                departureTime: toIso(booking.ride.departureTime),
+                originCity: booking.ride.originCity ?? null,
+                destinationCity: booking.ride.destinationCity ?? null,
+                status: booking.ride.status ?? null,
+              }
+            : null,
+          paymentMethod: null,
+        };
+      });
+
+    const seenIds = new Set<string>();
+    const all = [...mappedPayments, ...fallbackRows, ...refundRows]
+      .filter((row) => {
+        if (seenIds.has(row.id)) return false;
+        seenIds.add(row.id);
+        return true;
+      })
+      .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
 
     const totalAmountCents = all.reduce((sum, p) => sum + (p.amountCents || 0), 0);
 
@@ -295,11 +387,11 @@ export default async function handler(
         totalAmountCents,
       },
     });
-  } catch (err: any) {
+  } catch (err: unknown) {
     console.error("Rider billing API error:", err);
     return res.status(500).json({
       ok: false,
-      error: err?.message || "Internal error",
+      error: err instanceof Error ? err.message : "Internal error",
     });
   }
 }

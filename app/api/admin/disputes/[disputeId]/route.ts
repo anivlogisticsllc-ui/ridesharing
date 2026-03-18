@@ -30,7 +30,6 @@ type PatchBody = {
   status?: string;
   adminNotes?: string;
   refundAmountCents?: number | string | null;
-  markRefundIssued?: boolean;
 };
 
 function asNonNegativeCents(value: unknown): number | null {
@@ -351,6 +350,8 @@ export async function PATCH(req: NextRequest, context: RouteContext) {
         rideId: true,
         riderId: true,
         driverId: true,
+        status: true,
+        resolvedAt: true,
         refundIssued: true,
         refundAmountCents: true,
         refundIssuedAt: true,
@@ -372,30 +373,54 @@ export async function PATCH(req: NextRequest, context: RouteContext) {
 
     const nextStatus = body.status as DisputeStatus;
     const nextDecision = mapDecision(nextStatus);
-    const nextResolvedAt =
+
+    const shouldSetResolvedAt =
       nextStatus === DisputeStatus.RESOLVED_RIDER ||
       nextStatus === DisputeStatus.RESOLVED_DRIVER ||
-      nextStatus === DisputeStatus.CLOSED
-        ? new Date()
+      nextStatus === DisputeStatus.CLOSED;
+
+    const nextResolvedAt =
+      shouldSetResolvedAt
+        ? existing.resolvedAt ?? new Date()
         : null;
 
     const requestedRefundAmount = asNonNegativeCents(body.refundAmountCents);
     const bookingFinalAmount =
-      asNonNegativeCents(existing.booking?.finalAmountCents) ?? 0;
+      asNonNegativeCents(existing.booking?.finalAmountCents) ?? null;
 
-    const shouldMarkRefundIssued =
-      nextStatus === DisputeStatus.RESOLVED_RIDER && body.markRefundIssued === true;
+    const shouldAutoRecordRefund = nextStatus === DisputeStatus.RESOLVED_RIDER;
 
-    let nextRefundIssued = false;
-    let nextRefundAmountCents: number | null = null;
-    let nextRefundIssuedAt: Date | null = null;
+    let nextRefundIssued = existing.refundIssued;
+    let nextRefundAmountCents = existing.refundAmountCents;
+    let nextRefundIssuedAt = existing.refundIssuedAt;
 
-    if (shouldMarkRefundIssued) {
+    if (shouldAutoRecordRefund) {
+      const resolvedRefundAmount =
+        requestedRefundAmount !== null
+          ? requestedRefundAmount
+          : existing.refundAmountCents ?? bookingFinalAmount;
+
+      if (resolvedRefundAmount === null) {
+        return NextResponse.json(
+          {
+            ok: false,
+            error:
+              "Unable to determine refund amount for rider-favored resolution.",
+          },
+          { status: 400 }
+        );
+      }
+
       nextRefundIssued = true;
-      nextRefundAmountCents =
-        requestedRefundAmount !== null ? requestedRefundAmount : bookingFinalAmount;
-      nextRefundIssuedAt = new Date();
+      nextRefundAmountCents = resolvedRefundAmount;
+      nextRefundIssuedAt = existing.refundIssuedAt ?? new Date();
     }
+
+    const refundWasJustRecorded =
+      existing.refundIssued !== true && nextRefundIssued === true;
+
+    const refundAmountChanged =
+      existing.refundAmountCents !== nextRefundAmountCents;
 
     const updated = await prisma.$transaction(async (tx) => {
       const dispute = await tx.dispute.update({
@@ -446,7 +471,7 @@ export async function PATCH(req: NextRequest, context: RouteContext) {
         });
       }
 
-      if (shouldMarkRefundIssued && dispute.refundIssued) {
+      if (refundWasJustRecorded) {
         await tx.adminAuditLog.create({
           data: {
             adminUserId: adminId,
@@ -506,6 +531,32 @@ export async function PATCH(req: NextRequest, context: RouteContext) {
             },
           });
         }
+      } else if (
+        nextStatus === DisputeStatus.RESOLVED_RIDER &&
+        existing.refundIssued === true &&
+        refundAmountChanged
+      ) {
+        await tx.adminAuditLog.create({
+          data: {
+            adminUserId: adminId,
+            disputeId: dispute.id,
+            actionType: AdminActionType.FALLBACK_CHARGE_REFUNDED,
+            targetType: AdminTargetType.DISPUTE,
+            targetId: dispute.id,
+            notes:
+              adminNotes ||
+              `Refund amount updated to ${dispute.refundAmountCents ?? 0} cents.`,
+            metadata: {
+              disputeId: dispute.id,
+              bookingId: dispute.bookingId,
+              rideId: dispute.rideId,
+              refundIssued: dispute.refundIssued,
+              refundAmountCents: dispute.refundAmountCents ?? 0,
+              refundIssuedAt: dispute.refundIssuedAt?.toISOString() ?? null,
+              refundAmountUpdated: true,
+            },
+          },
+        });
       }
 
       const msg = statusMessage(nextStatus);

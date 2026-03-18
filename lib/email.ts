@@ -242,6 +242,8 @@ export async function sendPasswordResetEmail(to: string, resetUrl: string) {
 
 /* -------------------- Receipt emails -------------------- */
 
+const PLATFORM_FEE_BPS = 1000; // 10%
+
 export type RideReceiptSnapshot = {
   id: string;
   status: string;
@@ -269,7 +271,31 @@ export type RideReceiptSnapshot = {
   discountCents?: number | null;
   convenienceFeeCents?: number | null;
   finalTotalCents?: number | null;
+
+  originalPaymentType?: "CARD" | "CASH" | null;
+  fallbackCardChargedAt?: Date | null;
+  cashNotPaidAt?: Date | null;
+  cashDiscountRevokedAt?: Date | null;
+  cashNotPaidReason?: string | null;
+  cashNotPaidNote?: string | null;
+
+  refundIssued?: boolean;
+  refundAmountCents?: number | null;
+  refundIssuedAt?: Date | null;
+  disputeResolvedAt?: Date | null;
 };
+
+function computeDriverSplitForEmail(grossAmountCents: number) {
+  const gross = normalizeCents(grossAmountCents);
+  const fee = Math.round(gross * (PLATFORM_FEE_BPS / 10000));
+  const net = Math.max(0, gross - fee);
+
+  return {
+    grossAmountCents: gross,
+    serviceFeeCents: fee,
+    netAmountCents: net,
+  };
+}
 
 function moneyLine(label: string, valueCents: number, negative = false) {
   const val = formatMoneyFromCents(valueCents);
@@ -281,15 +307,57 @@ function moneyLine(label: string, valueCents: number, negative = false) {
   `;
 }
 
-function receiptBreakdownHtml(ride: RideReceiptSnapshot) {
+function getReceiptMoney(ride: RideReceiptSnapshot) {
   const base = normalizeCents(ride.baseFareCents);
   const disc = normalizeCents(ride.discountCents);
   const fee = normalizeCents(ride.convenienceFeeCents);
 
-  const total =
+  const originalTotal =
     normalizeCents(ride.finalTotalCents) ||
     normalizeCents(ride.totalPriceCents) ||
     Math.max(0, base + fee - disc);
+
+  const refundAmountCents = Math.min(
+    normalizeCents(ride.refundAmountCents),
+    originalTotal
+  );
+
+  const refundedAfterDispute = Boolean(ride.refundIssued && refundAmountCents > 0);
+  const netCardResultCents = Math.max(0, originalTotal - refundAmountCents);
+
+  return {
+    base,
+    disc,
+    fee,
+    originalTotal,
+    refundAmountCents,
+    refundedAfterDispute,
+    netCardResultCents,
+  };
+}
+
+function getPaymentLabelForReceipt(ride: RideReceiptSnapshot) {
+  const originallyCash = ride.originalPaymentType === "CASH";
+  const fallbackCharged = Boolean(ride.cashNotPaidAt && ride.fallbackCardChargedAt);
+  const switchedToCardFallback =
+    originallyCash && ride.paymentType === "CARD" && fallbackCharged;
+
+  const refundAmountCents = normalizeCents(ride.refundAmountCents);
+  const refundedAfterDispute = Boolean(ride.refundIssued && refundAmountCents > 0);
+
+  if (switchedToCardFallback && refundedAfterDispute) {
+    return "CARD (fallback after unpaid CASH, later refunded)";
+  }
+  if (switchedToCardFallback) {
+    return "CARD (fallback after unpaid CASH)";
+  }
+  if (ride.paymentType === "CARD") return "CARD";
+  if (ride.paymentType === "CASH") return "CASH";
+  return "n/a";
+}
+
+function receiptBreakdownHtml(ride: RideReceiptSnapshot) {
+  const { base, disc, fee, originalTotal } = getReceiptMoney(ride);
 
   return `
     <div style="border-radius:14px; border:1px solid #e2e8f0; padding:14px; background:#ffffff;">
@@ -298,9 +366,112 @@ function receiptBreakdownHtml(ride: RideReceiptSnapshot) {
       ${moneyLine("Convenience fee", fee)}
       <div style="height:1px; background:#e2e8f0; margin:10px 0;"></div>
       <div style="display:flex; justify-content:space-between; gap:10px; font-size:14px; color:#0f172a;">
-        <div style="font-weight:700;">Total</div>
-        <div style="font-weight:800;">$${escapeHtml(formatMoneyFromCents(total))}</div>
+        <div style="font-weight:700;">Original total</div>
+        <div style="font-weight:800;">$${escapeHtml(formatMoneyFromCents(originalTotal))}</div>
       </div>
+    </div>
+  `;
+}
+
+function fallbackChargeHtml(ride: RideReceiptSnapshot) {
+  const originallyCash = ride.originalPaymentType === "CASH";
+  const fallbackCharged = Boolean(ride.cashNotPaidAt && ride.fallbackCardChargedAt);
+  const switchedToCardFallback =
+    originallyCash && ride.paymentType === "CARD" && fallbackCharged;
+
+  if (!switchedToCardFallback) return "";
+
+  const originalTotal = getReceiptMoney(ride).originalTotal;
+
+  return `
+    <div style="border-radius:14px; border:1px solid #fcd34d; padding:14px; margin-top:14px; background:#fffbeb;">
+      <div style="font-size:14px; font-weight:700; color:#92400e; margin-bottom:8px;">
+        Cash fallback charge
+      </div>
+
+      <div style="font-size:12px; color:#78350f; line-height:1.7;">
+        <div>Original payment selection: <b>CASH</b></div>
+        <div>Fallback card charged amount: <b>$${escapeHtml(formatMoneyFromCents(originalTotal))}</b></div>
+        <div>Cash not paid at: <b>${escapeHtml(fmtDate(ride.cashNotPaidAt))}</b></div>
+        <div>Cash discount revoked at: <b>${escapeHtml(fmtDate(ride.cashDiscountRevokedAt))}</b></div>
+        <div>Fallback card charged at: <b>${escapeHtml(fmtDate(ride.fallbackCardChargedAt))}</b></div>
+        <div>Reason: <b>${escapeHtml(ride.cashNotPaidReason || "n/a")}</b></div>
+        ${
+          ride.cashNotPaidNote
+            ? `<div>Note: <b>${escapeHtml(ride.cashNotPaidNote)}</b></div>`
+            : ""
+        }
+      </div>
+    </div>
+  `;
+}
+
+function refundAfterDisputeHtml(ride: RideReceiptSnapshot, includeDriverPayoutEffect: boolean) {
+  const {
+    originalTotal,
+    refundAmountCents,
+    refundedAfterDispute,
+    netCardResultCents,
+  } = getReceiptMoney(ride);
+
+  if (!refundedAfterDispute) return "";
+
+  const originalDriverSplit = computeDriverSplitForEmail(originalTotal);
+  const adjustedDriverSplit = computeDriverSplitForEmail(originalTotal);
+
+  return `
+    <div style="border-radius:14px; border:1px solid #86efac; padding:14px; margin-top:14px; background:#ecfdf5;">
+      <div style="font-size:14px; font-weight:700; color:#166534; margin-bottom:8px;">
+        Refund after dispute
+      </div>
+
+      <div style="font-size:12px; color:#166534; line-height:1.7;">
+        <div>Refund recorded: <b>Yes</b></div>
+        <div>Refund amount: <b>-$${escapeHtml(formatMoneyFromCents(refundAmountCents))}</b></div>
+        <div>Refund issued at: <b>${escapeHtml(fmtDate(ride.refundIssuedAt))}</b></div>
+        <div>Dispute resolved at: <b>${escapeHtml(fmtDate(ride.disputeResolvedAt))}</b></div>
+      </div>
+
+      <div style="border-radius:10px; border:1px solid #bbf7d0; background:#ffffffcc; padding:12px; margin-top:10px;">
+        <div style="display:flex; justify-content:space-between; gap:10px; font-size:13px; color:#14532d;">
+          <div>Original fallback charge</div>
+          <div style="font-weight:700;">$${escapeHtml(formatMoneyFromCents(originalTotal))}</div>
+        </div>
+        <div style="display:flex; justify-content:space-between; gap:10px; font-size:13px; color:#14532d; margin-top:6px;">
+          <div>Refund after dispute</div>
+          <div style="font-weight:700;">-$${escapeHtml(formatMoneyFromCents(refundAmountCents))}</div>
+        </div>
+        <div style="height:1px; background:#bbf7d0; margin:10px 0;"></div>
+        <div style="display:flex; justify-content:space-between; gap:10px; font-size:14px; color:#14532d;">
+          <div style="font-weight:800;">Net card result</div>
+          <div style="font-weight:800;">$${escapeHtml(formatMoneyFromCents(netCardResultCents))}</div>
+        </div>
+      </div>
+
+      ${
+        includeDriverPayoutEffect
+          ? `
+            <div style="border-radius:10px; border:1px solid #bbf7d0; background:#ffffffcc; padding:12px; margin-top:10px;">
+              <div style="font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:#15803d; margin-bottom:8px;">
+                Driver payout effect
+              </div>
+              <div style="display:flex; justify-content:space-between; gap:10px; font-size:13px; color:#14532d;">
+                <div>Driver gross fare</div>
+                <div style="font-weight:700;">$${escapeHtml(formatMoneyFromCents(originalDriverSplit.grossAmountCents))}</div>
+              </div>
+              <div style="display:flex; justify-content:space-between; gap:10px; font-size:13px; color:#14532d; margin-top:6px;">
+                <div>Platform fee</div>
+                <div style="font-weight:700;">$${escapeHtml(formatMoneyFromCents(originalDriverSplit.serviceFeeCents))}</div>
+              </div>
+              <div style="height:1px; background:#bbf7d0; margin:10px 0;"></div>
+              <div style="display:flex; justify-content:space-between; gap:10px; font-size:14px; color:#14532d;">
+                <div style="font-weight:800;">Driver net after fee</div>
+                <div style="font-weight:800;">$${escapeHtml(formatMoneyFromCents(adjustedDriverSplit.netAmountCents))}</div>
+              </div>
+            </div>
+          `
+          : ""
+      }
     </div>
   `;
 }
@@ -314,15 +485,15 @@ function riderReceiptHtml(args: {
 }) {
   const { riderName, riderEmail, driverName, driverEmail, ride } = args;
 
-  const totalCents = normalizeCents(ride.finalTotalCents ?? ride.totalPriceCents);
-  const amount = formatMoneyFromCents(totalCents);
+  const { originalTotal, refundedAfterDispute } = getReceiptMoney(ride);
+  const amount = formatMoneyFromCents(originalTotal);
   const miles = formatMiles(ride.distanceMiles);
 
   const completedWhen = fmtDate(ride.tripCompletedAt ?? ride.departureTime);
   const started = fmtDate(ride.tripStartedAt);
   const completed = fmtDate(ride.tripCompletedAt);
 
-  const payment = ride.paymentType ? escapeHtml(ride.paymentType) : "n/a";
+  const payment = getPaymentLabelForReceipt(ride);
 
   return `
     <p style="margin:0 0 18px; font-size:14px; color:#475569;">
@@ -342,10 +513,12 @@ function riderReceiptHtml(args: {
         </div>
 
         <div style="text-align:right;">
-          <div style="font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:#64748b; margin-bottom:4px;">Total</div>
+          <div style="font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:#64748b; margin-bottom:4px;">
+            ${refundedAfterDispute ? "Original total" : "Total"}
+          </div>
           <div style="font-size:20px; font-weight:800; color:#0f172a;">$${escapeHtml(amount)}</div>
           <div style="font-size:11px; color:#94a3b8; margin-top:2px;">
-            Stored as ${totalCents} cents
+            Stored as ${originalTotal} cents
           </div>
         </div>
       </div>
@@ -359,9 +532,9 @@ function riderReceiptHtml(args: {
           <div style="font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:#94a3b8;">Passengers</div>
           <div style="margin-top:3px; font-weight:700;">${ride.passengerCount ?? "n/a"}</div>
         </div>
-        <div style="flex:1 1 120px;">
+        <div style="flex:1 1 160px;">
           <div style="font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:#94a3b8;">Payment</div>
-          <div style="margin-top:3px; font-weight:700;">${payment}</div>
+          <div style="margin-top:3px; font-weight:700;">${escapeHtml(payment)}</div>
         </div>
       </div>
     </div>
@@ -381,6 +554,8 @@ function riderReceiptHtml(args: {
     </div>
 
     ${receiptBreakdownHtml(ride)}
+    ${fallbackChargeHtml(ride)}
+    ${refundAfterDisputeHtml(ride, false)}
 
     <div style="border-radius:14px; border:1px solid #e2e8f0; padding:16px; margin-top:14px; background:#ffffff;">
       <div style="font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:#94a3b8; margin-bottom:6px;">Timing</div>
@@ -418,11 +593,11 @@ function driverReceiptHtml(args: {
 }) {
   const { driverName, driverEmail, riderName, riderEmail, ride } = args;
 
-  const totalCents = normalizeCents(ride.finalTotalCents ?? ride.totalPriceCents);
-  const amount = formatMoneyFromCents(totalCents);
+  const { originalTotal, refundedAfterDispute } = getReceiptMoney(ride);
+  const amount = formatMoneyFromCents(originalTotal);
   const miles = formatMiles(ride.distanceMiles);
   const completedWhen = fmtDate(ride.tripCompletedAt ?? ride.departureTime);
-  const payment = ride.paymentType ? escapeHtml(ride.paymentType) : "n/a";
+  const payment = getPaymentLabelForReceipt(ride);
 
   return `
     <p style="margin:0 0 18px; font-size:14px; color:#475569;">
@@ -442,10 +617,12 @@ function driverReceiptHtml(args: {
         </div>
 
         <div style="text-align:right;">
-          <div style="font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:#64748b; margin-bottom:4px;">Total</div>
+          <div style="font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:#64748b; margin-bottom:4px;">
+            ${refundedAfterDispute ? "Original total" : "Total"}
+          </div>
           <div style="font-size:20px; font-weight:800; color:#0f172a;">$${escapeHtml(amount)}</div>
           <div style="font-size:11px; color:#94a3b8; margin-top:2px;">
-            Stored as ${totalCents} cents
+            Stored as ${originalTotal} cents
           </div>
         </div>
       </div>
@@ -459,9 +636,9 @@ function driverReceiptHtml(args: {
           <div style="font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:#94a3b8;">Passengers</div>
           <div style="margin-top:3px; font-weight:700;">${ride.passengerCount ?? "n/a"}</div>
         </div>
-        <div style="flex:1 1 120px;">
+        <div style="flex:1 1 160px;">
           <div style="font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:#94a3b8;">Payment</div>
-          <div style="margin-top:3px; font-weight:700;">${payment}</div>
+          <div style="margin-top:3px; font-weight:700;">${escapeHtml(payment)}</div>
         </div>
       </div>
     </div>
@@ -481,6 +658,8 @@ function driverReceiptHtml(args: {
     </div>
 
     ${receiptBreakdownHtml(ride)}
+    ${fallbackChargeHtml(ride)}
+    ${refundAfterDisputeHtml(ride, true)}
 
     <div style="border-radius:14px; border:1px solid #e2e8f0; padding:16px; margin-top:14px; background:#ffffff;">
       <div style="font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:#94a3b8; margin-bottom:6px;">Timing</div>
@@ -529,13 +708,19 @@ export async function sendRideReceiptEmail(args: {
     })
   );
 
+  const { originalTotal, refundAmountCents, refundedAfterDispute, netCardResultCents } = getReceiptMoney(args.ride);
+
   const text = [
     "Ride receipt",
     "",
     `Route: ${args.ride.originCity} -> ${args.ride.destinationCity}`,
-    `Total: $${formatMoneyFromCents(args.ride.finalTotalCents ?? args.ride.totalPriceCents)}`,
+    `Original total: $${formatMoneyFromCents(originalTotal)}`,
+    refundedAfterDispute ? `Refund after dispute: -$${formatMoneyFromCents(refundAmountCents)}` : "",
+    refundedAfterDispute ? `Net card result: $${formatMoneyFromCents(netCardResultCents)}` : "",
     `Ride ID: ${args.ride.id}`,
-  ].join("\n");
+  ]
+    .filter(Boolean)
+    .join("\n");
 
   await sendOrLog({ to: args.riderEmail, subject, html, text });
 }
@@ -559,144 +744,28 @@ export async function sendDriverReceiptEmail(args: {
     })
   );
 
+  const {
+    originalTotal,
+    refundAmountCents,
+    refundedAfterDispute,
+    netCardResultCents,
+  } = getReceiptMoney(args.ride);
+
+  const driverSplit = computeDriverSplitForEmail(originalTotal);
+
   const text = [
     "Driver receipt",
     "",
     `Route: ${args.ride.originCity} -> ${args.ride.destinationCity}`,
-    `Total: $${formatMoneyFromCents(args.ride.finalTotalCents ?? args.ride.totalPriceCents)}`,
+    `Original total: $${formatMoneyFromCents(originalTotal)}`,
+    refundedAfterDispute ? `Refund after dispute: -$${formatMoneyFromCents(refundAmountCents)}` : "",
+    refundedAfterDispute ? `Net card result: $${formatMoneyFromCents(netCardResultCents)}` : "",
+    `Platform fee: $${formatMoneyFromCents(driverSplit.serviceFeeCents)}`,
+    `Driver net after fee: $${formatMoneyFromCents(driverSplit.netAmountCents)}`,
     `Ride ID: ${args.ride.id}`,
-  ].join("\n");
-
-  await sendOrLog({ to: args.driverEmail, subject, html, text });
-}
-
-/* ---------- Outstanding balance email ---------- */
-
-export type OutstandingChargeEmailSnapshot = {
-  id: string;
-  totalCents: number;
-  fareCents: number;
-  convenienceFeeCents: number;
-  currency: string; // "USD"
-  reason: string;
-  note?: string | null;
-  createdAt: Date;
-  ride: {
-    id: string;
-    originCity: string;
-    destinationCity: string;
-    departureTime: Date;
-    tripCompletedAt: Date | null;
-  };
-};
-
-function fmtMoney(cents: number) {
-  const v = Number.isFinite(cents) ? Math.max(0, Math.round(cents)) : 0;
-  return (v / 100).toFixed(2);
-}
-
-export async function sendOutstandingChargeEmailToRider(args: {
-  riderEmail: string;
-  riderName?: string | null;
-  outstanding: OutstandingChargeEmailSnapshot;
-  resolveUrl: string;
-}) {
-  const { riderEmail, riderName, outstanding, resolveUrl } = args;
-
-  const title = "Action required: unpaid ride reported";
-  const subject = "Action required: unpaid ride reported";
-
-  const fixedResolveUrl = normalizeAppUrl(resolveUrl);
-  const safeResolve = escapeHtml(fixedResolveUrl);
-
-  const total = fmtMoney(outstanding.totalCents);
-  const fare = fmtMoney(outstanding.fareCents);
-  const fee = fmtMoney(outstanding.convenienceFeeCents);
-
-  const ride = outstanding.ride;
-  const routeLine = `${ride.originCity} → ${ride.destinationCity}`;
-  const when = fmtDate(ride.tripCompletedAt ?? ride.departureTime);
-
-  const reason = escapeHtml(outstanding.reason);
-  const note = outstanding.note ? escapeHtml(outstanding.note) : "";
-
-  const html = wrapHtml(
-    title,
-    `
-      <p style="margin:0 0 12px; font-size:14px; color:#475569;">
-        Hi${riderName ? ` ${escapeHtml(riderName)}` : ""}, a driver reported an unpaid CASH ride.
-        Please review and respond.
-      </p>
-
-      <div style="border-radius:14px; border:1px solid #e2e8f0; padding:16px; background:#ffffff; margin-bottom:12px;">
-        <div style="font-size:15px; font-weight:700; color:#0f172a; margin-bottom:6px;">
-          ${escapeHtml(routeLine)}
-        </div>
-        <div style="font-size:12px; color:#64748b; margin-bottom:10px;">
-          ${escapeHtml(when)}
-        </div>
-
-        <div style="display:flex; flex-wrap:wrap; gap:12px; font-size:13px; color:#334155;">
-          <div style="flex:1 1 160px;">
-            <div style="font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:#94a3b8;">Fare</div>
-            <div style="margin-top:3px; font-weight:600;">$${escapeHtml(fare)}</div>
-          </div>
-          <div style="flex:1 1 160px;">
-            <div style="font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:#94a3b8;">Convenience fee</div>
-            <div style="margin-top:3px; font-weight:600;">$${escapeHtml(fee)}</div>
-          </div>
-          <div style="flex:1 1 160px;">
-            <div style="font-size:11px; text-transform:uppercase; letter-spacing:.06em; color:#94a3b8;">Total due</div>
-            <div style="margin-top:3px; font-weight:800; color:#0f172a;">$${escapeHtml(total)}</div>
-          </div>
-        </div>
-
-        <div style="margin-top:12px; font-size:12px; color:#64748b;">
-          Reason: <b style="color:#0f172a;">${reason}</b>
-          ${note ? `<div style="margin-top:6px;">Note: <span style="color:#0f172a;">${note}</span></div>` : ""}
-        </div>
-
-        <div style="margin-top:14px;">
-          <a href="${safeResolve}"
-             style="background:#2563eb;color:white;padding:10px 16px;text-decoration:none;border-radius:8px;display:inline-block;font-weight:700;font-size:14px;">
-            Review & resolve
-          </a>
-        </div>
-
-        <div style="margin-top:10px; font-size:12px; color:#94a3b8; word-break:break-all;">
-          If the button doesn’t work, copy and paste this URL:<br/>
-          ${safeResolve}
-        </div>
-
-        <div style="margin-top:10px; font-size:11px; color:#94a3b8;">
-          Outstanding Charge ID: ${escapeHtml(outstanding.id)} • Ride ID: ${escapeHtml(ride.id)}
-        </div>
-      </div>
-
-      <p style="margin:0; font-size:12px; color:#94a3b8;">
-        If you believe this was reported in error, open the link above and choose “Dispute”.
-      </p>
-    `
-  );
-
-  const text = [
-    "Action required: unpaid ride reported",
-    "",
-    `Route: ${ride.originCity} -> ${ride.destinationCity}`,
-    `When: ${when}`,
-    `Fare: $${fare}`,
-    `Convenience fee: $${fee}`,
-    `Total due: $${total}`,
-    `Reason: ${outstanding.reason}`,
-    outstanding.note ? `Note: ${outstanding.note}` : "",
-    "",
-    `Review & resolve: ${fixedResolveUrl}`,
-    "",
-    `Outstanding Charge ID: ${outstanding.id}`,
-    `Ride ID: ${ride.id}`,
   ]
     .filter(Boolean)
     .join("\n");
 
-  await sendOrLog({ to: riderEmail, subject, html, text });
+  await sendOrLog({ to: args.driverEmail, subject, html, text });
 }

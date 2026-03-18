@@ -1,4 +1,3 @@
-// app/receipt/[bookingId]/PrintButton.tsx
 "use client";
 
 export default function PrintButton() {

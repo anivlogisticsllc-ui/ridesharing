@@ -1,7 +1,7 @@
 // pages/api/receipt/email.ts
 import type { NextApiRequest, NextApiResponse } from "next";
 import { getServerSession } from "next-auth";
-import { RideStatus, PaymentType } from "@prisma/client";
+import { DisputeStatus, RideStatus, PaymentType } from "@prisma/client";
 
 import { authOptions } from "../auth/[...nextauth]";
 import { prisma } from "@/lib/prisma";
@@ -41,6 +41,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
   const userId = toStr(user?.id).trim();
   const userEmail = toStr(user?.email).trim();
+
   if (!userId || !userEmail) {
     return res.status(401).json({ ok: false, error: "Not authenticated" });
   }
@@ -54,7 +55,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     where: { id: bookingId },
     include: {
       rider: { select: { id: true, name: true, email: true } },
-      ride: { include: { driver: { select: { id: true, name: true, email: true } } } },
+      ride: {
+        include: {
+          driver: { select: { id: true, name: true, email: true } },
+        },
+      },
     },
   });
 
@@ -65,14 +70,38 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
   const ride = booking.ride;
 
   if (ride.status !== RideStatus.COMPLETED) {
-    return res.status(400).json({ ok: false, error: "Receipt is only available for completed rides." });
+    return res
+      .status(400)
+      .json({ ok: false, error: "Receipt is only available for completed rides." });
   }
 
   const isRider = booking.rider?.id === userId;
   const isDriver = ride.driver?.id === userId;
+
   if (!isRider && !isDriver) {
     return res.status(403).json({ ok: false, error: "Not allowed" });
   }
+
+  const dispute = await prisma.dispute.findFirst({
+    where: {
+      bookingId: booking.id,
+      rideId: ride.id,
+      status: DisputeStatus.RESOLVED_RIDER,
+      refundIssued: true,
+    },
+    orderBy: [
+      { refundIssuedAt: "desc" },
+      { resolvedAt: "desc" },
+      { createdAt: "desc" },
+    ],
+    select: {
+      id: true,
+      refundIssued: true,
+      refundAmountCents: true,
+      refundIssuedAt: true,
+      resolvedAt: true,
+    },
+  });
 
   const originDisplay =
     toStr((ride as any).originAddress).trim() || toStr((ride as any).originCity).trim();
@@ -80,21 +109,26 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
   const destDisplay =
     toStr((ride as any).destinationAddress).trim() || toStr((ride as any).destinationCity).trim();
 
-  // ---------- Money logic ----------
-  // Source of truth: Booking amounts (fallback to ride.totalPriceCents)
+  // Source of truth: booking amounts first, then ride fallback
   const base =
     asInt((booking as any).baseAmountCents) ??
     asInt((ride as any).totalPriceCents) ??
     0;
 
-  const disc = asInt((booking as any).discountCents) ?? 0;
+  const disc =
+    booking.originalPaymentType === PaymentType.CASH &&
+    booking.paymentType === PaymentType.CARD &&
+    booking.cashNotPaidAt &&
+    booking.fallbackCardChargedAt
+      ? 0
+      : asInt((booking as any).discountCents) ?? 0;
 
   const final =
     asInt((booking as any).finalAmountCents) ??
     Math.max(0, base - disc);
 
   const netAfterDiscount = Math.max(0, base - disc);
-  const fee = Math.max(0, final - netAfterDiscount); // should be 0 in the new model
+  const fee = Math.max(0, final - netAfterDiscount);
 
   const baseFareCents = clampCents(base);
   const discountCents = clampCents(disc);
@@ -124,11 +158,23 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
     bookingId: booking.id,
     paymentType: toPaymentLabel(booking.paymentType),
+    originalPaymentType: toPaymentLabel(booking.originalPaymentType),
 
     baseFareCents,
     convenienceFeeCents,
     discountCents,
     finalTotalCents,
+
+    cashNotPaidAt: booking.cashNotPaidAt,
+    cashDiscountRevokedAt: booking.cashDiscountRevokedAt,
+    fallbackCardChargedAt: booking.fallbackCardChargedAt,
+    cashNotPaidReason: booking.cashNotPaidReason ?? null,
+    cashNotPaidNote: booking.cashNotPaidNote ?? null,
+
+    refundIssued: dispute?.refundIssued ?? false,
+    refundAmountCents: clampCents(dispute?.refundAmountCents),
+    refundIssuedAt: dispute?.refundIssuedAt ?? null,
+    disputeResolvedAt: dispute?.resolvedAt ?? null,
   };
 
   if (isDriver) {
@@ -136,15 +182,19 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       driverEmail: userEmail,
       driverName: ride.driver?.name ?? user?.name ?? null,
       riderName: booking.rider?.name ?? null,
+      riderEmail: booking.rider?.email ?? null,
       ride: snapshot,
     });
+
     return res.status(200).json({ ok: true });
   }
 
   await sendRideReceiptEmail({
     riderEmail: userEmail,
     riderName: booking.rider?.name ?? null,
+    riderEmailLabel: booking.rider?.email ?? null,
     driverName: ride.driver?.name ?? null,
+    driverEmail: ride.driver?.email ?? null,
     ride: snapshot,
   });
 

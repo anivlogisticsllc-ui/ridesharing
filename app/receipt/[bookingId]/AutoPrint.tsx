@@ -15,8 +15,10 @@ export default function AutoPrint() {
 
     printedRef.current = true;
 
-    // Give layout/fonts a beat to settle
-    const t = window.setTimeout(() => window.print(), 200);
+    const t = window.setTimeout(() => {
+      window.print();
+    }, 400);
+
     return () => window.clearTimeout(t);
   }, [searchParams]);
 

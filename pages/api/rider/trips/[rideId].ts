@@ -1,12 +1,19 @@
-// pages/api/rider/trips/[rideId].ts
+// OATH: Clean replacement file
+// FILE: pages/api/rider/trips/[rideId].ts
+
 import type { NextApiRequest, NextApiResponse } from "next";
 import { getServerSession } from "next-auth";
 import { authOptions } from "../../auth/[...nextauth]";
 import { prisma } from "../../../../lib/prisma";
-import { PaymentType } from "@prisma/client";
+import { DisputeStatus, PaymentType } from "@prisma/client";
 
 type TripStatus = "OPEN" | "IN_ROUTE" | "COMPLETED" | "CANCELLED" | string;
-type BookingStatus = "PENDING" | "CONFIRMED" | "COMPLETED" | "CANCELLED" | "EXPIRED";
+type BookingStatus =
+  | "PENDING"
+  | "CONFIRMED"
+  | "COMPLETED"
+  | "CANCELLED"
+  | "EXPIRED";
 
 type TripDto = {
   rideId: string;
@@ -19,16 +26,19 @@ type TripDto = {
 
   distanceMiles: number | null;
 
-  // IMPORTANT: this should be final charged total if available
+  // rider-visible net amount after refund credit
   totalPriceCents: number | null;
 
-  // extra fields (safe additive)
   paymentType?: "CARD" | "CASH" | null;
   cashDiscountBps?: number | null;
   baseFareCents?: number | null;
   convenienceFeeCents?: number | null;
   discountCents?: number | null;
   finalTotalCents?: number | null;
+
+  refundAmountCents?: number | null;
+  refundIssued?: boolean;
+  refundIssuedAt?: string | null;
 
   driverName: string | null;
   driverPublicId: string | null;
@@ -48,7 +58,11 @@ function pickNumber(v: unknown): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
 }
 
-function applyCashDiscount(baseCents: number, paymentType: PaymentType | null, cashDiscountBps: number | null) {
+function applyCashDiscount(
+  baseCents: number,
+  paymentType: PaymentType | null,
+  cashDiscountBps: number | null
+) {
   if (!Number.isFinite(baseCents)) return baseCents;
   if (paymentType !== PaymentType.CASH) return baseCents;
 
@@ -88,7 +102,12 @@ function deriveBookingMoney(b: any) {
     pickNumber(b.totalPaidCents) ??
     null;
 
-  return { baseFareCents, convenienceFeeCents, discountCents, finalTotalCents };
+  return {
+    baseFareCents,
+    convenienceFeeCents,
+    discountCents,
+    finalTotalCents,
+  };
 }
 
 function computeFinalTotalCents(args: {
@@ -119,12 +138,18 @@ function computeFinalTotalCents(args: {
   }
 
   const anyB = booking as any;
-  const paymentType: PaymentType | null = (booking.paymentType ?? null) as any;
-  const cashDiscountBps = typeof anyB.cashDiscountBps === "number" ? anyB.cashDiscountBps : null;
+  const paymentType: PaymentType | null =
+    (booking.paymentType ?? null) as PaymentType | null;
+  const cashDiscountBps =
+    typeof anyB.cashDiscountBps === "number" ? anyB.cashDiscountBps : null;
 
-  const { baseFareCents, convenienceFeeCents, discountCents, finalTotalCents } = deriveBookingMoney(anyB);
+  const {
+    baseFareCents,
+    convenienceFeeCents,
+    discountCents,
+    finalTotalCents,
+  } = deriveBookingMoney(anyB);
 
-  // If booking final exists, trust it
   if (typeof finalTotalCents === "number") {
     return {
       totalPriceCents: finalTotalCents,
@@ -132,43 +157,48 @@ function computeFinalTotalCents(args: {
       convenienceFeeCents,
       discountCents,
       finalTotalCents,
-      paymentType: (paymentType as any) ?? null,
+      paymentType: paymentType ?? null,
       cashDiscountBps,
     };
   }
 
-  // else compute from pieces
   if (typeof baseFareCents === "number") {
     const discountedBase =
-      paymentType === PaymentType.CASH ? applyCashDiscount(baseFareCents, paymentType, cashDiscountBps) : baseFareCents;
+      paymentType === PaymentType.CASH
+        ? applyCashDiscount(baseFareCents, paymentType, cashDiscountBps)
+        : baseFareCents;
 
-    const fee = typeof convenienceFeeCents === "number" ? convenienceFeeCents : 0;
+    const fee =
+      typeof convenienceFeeCents === "number" ? convenienceFeeCents : 0;
     const disc = typeof discountCents === "number" ? discountCents : 0;
+    const computedTotal = Math.max(0, discountedBase + fee - disc);
 
     return {
-      totalPriceCents: Math.max(0, discountedBase + fee - disc),
+      totalPriceCents: computedTotal,
       baseFareCents,
       convenienceFeeCents,
       discountCents,
-      finalTotalCents: null,
-      paymentType: (paymentType as any) ?? null,
+      finalTotalCents: computedTotal,
+      paymentType: paymentType ?? null,
       cashDiscountBps,
     };
   }
 
-  // last resort
   return {
     totalPriceCents: rideEstimateCents,
     baseFareCents: null,
     convenienceFeeCents: null,
     discountCents: null,
-    finalTotalCents: null,
-    paymentType: (paymentType as any) ?? null,
+    finalTotalCents: rideEstimateCents,
+    paymentType: paymentType ?? null,
     cashDiscountBps,
   };
 }
 
-export default async function handler(req: NextApiRequest, res: NextApiResponse<ApiResponse>) {
+export default async function handler(
+  req: NextApiRequest,
+  res: NextApiResponse<ApiResponse>
+) {
   if (req.method !== "GET") {
     return res.status(405).json({ ok: false, error: "Method not allowed" });
   }
@@ -186,7 +216,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       return res.status(400).json({ ok: false, error: "Invalid rideId parameter" });
     }
 
-    // 1) Try to find a booking for this rider + ride
     const booking = await prisma.booking.findFirst({
       where: { riderId: userId, rideId },
       orderBy: { createdAt: "desc" },
@@ -196,7 +225,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       },
     });
 
-    // 2) If there is no booking, fall back to ride-only access
     if (!booking) {
       const ride = await prisma.ride.findUnique({
         where: { id: rideId },
@@ -210,7 +238,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       const tripFromRideOnly: TripDto = {
         rideId: ride.id,
         originAddress: (ride as any).originAddress ?? (ride as any).originCity ?? "",
-        destinationAddress: (ride as any).destinationAddress ?? (ride as any).destinationCity ?? "",
+        destinationAddress:
+          (ride as any).destinationAddress ?? (ride as any).destinationCity ?? "",
         departureTime: ride.departureTime.toISOString(),
 
         bookingStatus: "PENDING",
@@ -218,6 +247,17 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
         distanceMiles: (ride as any).distanceMiles ?? null,
         totalPriceCents: (ride as any).totalPriceCents ?? null,
+
+        paymentType: null,
+        cashDiscountBps: null,
+        baseFareCents: null,
+        convenienceFeeCents: null,
+        discountCents: null,
+        finalTotalCents: (ride as any).totalPriceCents ?? null,
+
+        refundAmountCents: null,
+        refundIssued: false,
+        refundIssuedAt: null,
 
         driverName: ((ride as any).driver?.name as string | undefined) ?? null,
         driverPublicId: ((ride as any).driver?.publicId as string | undefined) ?? null,
@@ -233,9 +273,36 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     }
 
     const ride = booking.ride as any;
-
     const rideEstimateCents = pickNumber(ride.totalPriceCents) ?? null;
     const money = computeFinalTotalCents({ booking, rideEstimateCents });
+
+    const dispute = await prisma.dispute.findFirst({
+      where: {
+        riderId: userId,
+        rideId: ride.id,
+        status: DisputeStatus.RESOLVED_RIDER,
+        refundIssued: true,
+      },
+      orderBy: {
+        refundIssuedAt: "desc",
+      },
+      select: {
+        refundIssued: true,
+        refundAmountCents: true,
+        refundIssuedAt: true,
+      },
+    });
+
+    const refundAmountCents =
+      typeof dispute?.refundAmountCents === "number" &&
+      Number.isFinite(dispute.refundAmountCents)
+        ? Math.max(0, Math.round(dispute.refundAmountCents))
+        : 0;
+
+    const riderVisibleTotalPriceCents =
+      typeof money.totalPriceCents === "number"
+        ? Math.max(0, money.totalPriceCents - refundAmountCents)
+        : money.totalPriceCents;
 
     const trip: TripDto = {
       rideId: ride.id,
@@ -248,15 +315,23 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
       distanceMiles: ride.distanceMiles ?? null,
 
-      // ✅ This is the big fix:
-      totalPriceCents: money.totalPriceCents,
+      // rider-visible charge after refund credit
+      totalPriceCents: riderVisibleTotalPriceCents,
 
       paymentType: money.paymentType,
       cashDiscountBps: money.cashDiscountBps,
       baseFareCents: money.baseFareCents,
       convenienceFeeCents: money.convenienceFeeCents,
       discountCents: money.discountCents,
+
+      // original stored total before refund credit
       finalTotalCents: money.finalTotalCents,
+
+      refundAmountCents: refundAmountCents || null,
+      refundIssued: Boolean(dispute?.refundIssued),
+      refundIssuedAt: dispute?.refundIssuedAt
+        ? dispute.refundIssuedAt.toISOString()
+        : null,
 
       driverName: (ride.driver?.name as string | undefined) ?? null,
       driverPublicId: (ride.driver?.publicId as string | undefined) ?? null,
@@ -265,7 +340,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
       tripStartedAt: ride.tripStartedAt?.toISOString?.() ?? null,
       tripCompletedAt: ride.tripCompletedAt?.toISOString?.() ?? null,
 
-      conversationId: (booking as any).conversationId ?? (booking as any).conversation?.id ?? null,
+      conversationId:
+        (booking as any).conversationId ?? (booking as any).conversation?.id ?? null,
     };
 
     return res.status(200).json({ ok: true, trip });

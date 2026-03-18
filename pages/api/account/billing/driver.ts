@@ -1,9 +1,38 @@
-// pages/api/account/billing/driver.ts
+// OATH: Clean replacement file
+// FILE: pages/api/account/billing/driver.ts
+
 import type { NextApiRequest, NextApiResponse } from "next";
 import { getServerSession } from "next-auth";
 import { authOptions } from "../../auth/[...nextauth]";
 import { prisma } from "../../../../lib/prisma";
-import { PaymentType } from "@prisma/client";
+import { DisputeStatus, PaymentType } from "@prisma/client";
+
+type DriverBillingRow = {
+  id: string;
+  rideId: string;
+  createdAt: string;
+  status: string;
+  grossAmountCents: number;
+  serviceFeeCents: number;
+  netAmountCents: number;
+  paymentType: "CARD" | "CASH" | "UNKNOWN";
+  payoutEligible: boolean;
+
+  refundIssued?: boolean;
+  refundAmountCents?: number;
+  originalGrossAmountCents?: number;
+  originalServiceFeeCents?: number;
+  originalNetAmountCents?: number;
+  refundIssuedAt?: string | null;
+
+  ride: {
+    id: string;
+    departureTime: string | null;
+    originCity: string | null;
+    destinationCity: string | null;
+    status: string | null;
+  } | null;
+};
 
 type DriverBillingResponse =
   | {
@@ -28,24 +57,7 @@ type DriverBillingResponse =
         paidNetAmountCents: number;
         rideCount: number;
       };
-      transactions: {
-        id: string;
-        rideId: string;
-        createdAt: string;
-        status: string;
-        grossAmountCents: number;
-        serviceFeeCents: number;
-        netAmountCents: number;
-        paymentType: "CARD" | "CASH" | "UNKNOWN";
-        payoutEligible: boolean;
-        ride: {
-          id: string;
-          departureTime: string | null;
-          originCity: string | null;
-          destinationCity: string | null;
-          status: string | null;
-        } | null;
-      }[];
+      transactions: DriverBillingRow[];
       membershipCharges: {
         id: string;
         amountCents: number;
@@ -58,10 +70,14 @@ type DriverBillingResponse =
     }
   | { ok: false; error: string };
 
-const PLATFORM_FEE_BPS = 1000; // 10%
+const PLATFORM_FEE_BPS = 1000;
 
 function toIso(d: Date | null | undefined) {
   return d ? d.toISOString() : null;
+}
+
+function asNonNegativeCents(v: unknown): number {
+  return typeof v === "number" && Number.isFinite(v) ? Math.max(0, Math.round(v)) : 0;
 }
 
 function computeDriverSplit(collectedAmountCents: number) {
@@ -80,32 +96,28 @@ function deriveDriverPaymentType(args: {
   return "UNKNOWN";
 }
 
-function isFallbackCardRide(args: {
+function isCashPreservedRefund(args: {
+  originalPaymentType: PaymentType | null | undefined;
   paymentType: PaymentType | null | undefined;
   cashNotPaidAt?: Date | null;
   fallbackCardChargedAt?: Date | null;
+  refundAmountCents?: number;
 }) {
   return (
+    args.originalPaymentType === PaymentType.CASH &&
     args.paymentType === PaymentType.CARD &&
     Boolean(args.cashNotPaidAt) &&
-    Boolean(args.fallbackCardChargedAt)
+    Boolean(args.fallbackCardChargedAt) &&
+    asNonNegativeCents(args.refundAmountCents) > 0
   );
 }
 
 function isPayoutEligible(args: {
-  paymentType: PaymentType | null | undefined;
-  cashNotPaidAt?: Date | null;
-  fallbackCardChargedAt?: Date | null;
+  adjustedNetAmountCents?: number;
+  cashPreservedRefund?: boolean;
 }) {
-  if (args.paymentType === PaymentType.CARD) return true;
-  if (
-    args.paymentType === PaymentType.CASH &&
-    args.cashNotPaidAt &&
-    args.fallbackCardChargedAt
-  ) {
-    return true;
-  }
-  return false;
+  if (args.cashPreservedRefund) return true;
+  return asNonNegativeCents(args.adjustedNetAmountCents) > 0;
 }
 
 export default async function handler(
@@ -119,8 +131,10 @@ export default async function handler(
     }
 
     const session = await getServerSession(req, res, authOptions);
-    const userId = (session?.user as any)?.id as string | undefined;
-    const role = (session?.user as any)?.role as "DRIVER" | "ADMIN" | "RIDER" | undefined;
+    const userId = (session?.user as { id?: string } | undefined)?.id;
+    const role = (session?.user as {
+      role?: "DRIVER" | "ADMIN" | "RIDER";
+    } | undefined)?.role;
 
     if (!userId) {
       return res.status(401).json({ ok: false, error: "Not authenticated" });
@@ -183,6 +197,24 @@ export default async function handler(
         })
       : [];
 
+    const disputes = rideIds.length
+      ? await prisma.dispute.findMany({
+          where: {
+            driverId: userId,
+            rideId: { in: rideIds },
+            status: DisputeStatus.RESOLVED_RIDER,
+            refundIssued: true,
+          },
+          orderBy: { refundIssuedAt: "desc" },
+          select: {
+            id: true,
+            rideId: true,
+            refundAmountCents: true,
+            refundIssuedAt: true,
+          },
+        })
+      : [];
+
     const bookingByRideId = new Map<
       string,
       {
@@ -203,67 +235,140 @@ export default async function handler(
       }
     }
 
-    const enrichedTransactions = transactions.map((t) => {
+    const disputeByRideId = new Map<
+      string,
+      {
+        refundAmountCents: number;
+        refundIssuedAt: Date | null;
+      }
+    >();
+
+    for (const d of disputes) {
+      if (!disputeByRideId.has(d.rideId)) {
+        disputeByRideId.set(d.rideId, {
+          refundAmountCents: asNonNegativeCents(d.refundAmountCents),
+          refundIssuedAt: d.refundIssuedAt ?? null,
+        });
+      }
+    }
+
+    const allTransactions: DriverBillingRow[] = transactions.map((t) => {
       const booking = bookingByRideId.get(t.rideId);
+      const dispute = disputeByRideId.get(t.rideId);
 
-      const paymentType = deriveDriverPaymentType({
-        paymentType: booking?.paymentType,
-      });
+      const bookingFinalAmountCents = asNonNegativeCents(booking?.finalAmountCents);
+      const txGrossAmountCents = asNonNegativeCents(t.grossAmountCents);
+      const txServiceFeeCents = asNonNegativeCents(t.serviceFeeCents);
+      const txNetAmountCents = asNonNegativeCents(t.netAmountCents);
 
-      const payoutEligible = isPayoutEligible({
+      const refundAmountCents = Math.min(
+        asNonNegativeCents(dispute?.refundAmountCents),
+        Math.max(bookingFinalAmountCents, txGrossAmountCents)
+      );
+
+      const refundIssued = refundAmountCents > 0;
+
+      const cashPreservedRefund = isCashPreservedRefund({
+        originalPaymentType: booking?.originalPaymentType,
         paymentType: booking?.paymentType,
         cashNotPaidAt: booking?.cashNotPaidAt,
         fallbackCardChargedAt: booking?.fallbackCardChargedAt,
+        refundAmountCents,
       });
 
-      const fallbackCardRide = isFallbackCardRide({
-        paymentType: booking?.paymentType,
-        cashNotPaidAt: booking?.cashNotPaidAt,
-        fallbackCardChargedAt: booking?.fallbackCardChargedAt,
-      });
+      let displayGrossAmountCents = txGrossAmountCents;
+      let displayServiceFeeCents = txServiceFeeCents;
+      let displayNetAmountCents = txNetAmountCents;
 
-      const overrideSplit =
-        fallbackCardRide &&
-        typeof booking?.finalAmountCents === "number" &&
-        booking.finalAmountCents > 0
-          ? computeDriverSplit(booking.finalAmountCents)
-          : null;
+      // Correct special-case accounting:
+      // refunded fallback-card charge on an originally cash ride
+      // should still preserve ride-value fee/net accounting
+      if (cashPreservedRefund && bookingFinalAmountCents > 0) {
+        const split = computeDriverSplit(bookingFinalAmountCents);
+        displayGrossAmountCents = split.grossAmountCents;
+        displayServiceFeeCents = split.serviceFeeCents;
+        displayNetAmountCents = split.netAmountCents;
+      } else if (refundIssued) {
+        const adjustedBase = Math.max(0, txGrossAmountCents - refundAmountCents);
+        const split = computeDriverSplit(adjustedBase);
+        displayGrossAmountCents = split.grossAmountCents;
+        displayServiceFeeCents = split.serviceFeeCents;
+        displayNetAmountCents = split.netAmountCents;
+      }
 
       return {
         id: t.id,
         rideId: t.rideId,
         createdAt: t.createdAt.toISOString(),
-        status: String(t.status),
-        grossAmountCents: overrideSplit?.grossAmountCents ?? t.grossAmountCents,
-        serviceFeeCents: overrideSplit?.serviceFeeCents ?? t.serviceFeeCents,
-        netAmountCents: overrideSplit?.netAmountCents ?? t.netAmountCents,
-        paymentType,
-        payoutEligible,
+        status: refundIssued ? "REFUNDED" : String(t.status).toUpperCase(),
+
+        grossAmountCents: displayGrossAmountCents,
+        serviceFeeCents: displayServiceFeeCents,
+        netAmountCents: displayNetAmountCents,
+
+        originalGrossAmountCents:
+          cashPreservedRefund && bookingFinalAmountCents > 0
+            ? bookingFinalAmountCents
+            : txGrossAmountCents,
+        originalServiceFeeCents:
+          cashPreservedRefund && bookingFinalAmountCents > 0
+            ? computeDriverSplit(bookingFinalAmountCents).serviceFeeCents
+            : txServiceFeeCents,
+        originalNetAmountCents:
+          cashPreservedRefund && bookingFinalAmountCents > 0
+            ? computeDriverSplit(bookingFinalAmountCents).netAmountCents
+            : txNetAmountCents,
+
+        refundIssued,
+        refundAmountCents,
+        refundIssuedAt: toIso(dispute?.refundIssuedAt),
+
+        paymentType: deriveDriverPaymentType({
+          paymentType: booking?.paymentType,
+        }),
+
+        payoutEligible: isPayoutEligible({
+          adjustedNetAmountCents: displayNetAmountCents,
+          cashPreservedRefund,
+        }),
+
         ride: t.ride
           ? {
               id: t.ride.id,
-              departureTime: toIso(t.ride.departureTime as any),
-              originCity: (t.ride as any).originCity ?? null,
-              destinationCity: (t.ride as any).destinationCity ?? null,
-              status: (t.ride as any).status ?? null,
+              departureTime: toIso(t.ride.departureTime as Date | null | undefined),
+              originCity: t.ride.originCity ?? null,
+              destinationCity: t.ride.destinationCity ?? null,
+              status: t.ride.status ?? null,
             }
           : null,
       };
     });
 
-    const grossAmountCents = enrichedTransactions.reduce((sum, t) => sum + (t.grossAmountCents || 0), 0);
-    const serviceFeeCents = enrichedTransactions.reduce((sum, t) => sum + (t.serviceFeeCents || 0), 0);
-    const netAmountCents = enrichedTransactions.reduce((sum, t) => sum + (t.netAmountCents || 0), 0);
+    const grossAmountCents = allTransactions.reduce(
+      (sum, t) => sum + (t.grossAmountCents || 0),
+      0
+    );
+    const serviceFeeCents = allTransactions.reduce(
+      (sum, t) => sum + (t.serviceFeeCents || 0),
+      0
+    );
+    const netAmountCents = allTransactions.reduce(
+      (sum, t) => sum + (t.netAmountCents || 0),
+      0
+    );
 
     const paidPayoutAmountCents = payouts
       .filter((p) => String(p.status).toUpperCase() === "PAID")
       .reduce((sum, p) => sum + p.amountCents, 0);
 
-    const payoutEligibleNetAmountCents = enrichedTransactions
+    const payoutEligibleNetAmountCents = allTransactions
       .filter((t) => t.payoutEligible)
-      .reduce((sum, t) => sum + t.netAmountCents, 0);
+      .reduce((sum, t) => sum + (t.netAmountCents || 0), 0);
 
-    const pendingNetAmountCents = Math.max(0, payoutEligibleNetAmountCents - paidPayoutAmountCents);
+    const pendingNetAmountCents = Math.max(
+      0,
+      payoutEligibleNetAmountCents - paidPayoutAmountCents
+    );
 
     const membershipCharges = await prisma.membershipCharge.findMany({
       where: { userId },
@@ -292,7 +397,7 @@ export default async function handler(
       serviceFees: {
         totalFeesCents: serviceFeeCents,
         currency: "USD",
-        rideCount: enrichedTransactions.length,
+        rideCount: allTransactions.length,
       },
       earningsSummary: {
         grossAmountCents,
@@ -300,9 +405,9 @@ export default async function handler(
         netAmountCents,
         pendingNetAmountCents,
         paidNetAmountCents: paidPayoutAmountCents,
-        rideCount: enrichedTransactions.length,
+        rideCount: allTransactions.length,
       },
-      transactions: enrichedTransactions,
+      transactions: allTransactions,
       membershipCharges: membershipCharges.map((c) => ({
         id: c.id,
         amountCents: c.amountCents,
@@ -313,8 +418,11 @@ export default async function handler(
         failedAt: toIso(c.failedAt),
       })),
     });
-  } catch (err: any) {
+  } catch (err: unknown) {
     console.error("Driver billing API error:", err);
-    return res.status(500).json({ ok: false, error: "Failed to load driver billing" });
+    return res.status(500).json({
+      ok: false,
+      error: err instanceof Error ? err.message : "Failed to load driver billing",
+    });
   }
 }

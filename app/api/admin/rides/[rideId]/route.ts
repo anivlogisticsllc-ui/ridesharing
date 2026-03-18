@@ -3,6 +3,7 @@ import { NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/pages/api/auth/[...nextauth]";
 import { prisma } from "@/lib/prisma";
+import { DisputeStatus } from "@prisma/client";
 
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
@@ -11,7 +12,6 @@ function jsonError(status: number, error: string) {
   return NextResponse.json({ ok: false, error }, { status });
 }
 
-// Support both shapes (Next versions vary)
 type Ctx = { params: { rideId: string } | Promise<{ rideId: string }> };
 
 function toIsoOrNull(d: Date | null | undefined) {
@@ -65,6 +65,7 @@ export async function GET(_: Request, ctx: Ctx) {
             stripePaymentIntentStatus: true,
 
             cashNotPaidNote: true,
+            cashNotPaidReason: true,
             cashNotPaidReportedById: true,
 
             createdAt: true,
@@ -78,10 +79,13 @@ export async function GET(_: Request, ctx: Ctx) {
 
     const latestBooking = ride.bookings?.[0] ?? null;
 
-    // Resolve “reported by / marked by” into name/email
     const idsToResolve = new Set<string>();
-    if (latestBooking?.cashNotPaidReportedById) idsToResolve.add(String(latestBooking.cashNotPaidReportedById));
-    if (latestBooking?.cashNotPaidByUserId) idsToResolve.add(String(latestBooking.cashNotPaidByUserId));
+    if (latestBooking?.cashNotPaidReportedById) {
+      idsToResolve.add(String(latestBooking.cashNotPaidReportedById));
+    }
+    if (latestBooking?.cashNotPaidByUserId) {
+      idsToResolve.add(String(latestBooking.cashNotPaidByUserId));
+    }
 
     const resolvedUsers =
       idsToResolve.size > 0
@@ -92,6 +96,36 @@ export async function GET(_: Request, ctx: Ctx) {
         : [];
 
     const userMap = new Map(resolvedUsers.map((u) => [u.id, u]));
+
+    const latestRefundedDispute = await prisma.dispute.findFirst({
+      where: {
+        rideId,
+        status: DisputeStatus.RESOLVED_RIDER,
+        refundIssued: true,
+        ...(latestBooking?.id ? { bookingId: latestBooking.id } : {}),
+      },
+      orderBy: [
+        { refundIssuedAt: "desc" },
+        { resolvedAt: "desc" },
+        { createdAt: "desc" },
+      ],
+      select: {
+        id: true,
+        bookingId: true,
+        rideId: true,
+        status: true,
+        reason: true,
+        riderStatement: true,
+        adminDecision: true,
+        adminNotes: true,
+        refundIssued: true,
+        refundAmountCents: true,
+        refundIssuedAt: true,
+        resolvedAt: true,
+        createdAt: true,
+        updatedAt: true,
+      },
+    });
 
     const shaped = {
       ...ride,
@@ -111,17 +145,26 @@ export async function GET(_: Request, ctx: Ctx) {
             cashDiscountRevokedAt: toIsoOrNull(latestBooking.cashDiscountRevokedAt),
             fallbackCardChargedAt: toIsoOrNull(latestBooking.fallbackCardChargedAt),
 
-            // richer objects for UI
             cashNotPaidReportedBy: latestBooking.cashNotPaidReportedById
               ? userMap.get(String(latestBooking.cashNotPaidReportedById)) ?? null
               : null,
+
             cashNotPaidMarkedBy: latestBooking.cashNotPaidByUserId
               ? userMap.get(String(latestBooking.cashNotPaidByUserId)) ?? null
               : null,
           }
         : null,
 
-      // keep your “latestBooking only” API contract
+      latestRefundedDispute: latestRefundedDispute
+        ? {
+            ...latestRefundedDispute,
+            refundIssuedAt: toIsoOrNull(latestRefundedDispute.refundIssuedAt),
+            resolvedAt: toIsoOrNull(latestRefundedDispute.resolvedAt),
+            createdAt: toIsoOrNull(latestRefundedDispute.createdAt),
+            updatedAt: toIsoOrNull(latestRefundedDispute.updatedAt),
+          }
+        : null,
+
       bookings: undefined as never,
     };
 
