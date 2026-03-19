@@ -7,13 +7,32 @@ import { formatUsdFromCents } from "@/lib/money";
 
 type DashboardRide = {
   id: string;
-  departureTime: string; // ISO (but we also support epoch below)
+  departureTime: string;
   departureTimeMs?: number;
   status: string;
+
+  // legacy fallback from older API
   totalPriceCents: number;
+
   distanceMiles: number;
   originCity: string;
   destinationCity: string;
+
+  // newer optional accounting fields
+  driverNetCents?: number | null;
+  grossAmountCents?: number | null;
+  platformFeeCents?: number | null;
+
+  paymentType?: "CARD" | "CASH" | null;
+  originalPaymentType?: "CARD" | "CASH" | null;
+
+  cashNotPaidAt?: string | null;
+  fallbackCardChargedAt?: string | null;
+
+  refundIssued?: boolean | null;
+  refundAmountCents?: number | null;
+
+  settlementLabel?: string | null;
 };
 
 type DashboardStatsResponse =
@@ -48,7 +67,6 @@ function safeDate(value: unknown): Date | null {
   if (typeof value === "string") {
     const s = value.trim();
 
-    // numeric string -> epoch ms
     if (/^\d{10,17}$/.test(s)) {
       const num = Number(s);
       if (!Number.isFinite(num)) return null;
@@ -85,8 +103,8 @@ function isSameDay(a: Date, b: Date) {
 
 function startOfWeekMonday(now: Date) {
   const d = startOfDay(now);
-  const day = d.getDay(); // 0 Sun..6 Sat
-  const diffToMonday = (day + 6) % 7; // Mon=0, Sun=6
+  const day = d.getDay();
+  const diffToMonday = (day + 6) % 7;
   d.setDate(d.getDate() - diffToMonday);
   return d;
 }
@@ -112,7 +130,7 @@ function filterByPresetRange(
   if (range === "THIS_WEEK") {
     const start = startOfWeekMonday(now);
     const end = new Date(start);
-    end.setDate(end.getDate() + 7); // exclusive
+    end.setDate(end.getDate() + 7);
     return rides.filter((r) => r.dt >= start && r.dt < end);
   }
 
@@ -167,6 +185,49 @@ function formatLocalDateTime(dt: Date): { datePart: string; timePart: string } {
   };
 }
 
+function asNonNegativeInt(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0
+    ? Math.round(value)
+    : null;
+}
+
+function getRideEarningsCents(ride: DashboardRide): number {
+  const directNet = asNonNegativeInt(ride.driverNetCents);
+  if (directNet !== null) return directNet;
+
+  const gross = asNonNegativeInt(ride.grossAmountCents);
+  const fee = asNonNegativeInt(ride.platformFeeCents);
+
+  const originallyCash = ride.originalPaymentType === "CASH";
+  const fallbackCharged = Boolean(
+    originallyCash &&
+      ride.paymentType === "CARD" &&
+      ride.cashNotPaidAt &&
+      ride.fallbackCardChargedAt
+  );
+  const refundedAfterDispute = Boolean(
+    ride.refundIssued &&
+      (asNonNegativeInt(ride.refundAmountCents) ?? 0) > 0
+  );
+  const preservedCashAccounting = fallbackCharged && refundedAfterDispute;
+
+  if (preservedCashAccounting && gross !== null && fee !== null) {
+    return Math.max(0, gross - fee);
+  }
+
+  if (
+    typeof ride.settlementLabel === "string" &&
+    ride.settlementLabel.toLowerCase().includes("cash preserved") &&
+    gross !== null &&
+    fee !== null
+  ) {
+    return Math.max(0, gross - fee);
+  }
+
+  const legacy = asNonNegativeInt(ride.totalPriceCents);
+  return legacy ?? 0;
+}
+
 /* ---------- Page ---------- */
 
 const RANGE_OPTIONS: [RangeKey, string][] = [
@@ -199,9 +260,8 @@ export default function DriverDashboardPage() {
       return;
     }
 
-    const role = (session.user as any)?.role as "RIDER" | "DRIVER" | "ADMIN" | undefined;
+    const role = (session.user as { role?: string } | undefined)?.role;
 
-    // If you want ADMIN to also access driver dashboard, keep ADMIN allowed.
     if (role !== "DRIVER" && role !== "ADMIN") {
       router.replace("/");
       return;
@@ -216,12 +276,17 @@ export default function DriverDashboardPage() {
         const data: DashboardStatsResponse = await res.json();
 
         if (!res.ok || !("ok" in data) || !data.ok) {
-          throw new Error((data as any)?.error || "Failed to load stats.");
+          throw new Error(
+            (data as { error?: string } | undefined)?.error ||
+              "Failed to load stats."
+          );
         }
 
         setRides(data.rides ?? []);
-      } catch (e: any) {
-        setError(e?.message || "Could not load dashboard.");
+      } catch (e: unknown) {
+        setError(
+          e instanceof Error ? e.message : "Could not load dashboard."
+        );
       } finally {
         setLoading(false);
       }
@@ -235,7 +300,8 @@ export default function DriverDashboardPage() {
 
     const withDates = completed
       .map((raw) => {
-        const dt = safeDate(raw.departureTimeMs) ?? safeDate(raw.departureTime) ?? null;
+        const dt =
+          safeDate(raw.departureTimeMs) ?? safeDate(raw.departureTime) ?? null;
         return dt ? { dt, raw } : null;
       })
       .filter(Boolean) as { dt: Date; raw: DashboardRide }[];
@@ -246,16 +312,28 @@ export default function DriverDashboardPage() {
 
   const filtered = useMemo(() => {
     if (range === "CUSTOM") {
-      return filterByCustomRange(normalizedCompleted, customStart || null, customEnd || null);
+      return filterByCustomRange(
+        normalizedCompleted,
+        customStart || null,
+        customEnd || null
+      );
     }
     return filterByPresetRange(normalizedCompleted, range as NonCustomRange);
   }, [normalizedCompleted, range, customStart, customEnd]);
 
   const totals = useMemo(() => {
     const ridesCount = filtered.length;
-    const totalMiles = filtered.reduce((sum, r) => sum + (r.raw.distanceMiles ?? 0), 0);
-    const totalEarningsCents = filtered.reduce((sum, r) => sum + (r.raw.totalPriceCents ?? 0), 0);
-    const avgPerRideCents = ridesCount ? Math.round(totalEarningsCents / ridesCount) : 0;
+    const totalMiles = filtered.reduce(
+      (sum, r) => sum + (r.raw.distanceMiles ?? 0),
+      0
+    );
+    const totalEarningsCents = filtered.reduce(
+      (sum, r) => sum + getRideEarningsCents(r.raw),
+      0
+    );
+    const avgPerRideCents = ridesCount
+      ? Math.round(totalEarningsCents / ridesCount)
+      : 0;
 
     return { ridesCount, totalMiles, totalEarningsCents, avgPerRideCents };
   }, [filtered]);
@@ -269,23 +347,27 @@ export default function DriverDashboardPage() {
 
   return (
     <main className="min-h-[calc(100vh-4rem)] bg-slate-50">
-      <div className="mx-auto max-w-5xl px-4 py-10 space-y-8">
+      <div className="mx-auto max-w-5xl space-y-8 px-4 py-10">
         <header className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
           <div>
-            <h1 className="text-2xl font-semibold text-slate-900">Driver earnings dashboard</h1>
+            <h1 className="text-2xl font-semibold text-slate-900">
+              Driver earnings dashboard
+            </h1>
             <p className="text-sm text-slate-600">
               See your completed rides, distance, and earnings over time.
             </p>
           </div>
 
-          <div className="inline-flex flex-wrap gap-2 rounded-full bg-white p-1 shadow-sm border border-slate-200">
+          <div className="inline-flex flex-wrap gap-2 rounded-full border border-slate-200 bg-white p-1 shadow-sm">
             {RANGE_OPTIONS.map(([key, label]) => (
               <button
                 key={key}
                 type="button"
                 onClick={() => setRange(key)}
                 className={`rounded-full px-3 py-1 text-xs font-medium ${
-                  range === key ? "bg-slate-900 text-white" : "text-slate-600 hover:bg-slate-100"
+                  range === key
+                    ? "bg-slate-900 text-white"
+                    : "text-slate-600 hover:bg-slate-100"
                 }`}
               >
                 {label}
@@ -295,12 +377,14 @@ export default function DriverDashboardPage() {
         </header>
 
         {isCustomActive && (
-          <section className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm space-y-2">
-            <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Custom date range</p>
+          <section className="space-y-2 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+            <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
+              Custom date range
+            </p>
 
             <div className="flex flex-wrap items-center gap-3 text-sm">
               <div className="flex items-center gap-2">
-                <span className="text-slate-600 text-xs">From</span>
+                <span className="text-xs text-slate-600">From</span>
                 <input
                   type="date"
                   value={customStart}
@@ -310,7 +394,7 @@ export default function DriverDashboardPage() {
               </div>
 
               <div className="flex items-center gap-2">
-                <span className="text-slate-600 text-xs">To</span>
+                <span className="text-xs text-slate-600">To</span>
                 <input
                   type="date"
                   value={customEnd}
@@ -337,38 +421,60 @@ export default function DriverDashboardPage() {
         {!loading && !error && (
           <section className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
             <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Total earnings</p>
+              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                Total earnings
+              </p>
               <p className="mt-2 text-2xl font-semibold text-slate-900">
                 {formatUsdFromCents(totals.totalEarningsCents)}
               </p>
-              <p className="mt-1 text-[11px] text-slate-500">In selected period</p>
+              <p className="mt-1 text-[11px] text-slate-500">
+                In selected period
+              </p>
             </div>
 
             <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Completed rides</p>
-              <p className="mt-2 text-2xl font-semibold text-slate-900">{totals.ridesCount}</p>
-              <p className="mt-1 text-[11px] text-slate-500">Status: COMPLETED only</p>
+              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                Completed rides
+              </p>
+              <p className="mt-2 text-2xl font-semibold text-slate-900">
+                {totals.ridesCount}
+              </p>
+              <p className="mt-1 text-[11px] text-slate-500">
+                Status: COMPLETED only
+              </p>
             </div>
 
             <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Total miles</p>
-              <p className="mt-2 text-2xl font-semibold text-slate-900">{totals.totalMiles.toFixed(1)}</p>
-              <p className="mt-1 text-[11px] text-slate-500">Based on stored distanceMiles</p>
+              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                Total miles
+              </p>
+              <p className="mt-2 text-2xl font-semibold text-slate-900">
+                {totals.totalMiles.toFixed(1)}
+              </p>
+              <p className="mt-1 text-[11px] text-slate-500">
+                Based on stored distanceMiles
+              </p>
             </div>
 
             <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Avg per ride</p>
+              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                Avg per ride
+              </p>
               <p className="mt-2 text-2xl font-semibold text-slate-900">
                 {formatUsdFromCents(totals.avgPerRideCents)}
               </p>
-              <p className="mt-1 text-[11px] text-slate-500">Average payout per completed ride</p>
+              <p className="mt-1 text-[11px] text-slate-500">
+                Average payout per completed ride
+              </p>
             </div>
           </section>
         )}
 
         {!loading && !error && (
           <section className="space-y-3">
-            <h2 className="text-sm font-semibold text-slate-800">Rides in selected period</h2>
+            <h2 className="text-sm font-semibold text-slate-800">
+              Rides in selected period
+            </h2>
 
             {filtered.length === 0 ? (
               <p className="text-sm text-slate-500">
@@ -391,25 +497,30 @@ export default function DriverDashboardPage() {
                     <tbody>
                       {filtered.map(({ dt, raw }) => {
                         const { datePart, timePart } = formatLocalDateTime(dt);
+                        const earningsCents = getRideEarningsCents(raw);
 
                         return (
                           <tr
                             key={raw.id}
-                            className="border-t border-slate-100 hover:bg-slate-50/60 cursor-pointer"
+                            className="cursor-pointer border-t border-slate-100 hover:bg-slate-50/60"
                             onClick={() => router.push(`/driver/rides/${raw.id}`)}
                           >
                             <td className="px-4 py-2 align-middle text-slate-700">
                               {datePart}{" "}
-                              {timePart && <span className="text-[11px] text-slate-400">{timePart}</span>}
+                              {timePart && (
+                                <span className="text-[11px] text-slate-400">
+                                  {timePart}
+                                </span>
+                              )}
                             </td>
                             <td className="px-4 py-2 align-middle text-slate-700">
                               {raw.originCity} → {raw.destinationCity}
                             </td>
-                            <td className="px-4 py-2 align-middle text-right text-slate-700">
+                            <td className="px-4 py-2 text-right align-middle text-slate-700">
                               {(raw.distanceMiles ?? 0).toFixed(1)}
                             </td>
-                            <td className="px-4 py-2 align-middle text-right text-slate-900">
-                              {formatUsdFromCents(raw.totalPriceCents)}
+                            <td className="px-4 py-2 text-right align-middle text-slate-900">
+                              {formatUsdFromCents(earningsCents)}
                             </td>
                           </tr>
                         );

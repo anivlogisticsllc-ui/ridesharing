@@ -5,7 +5,7 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "../auth/[...nextauth]";
 import { prisma } from "@/lib/prisma";
-import { BookingStatus, DisputeStatus } from "@prisma/client";
+import { BookingStatus, DisputeStatus, PaymentType } from "@prisma/client";
 
 type DashboardRide = {
   id: string;
@@ -27,6 +27,12 @@ type DashboardRide = {
 
   bookingId: string;
   paymentType: string | null;
+
+  // optional debug/supporting fields for future UI logic
+  originalPaymentType?: string | null;
+  cashNotPaidAt?: string | null;
+  fallbackCardChargedAt?: string | null;
+  settlementLabel?: string | null;
 };
 
 type DashboardStatsResponse =
@@ -40,10 +46,28 @@ function pickNumber(v: unknown): number | null {
 }
 
 function asNonNegativeCents(v: unknown): number {
-  return typeof v === "number" && Number.isFinite(v) ? Math.max(0, Math.round(v)) : 0;
+  return typeof v === "number" && Number.isFinite(v)
+    ? Math.max(0, Math.round(v))
+    : 0;
 }
 
-function computeFromBooking(b: any, rideEstimateCents: number | null) {
+function computeFromBooking(
+  b: {
+    finalAmountCents?: number | null;
+    finalTotalCents?: number | null;
+    totalChargedCents?: number | null;
+    totalPaidCents?: number | null;
+    baseFareCents?: number | null;
+    baseAmountCents?: number | null;
+    convenienceFeeCents?: number | null;
+    convenienceFeeAmountCents?: number | null;
+    feeCents?: number | null;
+    discountCents?: number | null;
+    promoDiscountCents?: number | null;
+    cashDiscountCents?: number | null;
+  },
+  rideEstimateCents: number | null
+) {
   const finalCents =
     pickNumber(b.finalAmountCents) ??
     pickNumber(b.finalTotalCents) ??
@@ -99,7 +123,7 @@ export default async function handler(
 
   const session = await getServerSession(req, res, authOptions);
   const user = session?.user as
-    | ({ id?: string; role?: "RIDER" | "DRIVER" | "ADMIN" } & Record<string, any>)
+    | ({ id?: string; role?: "RIDER" | "DRIVER" | "ADMIN" } & Record<string, unknown>)
     | undefined;
 
   if (!user?.id) {
@@ -132,9 +156,12 @@ export default async function handler(
         id: true,
         rideId: true,
         paymentType: true,
+        originalPaymentType: true,
         baseAmountCents: true,
         discountCents: true,
         finalAmountCents: true,
+        cashNotPaidAt: true,
+        fallbackCardChargedAt: true,
         ride: {
           select: {
             id: true,
@@ -204,27 +231,51 @@ export default async function handler(
         originalGrossAmountCents
       );
 
+      const originalNetAmountCents =
+        computeDriverNetFromGross(originalGrossAmountCents).netAmountCents;
+
       const adjustedGrossAmountCents = Math.max(
         0,
         originalGrossAmountCents - refundAmountCents
       );
 
-      const originalNetAmountCents =
-        computeDriverNetFromGross(originalGrossAmountCents).netAmountCents;
-
       const adjustedNetAmountCents =
         computeDriverNetFromGross(adjustedGrossAmountCents).netAmountCents;
+
+      const originallyCash = b.originalPaymentType === PaymentType.CASH;
+      const fallbackCharged = Boolean(
+        originallyCash &&
+          b.paymentType === PaymentType.CARD &&
+          b.cashNotPaidAt &&
+          b.fallbackCardChargedAt
+      );
+
+      const refundedAfterDispute = refundAmountCents > 0;
+      const preservedCashAccounting = fallbackCharged && refundedAfterDispute;
+
+      const effectiveNetAmountCents = preservedCashAccounting
+        ? originalNetAmountCents
+        : adjustedNetAmountCents;
+
+      const settlementLabel = preservedCashAccounting
+        ? "Cash preserved"
+        : refundedAfterDispute
+        ? "Refund adjusted"
+        : "Standard payout";
 
       return {
         id: ride.id,
         bookingId: b.id,
         paymentType: b.paymentType ? String(b.paymentType) : null,
+        originalPaymentType: b.originalPaymentType
+          ? String(b.originalPaymentType)
+          : null,
 
         departureTime: ride.departureTime.toISOString(),
         departureTimeMs: ride.departureTime.getTime(),
         status: ride.status,
 
-        totalPriceCents: adjustedNetAmountCents,
+        totalPriceCents: effectiveNetAmountCents,
         originalTotalPriceCents: originalNetAmountCents,
         refundAmountCents,
         refundIssued: refundAmountCents > 0,
@@ -235,6 +286,12 @@ export default async function handler(
         distanceMiles: ride.distanceMiles ?? 0,
         originCity: ride.originCity,
         destinationCity: ride.destinationCity,
+
+        cashNotPaidAt: b.cashNotPaidAt ? b.cashNotPaidAt.toISOString() : null,
+        fallbackCardChargedAt: b.fallbackCardChargedAt
+          ? b.fallbackCardChargedAt.toISOString()
+          : null,
+        settlementLabel,
       };
     });
 
