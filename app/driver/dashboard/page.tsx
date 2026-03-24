@@ -5,6 +5,8 @@ import { useSession } from "next-auth/react";
 import { useRouter } from "next/navigation";
 import { formatUsdFromCents } from "@/lib/money";
 
+
+
 type DashboardRide = {
   id: string;
   departureTime: string;
@@ -33,6 +35,8 @@ type DashboardRide = {
   refundAmountCents?: number | null;
 
   settlementLabel?: string | null;
+  effectiveTime?: string;
+  effectiveTimeMs?: number;
 };
 
 type DashboardStatsResponse =
@@ -206,8 +210,7 @@ function getRideEarningsCents(ride: DashboardRide): number {
       ride.fallbackCardChargedAt
   );
   const refundedAfterDispute = Boolean(
-    ride.refundIssued &&
-      (asNonNegativeInt(ride.refundAmountCents) ?? 0) > 0
+    ride.refundIssued && (asNonNegativeInt(ride.refundAmountCents) ?? 0) > 0
   );
   const preservedCashAccounting = fallbackCharged && refundedAfterDispute;
 
@@ -272,7 +275,7 @@ export default function DriverDashboardPage() {
         setLoading(true);
         setError(null);
 
-        const res = await fetch("/api/driver/dashboard-stats");
+        const res = await fetch("/api/driver/dashboard-stats", {  cache: "no-store",});
         const data: DashboardStatsResponse = await res.json();
 
         if (!res.ok || !("ok" in data) || !data.ok) {
@@ -284,9 +287,7 @@ export default function DriverDashboardPage() {
 
         setRides(data.rides ?? []);
       } catch (e: unknown) {
-        setError(
-          e instanceof Error ? e.message : "Could not load dashboard."
-        );
+        setError(e instanceof Error ? e.message : "Could not load dashboard.");
       } finally {
         setLoading(false);
       }
@@ -299,12 +300,25 @@ export default function DriverDashboardPage() {
     );
 
     const withDates = completed
-      .map((raw) => {
+      .map((raw, index) => {
         const dt =
-          safeDate(raw.departureTimeMs) ?? safeDate(raw.departureTime) ?? null;
-        return dt ? { dt, raw } : null;
+          safeDate(raw.effectiveTimeMs) ??
+          safeDate(raw.effectiveTime) ??
+          safeDate(raw.departureTimeMs) ??
+          safeDate(raw.departureTime) ??
+          null;
+
+        if (!dt) return null;
+
+        const uniqueKey = [
+          raw.id,
+          raw.departureTimeMs ?? raw.departureTime ?? "no-time",
+          index,
+        ].join("::");
+
+        return { dt, raw, uniqueKey };
       })
-      .filter(Boolean) as { dt: Date; raw: DashboardRide }[];
+      .filter(Boolean) as { dt: Date; raw: DashboardRide; uniqueKey: string }[];
 
     withDates.sort((a, b) => b.dt.getTime() - a.dt.getTime());
     return withDates;
@@ -313,12 +327,30 @@ export default function DriverDashboardPage() {
   const filtered = useMemo(() => {
     if (range === "CUSTOM") {
       return filterByCustomRange(
-        normalizedCompleted,
+        normalizedCompleted.map(({ dt, raw }) => ({ dt, raw })),
         customStart || null,
         customEnd || null
-      );
+      ).map((item) => {
+        const match = normalizedCompleted.find(
+          (r) =>
+            r.raw === item.raw &&
+            r.dt.getTime() === item.dt.getTime()
+        );
+        return match!;
+      });
     }
-    return filterByPresetRange(normalizedCompleted, range as NonCustomRange);
+
+    return filterByPresetRange(
+      normalizedCompleted.map(({ dt, raw }) => ({ dt, raw })),
+      range as NonCustomRange
+    ).map((item) => {
+      const match = normalizedCompleted.find(
+        (r) =>
+          r.raw === item.raw &&
+          r.dt.getTime() === item.dt.getTime()
+      );
+      return match!;
+    });
   }, [normalizedCompleted, range, customStart, customEnd]);
 
   const totals = useMemo(() => {
@@ -495,13 +527,13 @@ export default function DriverDashboardPage() {
                       </tr>
                     </thead>
                     <tbody>
-                      {filtered.map(({ dt, raw }) => {
+                      {filtered.map(({ dt, raw, uniqueKey }) => {
                         const { datePart, timePart } = formatLocalDateTime(dt);
                         const earningsCents = getRideEarningsCents(raw);
 
                         return (
                           <tr
-                            key={raw.id}
+                            key={uniqueKey}
                             className="cursor-pointer border-t border-slate-100 hover:bg-slate-50/60"
                             onClick={() => router.push(`/driver/rides/${raw.id}`)}
                           >

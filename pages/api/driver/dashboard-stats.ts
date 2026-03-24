@@ -5,12 +5,19 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import { getServerSession } from "next-auth/next";
 import { authOptions } from "../auth/[...nextauth]";
 import { prisma } from "@/lib/prisma";
-import { BookingStatus, DisputeStatus, PaymentType } from "@prisma/client";
+import { DisputeStatus, PaymentType, RideStatus } from "@prisma/client";
 
 type DashboardRide = {
   id: string;
+
+  // keep original departure timestamp for reference/display if needed
   departureTime: string;
   departureTimeMs: number;
+
+  // use this for dashboard filtering/sorting so it matches portal behavior
+  effectiveTime: string;
+  effectiveTimeMs: number;
+
   status: string;
 
   // driver-visible NET earnings after fee and refund handling
@@ -28,7 +35,7 @@ type DashboardRide = {
   bookingId: string;
   paymentType: string | null;
 
-  // optional debug/supporting fields for future UI logic
+  // optional debug/supporting fields
   originalPaymentType?: string | null;
   cashNotPaidAt?: string | null;
   fallbackCardChargedAt?: string | null;
@@ -75,7 +82,9 @@ function computeFromBooking(
     pickNumber(b.totalPaidCents) ??
     null;
 
-  if (typeof finalCents === "number") return Math.max(0, Math.round(finalCents));
+  if (typeof finalCents === "number") {
+    return Math.max(0, Math.round(finalCents));
+  }
 
   const base =
     pickNumber(b.baseFareCents) ??
@@ -121,6 +130,14 @@ export default async function handler(
     return res.status(405).json({ ok: false, error: "Method not allowed" });
   }
 
+  res.setHeader(
+    "Cache-Control",
+    "no-store, no-cache, must-revalidate, proxy-revalidate"
+  );
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+  res.setHeader("Surrogate-Control", "no-store");
+
   const session = await getServerSession(req, res, authOptions);
   const user = session?.user as
     | ({ id?: string; role?: "RIDER" | "DRIVER" | "ADMIN" } & Record<string, unknown>)
@@ -138,47 +155,56 @@ export default async function handler(
 
   const driverId = user.id;
 
-  const since = new Date();
-  since.setFullYear(since.getFullYear() - 1);
-
   try {
-    const bookings = await prisma.booking.findMany({
+    const rides = await prisma.ride.findMany({
       where: {
-        status: { in: [BookingStatus.ACCEPTED, BookingStatus.COMPLETED] },
-        ride: {
-          driverId,
-          status: "COMPLETED",
-          departureTime: { gte: since },
-        },
+        driverId,
+        status: RideStatus.COMPLETED,
       },
-      orderBy: { createdAt: "desc" },
+      orderBy: {
+        updatedAt: "desc",
+      },
       select: {
         id: true,
-        rideId: true,
-        paymentType: true,
-        originalPaymentType: true,
-        baseAmountCents: true,
-        discountCents: true,
-        finalAmountCents: true,
-        cashNotPaidAt: true,
-        fallbackCardChargedAt: true,
-        ride: {
-          select: {
-            id: true,
-            departureTime: true,
-            status: true,
-            totalPriceCents: true,
-            distanceMiles: true,
-            originCity: true,
-            destinationCity: true,
-          },
-        },
+        departureTime: true,
+        updatedAt: true,
+        status: true,
+        totalPriceCents: true,
+        distanceMiles: true,
+        originCity: true,
+        destinationCity: true,
       },
     });
 
-    const rideIds = Array.from(
-      new Set(bookings.map((b) => b.rideId).filter((v): v is string => Boolean(v)))
-    );
+    const rideIds = rides.map((r) => r.id);
+
+    const bookings = rideIds.length
+      ? await prisma.booking.findMany({
+          where: {
+            rideId: { in: rideIds },
+          },
+          orderBy: [{ rideId: "asc" }, { updatedAt: "desc" }],
+          select: {
+            id: true,
+            rideId: true,
+            paymentType: true,
+            originalPaymentType: true,
+            baseAmountCents: true,
+            discountCents: true,
+            finalAmountCents: true,
+            cashNotPaidAt: true,
+            fallbackCardChargedAt: true,
+            updatedAt: true,
+          },
+        })
+      : [];
+
+    const latestBookingByRideId = new Map<string, (typeof bookings)[number]>();
+    for (const b of bookings) {
+      if (!latestBookingByRideId.has(b.rideId)) {
+        latestBookingByRideId.set(b.rideId, b);
+      }
+    }
 
     const disputes = rideIds.length
       ? await prisma.dispute.findMany({
@@ -219,12 +245,19 @@ export default async function handler(
       }
     }
 
-    const mapped: DashboardRide[] = bookings.map((b) => {
-      const ride = b.ride;
-      const estimate = pickNumber(ride.totalPriceCents) ?? null;
-
-      const originalGrossAmountCents = computeFromBooking(b, estimate);
+    const mapped: DashboardRide[] = rides.map((ride) => {
+      const booking = latestBookingByRideId.get(ride.id);
       const dispute = disputeByRideId.get(ride.id);
+
+      const estimate = pickNumber(ride.totalPriceCents) ?? null;
+      const originalGrossAmountCents = computeFromBooking(
+        {
+          finalAmountCents: booking?.finalAmountCents ?? null,
+          baseAmountCents: booking?.baseAmountCents ?? null,
+          discountCents: booking?.discountCents ?? null,
+        },
+        estimate
+      );
 
       const refundAmountCents = Math.min(
         asNonNegativeCents(dispute?.refundAmountCents),
@@ -242,12 +275,12 @@ export default async function handler(
       const adjustedNetAmountCents =
         computeDriverNetFromGross(adjustedGrossAmountCents).netAmountCents;
 
-      const originallyCash = b.originalPaymentType === PaymentType.CASH;
+      const originallyCash = booking?.originalPaymentType === PaymentType.CASH;
       const fallbackCharged = Boolean(
         originallyCash &&
-          b.paymentType === PaymentType.CARD &&
-          b.cashNotPaidAt &&
-          b.fallbackCardChargedAt
+          booking?.paymentType === PaymentType.CARD &&
+          booking?.cashNotPaidAt &&
+          booking?.fallbackCardChargedAt
       );
 
       const refundedAfterDispute = refundAmountCents > 0;
@@ -263,17 +296,26 @@ export default async function handler(
         ? "Refund adjusted"
         : "Standard payout";
 
+      const effectiveDate =
+        ride.updatedAt ??
+        booking?.updatedAt ??
+        ride.departureTime;
+
       return {
         id: ride.id,
-        bookingId: b.id,
-        paymentType: b.paymentType ? String(b.paymentType) : null,
-        originalPaymentType: b.originalPaymentType
-          ? String(b.originalPaymentType)
+        bookingId: booking?.id ?? ride.id,
+        paymentType: booking?.paymentType ? String(booking.paymentType) : null,
+        originalPaymentType: booking?.originalPaymentType
+          ? String(booking.originalPaymentType)
           : null,
 
         departureTime: ride.departureTime.toISOString(),
         departureTimeMs: ride.departureTime.getTime(),
-        status: ride.status,
+
+        effectiveTime: effectiveDate.toISOString(),
+        effectiveTimeMs: effectiveDate.getTime(),
+
+        status: String(ride.status),
 
         totalPriceCents: effectiveNetAmountCents,
         originalTotalPriceCents: originalNetAmountCents,
@@ -284,16 +326,20 @@ export default async function handler(
           : null,
 
         distanceMiles: ride.distanceMiles ?? 0,
-        originCity: ride.originCity,
-        destinationCity: ride.destinationCity,
+        originCity: ride.originCity ?? "",
+        destinationCity: ride.destinationCity ?? "",
 
-        cashNotPaidAt: b.cashNotPaidAt ? b.cashNotPaidAt.toISOString() : null,
-        fallbackCardChargedAt: b.fallbackCardChargedAt
-          ? b.fallbackCardChargedAt.toISOString()
+        cashNotPaidAt: booking?.cashNotPaidAt
+          ? booking.cashNotPaidAt.toISOString()
+          : null,
+        fallbackCardChargedAt: booking?.fallbackCardChargedAt
+          ? booking.fallbackCardChargedAt.toISOString()
           : null,
         settlementLabel,
       };
     });
+
+    mapped.sort((a, b) => b.effectiveTimeMs - a.effectiveTimeMs);
 
     return res.status(200).json({ ok: true, rides: mapped });
   } catch (err) {

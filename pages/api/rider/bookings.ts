@@ -31,8 +31,21 @@ type ApiBooking = {
 
   paymentType?: PaymentType | null;
   cashDiscountBps?: number | null;
+
   baseTotalPriceCents?: number | null;
   effectiveTotalPriceCents?: number | null;
+
+  originalPaymentType?: PaymentType | null;
+  originalCashDiscountBps?: number | null;
+  cashNotPaidAt?: string | null;
+  cashDiscountRevokedAt?: string | null;
+  cashDiscountRevokedReason?: string | null;
+  fallbackCardChargedAt?: string | null;
+
+  refundIssued?: boolean | null;
+  refundAmountCents?: number | null;
+  refundIssuedAt?: string | null;
+  disputeResolvedAt?: string | null;
 };
 
 type ApiResponse =
@@ -62,31 +75,31 @@ function safeNonNegativeInt(value: unknown): number | null {
     : null;
 }
 
-function deriveOriginalAmountCents(b: {
+function deriveFareCents(args: {
   finalAmountCents?: number | null;
   baseAmountCents?: number | null;
-  ride: { totalPriceCents?: number | null };
+  rideTotalPriceCents?: number | null;
   paymentType?: PaymentType | null;
   cashDiscountBps?: number | null;
 }) {
-  const finalAmountCents = safeNonNegativeInt(b.finalAmountCents);
+  const finalAmountCents = safeNonNegativeInt(args.finalAmountCents);
   if (finalAmountCents !== null) return finalAmountCents;
 
-  const baseAmountCents = safeNonNegativeInt(b.baseAmountCents);
+  const baseAmountCents = safeNonNegativeInt(args.baseAmountCents);
   if (baseAmountCents !== null) {
     return applyCashDiscount(
       baseAmountCents,
-      b.paymentType ?? null,
-      b.cashDiscountBps ?? null
+      args.paymentType ?? null,
+      args.cashDiscountBps ?? null
     );
   }
 
-  const rideAmountCents = safeNonNegativeInt(b.ride.totalPriceCents);
+  const rideAmountCents = safeNonNegativeInt(args.rideTotalPriceCents);
   if (rideAmountCents !== null) {
     return applyCashDiscount(
       rideAmountCents,
-      b.paymentType ?? null,
-      b.cashDiscountBps ?? null
+      args.paymentType ?? null,
+      args.cashDiscountBps ?? null
     );
   }
 
@@ -160,35 +173,62 @@ export default async function handler(
           select: {
             id: true,
             rideId: true,
+            refundIssued: true,
             refundAmountCents: true,
+            refundIssuedAt: true,
+            resolvedAt: true,
           },
         })
       : [];
 
-    const refundByRideId = new Map<string, number>();
+    const disputeByRideId = new Map<
+      string,
+      {
+        refundIssued: boolean;
+        refundAmountCents: number;
+        refundIssuedAt: string | null;
+        disputeResolvedAt: string | null;
+      }
+    >();
 
     for (const d of disputes) {
-      const refund = safeNonNegativeInt(d.refundAmountCents) ?? 0;
-      if (!refundByRideId.has(d.rideId)) {
-        refundByRideId.set(d.rideId, refund);
-      }
+      if (disputeByRideId.has(d.rideId)) continue;
+
+      disputeByRideId.set(d.rideId, {
+        refundIssued: Boolean(d.refundIssued),
+        refundAmountCents: safeNonNegativeInt(d.refundAmountCents) ?? 0,
+        refundIssuedAt: d.refundIssuedAt ? d.refundIssuedAt.toISOString() : null,
+        disputeResolvedAt: d.resolvedAt ? d.resolvedAt.toISOString() : null,
+      });
     }
 
     const shapedBookings: ApiBooking[] = bookings.map((b) => {
-      const originalAmountCents = deriveOriginalAmountCents({
+      const rideFareCents = deriveFareCents({
         finalAmountCents: b.finalAmountCents,
         baseAmountCents: b.baseAmountCents,
-        ride: { totalPriceCents: b.ride.totalPriceCents },
+        rideTotalPriceCents: b.ride.totalPriceCents,
         paymentType: b.paymentType ?? null,
         cashDiscountBps: b.cashDiscountBps ?? null,
       });
 
-      const refundAmountCents = refundByRideId.get(b.ride.id) ?? 0;
+      const dispute = disputeByRideId.get(b.ride.id);
+      const refundIssued = dispute?.refundIssued ?? false;
+      const refundAmountCents = dispute?.refundAmountCents ?? 0;
 
-      const effectiveAfterRefund =
-        typeof originalAmountCents === "number"
-          ? Math.max(0, originalAmountCents - refundAmountCents)
-          : null;
+      const originallyCash = b.originalPaymentType === PaymentType.CASH;
+      const fallbackCharged = Boolean(
+        originallyCash &&
+          b.paymentType === PaymentType.CARD &&
+          b.cashNotPaidAt &&
+          b.fallbackCardChargedAt
+      );
+
+      const preservedCashAccounting =
+        fallbackCharged && refundIssued && refundAmountCents > 0;
+
+      const effectiveVisibleFareCents = preservedCashAccounting
+        ? rideFareCents
+        : rideFareCents;
 
       return {
         id: b.id,
@@ -219,11 +259,26 @@ export default async function handler(
         paymentType: b.paymentType ?? null,
         cashDiscountBps: b.cashDiscountBps ?? null,
 
-        // original charged amount before rider-favor refund
-        baseTotalPriceCents: originalAmountCents,
+        baseTotalPriceCents: rideFareCents,
+        effectiveTotalPriceCents: effectiveVisibleFareCents,
 
-        // rider-visible amount after refund credit
-        effectiveTotalPriceCents: effectiveAfterRefund,
+        originalPaymentType: b.originalPaymentType ?? null,
+        originalCashDiscountBps: b.originalPaymentType === PaymentType.CASH
+          ? b.cashDiscountBps ?? null
+          : null,
+        cashNotPaidAt: b.cashNotPaidAt ? b.cashNotPaidAt.toISOString() : null,
+        cashDiscountRevokedAt: b.cashDiscountRevokedAt
+          ? b.cashDiscountRevokedAt.toISOString()
+          : null,
+        cashDiscountRevokedReason: b.cashNotPaidReason ?? null,
+        fallbackCardChargedAt: b.fallbackCardChargedAt
+          ? b.fallbackCardChargedAt.toISOString()
+          : null,
+
+        refundIssued,
+        refundAmountCents,
+        refundIssuedAt: dispute?.refundIssuedAt ?? null,
+        disputeResolvedAt: dispute?.disputeResolvedAt ?? null,
       };
     });
 
@@ -243,33 +298,49 @@ export default async function handler(
       },
     });
 
-    const shapedRideOnly: ApiBooking[] = ridesWithoutBookings.map((r) => ({
-      id: `ride-${r.id}`,
-      bookingId: null,
-      status: BookingStatus.PENDING,
+    const shapedRideOnly: ApiBooking[] = ridesWithoutBookings.map((r) => {
+      const total = safeNonNegativeInt(r.totalPriceCents);
 
-      rideId: r.id,
-      originCity: r.originCity,
-      destinationCity: r.destinationCity,
-      departureTime: r.departureTime.toISOString(),
-      rideStatus: r.status,
+      return {
+        id: `ride-${r.id}`,
+        bookingId: null,
+        status: BookingStatus.PENDING,
 
-      driverName: r.driver?.name ?? null,
-      driverPublicId: r.driver?.publicId ?? null,
-      conversationId: null,
+        rideId: r.id,
+        originCity: r.originCity,
+        destinationCity: r.destinationCity,
+        departureTime: r.departureTime.toISOString(),
+        rideStatus: r.status,
 
-      isRideOnly: true,
+        driverName: r.driver?.name ?? null,
+        driverPublicId: r.driver?.publicId ?? null,
+        conversationId: null,
 
-      distanceMiles: r.distanceMiles,
-      passengerCount: r.passengerCount,
-      tripStartedAt: r.tripStartedAt ? r.tripStartedAt.toISOString() : null,
-      tripCompletedAt: r.tripCompletedAt ? r.tripCompletedAt.toISOString() : null,
+        isRideOnly: true,
 
-      paymentType: null,
-      cashDiscountBps: null,
-      baseTotalPriceCents: safeNonNegativeInt(r.totalPriceCents),
-      effectiveTotalPriceCents: safeNonNegativeInt(r.totalPriceCents),
-    }));
+        distanceMiles: r.distanceMiles,
+        passengerCount: r.passengerCount,
+        tripStartedAt: r.tripStartedAt ? r.tripStartedAt.toISOString() : null,
+        tripCompletedAt: r.tripCompletedAt ? r.tripCompletedAt.toISOString() : null,
+
+        paymentType: null,
+        cashDiscountBps: null,
+        baseTotalPriceCents: total,
+        effectiveTotalPriceCents: total,
+
+        originalPaymentType: null,
+        originalCashDiscountBps: null,
+        cashNotPaidAt: null,
+        cashDiscountRevokedAt: null,
+        cashDiscountRevokedReason: null,
+        fallbackCardChargedAt: null,
+
+        refundIssued: false,
+        refundAmountCents: 0,
+        refundIssuedAt: null,
+        disputeResolvedAt: null,
+      };
+    });
 
     const combined = [...shapedBookings, ...shapedRideOnly];
 

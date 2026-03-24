@@ -141,13 +141,15 @@ export default async function RideDetailPage({ params }: Props) {
 
   const fallbackCharged = Boolean(booking?.cashNotPaidAt && booking?.fallbackCardChargedAt);
   const originallyCash = booking?.originalPaymentType === PaymentType.CASH;
+  const originallyCard = booking?.originalPaymentType === PaymentType.CARD;
+
   const switchedToCardFallback =
     originallyCash && booking?.paymentType === PaymentType.CARD && fallbackCharged;
 
   const refundAmountCents = Math.min(normalizeCents(dispute?.refundAmountCents), finalCents);
   const refundedAfterDispute = Boolean(dispute?.refundIssued && refundAmountCents > 0);
 
-  const netCardResultCents = Math.max(0, finalCents - refundAmountCents);
+  const netCardProcessorResultCents = Math.max(0, finalCents - refundAmountCents);
 
   const originalDriverSplit = computeDriverSplit(finalCents);
 
@@ -155,20 +157,39 @@ export default async function RideDetailPage({ params }: Props) {
 
   const effectiveDriverSplit = preservedCashAccounting
     ? originalDriverSplit
-    : computeDriverSplit(netCardResultCents);
+    : computeDriverSplit(netCardProcessorResultCents);
 
-  let paymentLabel =
-    booking?.paymentType === PaymentType.CARD
-      ? "CARD"
-      : booking?.paymentType === PaymentType.CASH
-      ? "CASH"
-      : "n/a";
+  const originalSelectionLabel = originallyCash
+    ? "CASH"
+    : originallyCard
+    ? "CARD"
+    : booking?.paymentType === PaymentType.CARD
+    ? "CARD"
+    : booking?.paymentType === PaymentType.CASH
+    ? "CASH"
+    : "n/a";
 
-  if (preservedCashAccounting) {
-    paymentLabel = "CASH preserved (fallback card later refunded)";
+  let processingLabel = "Standard settlement";
+  if (switchedToCardFallback && refundedAfterDispute) {
+    processingLabel = "Fallback card charged, then refunded after dispute";
   } else if (switchedToCardFallback) {
-    paymentLabel = "CARD (fallback after unpaid CASH)";
+    processingLabel = "Fallback card charged after unpaid cash";
+  } else if (booking?.paymentType === PaymentType.CARD) {
+    processingLabel = "Card settlement";
+  } else if (booking?.paymentType === PaymentType.CASH) {
+    processingLabel = "Cash settlement";
   }
+
+  let finalOutcomeLabel = "CARD settled";
+  if (preservedCashAccounting) {
+    finalOutcomeLabel = "CASH preserved";
+  } else if (booking?.paymentType === PaymentType.CASH) {
+    finalOutcomeLabel = "CASH settled";
+  }
+
+  const effectivePlatformFeeCents = preservedCashAccounting
+    ? originalDriverSplit.serviceFeeCents
+    : effectiveDriverSplit.serviceFeeCents;
 
   return (
     <main className="min-h-[calc(100vh-4rem)] bg-slate-50">
@@ -237,12 +258,30 @@ export default async function RideDetailPage({ params }: Props) {
             </div>
           </div>
 
-          <div className="grid gap-2 text-sm text-slate-700 sm:grid-cols-4">
+          <div className="grid gap-2 text-sm text-slate-700 sm:grid-cols-3">
             <div>
-              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Payment</p>
-              <p className="mt-1 font-semibold">{paymentLabel}</p>
+              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                Original payment selection
+              </p>
+              <p className="mt-1 font-semibold">{originalSelectionLabel}</p>
             </div>
 
+            <div>
+              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                Processing path
+              </p>
+              <p className="mt-1 font-semibold">{processingLabel}</p>
+            </div>
+
+            <div>
+              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                Final accounting outcome
+              </p>
+              <p className="mt-1 font-semibold">{finalOutcomeLabel}</p>
+            </div>
+          </div>
+
+          <div className="grid gap-2 text-sm text-slate-700 sm:grid-cols-4">
             <div>
               <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Base fare</p>
               <p className="mt-1 font-semibold">${money(baseCents)}</p>
@@ -256,10 +295,19 @@ export default async function RideDetailPage({ params }: Props) {
             </div>
 
             <div>
-              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Convenience fee</p>
+              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                Convenience fee
+              </p>
               <p className="mt-1 font-semibold">
                 {convenienceFeeCents > 0 ? `$${money(convenienceFeeCents)}` : "$0.00"}
               </p>
+            </div>
+
+            <div>
+              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                Driver earnings
+              </p>
+              <p className="mt-1 font-semibold">${money(effectiveDriverSplit.netAmountCents)}</p>
             </div>
           </div>
 
@@ -284,7 +332,7 @@ export default async function RideDetailPage({ params }: Props) {
         </section>
 
         {switchedToCardFallback ? (
-          <section className="space-y-3 rounded-2xl border border-amber-200 bg-amber-50 p-4 shadow-sm text-sm text-amber-950">
+          <section className="space-y-3 rounded-2xl border border-amber-200 bg-amber-50 p-4 text-sm text-amber-950 shadow-sm">
             <h2 className="text-xs font-semibold uppercase tracking-wide text-amber-800">
               Cash fallback charge
             </h2>
@@ -304,7 +352,9 @@ export default async function RideDetailPage({ params }: Props) {
               </div>
               <div>
                 <p className="text-xs text-amber-700">Fallback card charged at</p>
-                <p className="mt-1 font-medium">{booking?.fallbackCardChargedAt?.toLocaleString() ?? "n/a"}</p>
+                <p className="mt-1 font-medium">
+                  {booking?.fallbackCardChargedAt?.toLocaleString() ?? "n/a"}
+                </p>
               </div>
               <div>
                 <p className="text-xs text-amber-700">Reason</p>
@@ -319,7 +369,7 @@ export default async function RideDetailPage({ params }: Props) {
         ) : null}
 
         {refundedAfterDispute ? (
-          <section className="space-y-3 rounded-2xl border border-emerald-200 bg-emerald-50 p-4 shadow-sm text-sm text-emerald-950">
+          <section className="space-y-3 rounded-2xl border border-emerald-200 bg-emerald-50 p-4 text-sm text-emerald-950 shadow-sm">
             <h2 className="text-xs font-semibold uppercase tracking-wide text-emerald-800">
               Refund after dispute
             </h2>
@@ -353,8 +403,8 @@ export default async function RideDetailPage({ params }: Props) {
                 <span className="font-semibold">-${money(refundAmountCents)}</span>
               </div>
               <div className="mt-2 flex items-center justify-between border-t border-emerald-200 pt-2">
-                <span className="font-semibold">Net card result</span>
-                <span className="font-semibold">${money(netCardResultCents)}</span>
+                <span className="font-semibold">Net card processor result</span>
+                <span className="font-semibold">${money(netCardProcessorResultCents)}</span>
               </div>
             </div>
 
@@ -369,26 +419,30 @@ export default async function RideDetailPage({ params }: Props) {
                 </div>
                 <div className="flex items-center justify-between">
                   <span>
-                    {preservedCashAccounting ? "Effective driver earnings (cash preserved)" : "Adjusted driver earnings"}
+                    {preservedCashAccounting
+                      ? "Effective driver earnings (cash preserved)"
+                      : "Effective driver earnings"}
                   </span>
                   <span className="font-semibold">${money(effectiveDriverSplit.netAmountCents)}</span>
                 </div>
                 <div className="flex items-center justify-between">
-                  <span>Platform fee preserved</span>
-                  <span className="font-semibold">${money(originalDriverSplit.serviceFeeCents)}</span>
+                  <span>
+                    {preservedCashAccounting ? "Platform fee preserved" : "Effective platform fee"}
+                  </span>
+                  <span className="font-semibold">${money(effectivePlatformFeeCents)}</span>
                 </div>
               </div>
 
               <p className="mt-3 text-xs text-emerald-800">
                 {preservedCashAccounting
-                  ? "The rider's fallback card charge was refunded, but this ride still counts as cash-preserved for driver earnings and platform fee accounting."
-                  : "The refund changed the effective card result and associated driver payout values."}
+                  ? "The fallback card charge was refunded, but the ride still remains cash-preserved for driver earnings and platform fee accounting."
+                  : "The refund changed the card-side result and the effective payout values."}
               </p>
             </div>
           </section>
         ) : null}
 
-        <section className="space-y-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm text-sm text-slate-700">
+        <section className="space-y-3 rounded-2xl border border-slate-200 bg-white p-4 text-sm text-slate-700 shadow-sm">
           <h2 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Timing</h2>
           <div className="grid gap-3 sm:grid-cols-2">
             <div>

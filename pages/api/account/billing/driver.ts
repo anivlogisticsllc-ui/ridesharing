@@ -5,25 +5,49 @@ import type { NextApiRequest, NextApiResponse } from "next";
 import { getServerSession } from "next-auth";
 import { authOptions } from "../../auth/[...nextauth]";
 import { prisma } from "../../../../lib/prisma";
-import { DisputeStatus, PaymentType } from "@prisma/client";
+import {
+  BookingStatus,
+  DisputeStatus,
+  PaymentType,
+  RideStatus,
+} from "@prisma/client";
+
+type LedgerSettlementType =
+  | "CARD_PAYOUT"
+  | "CASH_COLLECTED"
+  | "CASH_PRESERVED"
+  | "REFUND_ADJUSTED"
+  | "UNKNOWN";
 
 type DriverBillingRow = {
   id: string;
   rideId: string;
+  bookingId: string;
   createdAt: string;
   status: string;
+
   grossAmountCents: number;
   serviceFeeCents: number;
   netAmountCents: number;
-  paymentType: "CARD" | "CASH" | "UNKNOWN";
-  payoutEligible: boolean;
 
-  refundIssued?: boolean;
-  refundAmountCents?: number;
-  originalGrossAmountCents?: number;
-  originalServiceFeeCents?: number;
-  originalNetAmountCents?: number;
-  refundIssuedAt?: string | null;
+  paymentType: "CARD" | "CASH" | "UNKNOWN";
+  originalPaymentType: "CARD" | "CASH" | "UNKNOWN";
+
+  settlementType: LedgerSettlementType;
+  payoutEligible: boolean;
+  exclusionReason: string | null;
+
+  refundIssued: boolean;
+  refundAmountCents: number;
+  refundIssuedAt: string | null;
+
+  originalGrossAmountCents: number;
+  originalServiceFeeCents: number;
+  originalNetAmountCents: number;
+
+  payoutWeekKey: string;
+  payoutWeekStart: string;
+  payoutWeekEnd: string;
 
   ride: {
     id: string;
@@ -32,6 +56,50 @@ type DriverBillingRow = {
     destinationCity: string | null;
     status: string | null;
   } | null;
+};
+
+type DriverPayoutWeek = {
+  key: string;
+  weekStart: string;
+  weekEnd: string;
+  label: string;
+
+  payoutStatus: "PAID" | "PENDING" | "NONE";
+  payoutId: string | null;
+  payoutCreatedAt: string | null;
+  payoutAmountCents: number;
+
+  includedGrossAmountCents: number;
+  includedServiceFeeCents: number;
+  includedNetAmountCents: number;
+
+  excludedGrossAmountCents: number;
+  excludedServiceFeeCents: number;
+  excludedNetAmountCents: number;
+
+  includedRideCount: number;
+  excludedRideCount: number;
+
+  cardPayableGrossAmountCents: number;
+  cardPayableServiceFeeCents: number;
+  cardPayableNetAmountCents: number;
+
+  cashCollectedGrossAmountCents: number;
+  cashCollectedServiceFeeCents: number;
+  cashCollectedNetAmountCents: number;
+
+  cashPreservedGrossAmountCents: number;
+  cashPreservedServiceFeeCents: number;
+  cashPreservedNetAmountCents: number;
+
+  refundAdjustedGrossAmountCents: number;
+  refundAdjustedServiceFeeCents: number;
+  refundAdjustedNetAmountCents: number;
+
+  cashRideServiceFeeOffsetCents: number;
+  finalTransferAmountCents: number;
+
+  rides: DriverBillingRow[];
 };
 
 type DriverBillingResponse =
@@ -56,8 +124,27 @@ type DriverBillingResponse =
         pendingNetAmountCents: number;
         paidNetAmountCents: number;
         rideCount: number;
+        bankPayoutEligibleNetAmountCents: number;
+        excludedFromBankPayoutNetAmountCents: number;
       };
       transactions: DriverBillingRow[];
+      weeklyPayouts: DriverPayoutWeek[];
+      payoutView: {
+        defaultWeekKey: string | null;
+        lastPaidWeekKey: string | null;
+        currentPendingWeekKey: string | null;
+        weekOptions: {
+          key: string;
+          label: string;
+          payoutStatus: "PAID" | "PENDING" | "NONE";
+          payoutAmountCents: number;
+          includedNetAmountCents: number;
+          includedRideCount: number;
+          excludedRideCount: number;
+          finalTransferAmountCents: number;
+          cashRideServiceFeeOffsetCents: number;
+        }[];
+      };
       membershipCharges: {
         id: string;
         amountCents: number;
@@ -77,12 +164,16 @@ function toIso(d: Date | null | undefined) {
 }
 
 function asNonNegativeCents(v: unknown): number {
-  return typeof v === "number" && Number.isFinite(v) ? Math.max(0, Math.round(v)) : 0;
+  return typeof v === "number" && Number.isFinite(v)
+    ? Math.max(0, Math.round(v))
+    : 0;
 }
 
 function computeDriverSplit(collectedAmountCents: number) {
   const grossAmountCents = Math.max(0, Math.round(collectedAmountCents));
-  const serviceFeeCents = Math.round(grossAmountCents * (PLATFORM_FEE_BPS / 10000));
+  const serviceFeeCents = Math.round(
+    grossAmountCents * (PLATFORM_FEE_BPS / 10000)
+  );
   const netAmountCents = Math.max(0, grossAmountCents - serviceFeeCents);
 
   return { grossAmountCents, serviceFeeCents, netAmountCents };
@@ -112,12 +203,141 @@ function isCashPreservedRefund(args: {
   );
 }
 
-function isPayoutEligible(args: {
-  adjustedNetAmountCents?: number;
-  cashPreservedRefund?: boolean;
+function deriveSettlementType(args: {
+  paymentType: "CARD" | "CASH" | "UNKNOWN";
+  originalPaymentType: "CARD" | "CASH" | "UNKNOWN";
+  cashPreservedRefund: boolean;
+  refundIssued: boolean;
+}): LedgerSettlementType {
+  if (args.cashPreservedRefund) return "CASH_PRESERVED";
+  if (args.paymentType === "CASH" || args.originalPaymentType === "CASH") {
+    return "CASH_COLLECTED";
+  }
+  if (args.refundIssued) return "REFUND_ADJUSTED";
+  if (args.paymentType === "CARD") return "CARD_PAYOUT";
+  return "UNKNOWN";
+}
+
+function deriveExclusionReason(args: {
+  payoutEligible: boolean;
+  settlementType: LedgerSettlementType;
 }) {
-  if (args.cashPreservedRefund) return true;
-  return asNonNegativeCents(args.adjustedNetAmountCents) > 0;
+  if (args.payoutEligible) return null;
+
+  if (args.settlementType === "CASH_COLLECTED") {
+    return "Collected directly in cash";
+  }
+
+  if (args.settlementType === "CASH_PRESERVED") {
+    return "Cash preserved, no bank payout";
+  }
+
+  if (args.settlementType === "REFUND_ADJUSTED") {
+    return "Refund adjusted to zero or non-payable amount";
+  }
+
+  return "Not payout eligible";
+}
+
+function startOfWeekMonday(date: Date) {
+  const d = new Date(date);
+  d.setHours(0, 0, 0, 0);
+  const day = d.getDay();
+  const diffToMonday = (day + 6) % 7;
+  d.setDate(d.getDate() - diffToMonday);
+  return d;
+}
+
+function endOfWeekSunday(date: Date) {
+  const start = startOfWeekMonday(date);
+  const end = new Date(start);
+  end.setDate(end.getDate() + 6);
+  end.setHours(23, 59, 59, 999);
+  return end;
+}
+
+function formatWeekKey(start: Date) {
+  const y = start.getFullYear();
+  const m = String(start.getMonth() + 1).padStart(2, "0");
+  const d = String(start.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+function formatWeekLabel(start: Date, end: Date) {
+  const startLabel = start.toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  });
+  const endLabel = end.toLocaleDateString(undefined, {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  });
+  return `${startLabel} – ${endLabel}`;
+}
+
+function getWeekMeta(date: Date) {
+  const weekStart = startOfWeekMonday(date);
+  const weekEnd = endOfWeekSunday(date);
+
+  return {
+    weekStart,
+    weekEnd,
+    weekKey: formatWeekKey(weekStart),
+    label: formatWeekLabel(weekStart, weekEnd),
+  };
+}
+
+function emptyWeekTotals(args: {
+  key: string;
+  weekStart: string;
+  weekEnd: string;
+  label: string;
+}): DriverPayoutWeek {
+  return {
+    key: args.key,
+    weekStart: args.weekStart,
+    weekEnd: args.weekEnd,
+    label: args.label,
+
+    payoutStatus: "NONE",
+    payoutId: null,
+    payoutCreatedAt: null,
+    payoutAmountCents: 0,
+
+    includedGrossAmountCents: 0,
+    includedServiceFeeCents: 0,
+    includedNetAmountCents: 0,
+
+    excludedGrossAmountCents: 0,
+    excludedServiceFeeCents: 0,
+    excludedNetAmountCents: 0,
+
+    includedRideCount: 0,
+    excludedRideCount: 0,
+
+    cardPayableGrossAmountCents: 0,
+    cardPayableServiceFeeCents: 0,
+    cardPayableNetAmountCents: 0,
+
+    cashCollectedGrossAmountCents: 0,
+    cashCollectedServiceFeeCents: 0,
+    cashCollectedNetAmountCents: 0,
+
+    cashPreservedGrossAmountCents: 0,
+    cashPreservedServiceFeeCents: 0,
+    cashPreservedNetAmountCents: 0,
+
+    refundAdjustedGrossAmountCents: 0,
+    refundAdjustedServiceFeeCents: 0,
+    refundAdjustedNetAmountCents: 0,
+
+    cashRideServiceFeeOffsetCents: 0,
+    finalTransferAmountCents: 0,
+
+    rides: [],
+  };
 }
 
 export default async function handler(
@@ -157,11 +377,26 @@ export default async function handler(
       },
     });
 
-    const transactions = await prisma.transaction.findMany({
-      where: { driverId: userId },
-      orderBy: { createdAt: "desc" },
-      take: 200,
-      include: {
+    const bookings = await prisma.booking.findMany({
+      where: {
+        status: { in: [BookingStatus.ACCEPTED, BookingStatus.COMPLETED] },
+        ride: {
+          driverId: userId,
+          status: RideStatus.COMPLETED,
+        },
+      },
+      orderBy: [{ rideId: "asc" }, { updatedAt: "desc" }],
+      select: {
+        id: true,
+        rideId: true,
+        createdAt: true,
+        updatedAt: true,
+        paymentType: true,
+        originalPaymentType: true,
+        cashNotPaidAt: true,
+        fallbackCardChargedAt: true,
+        baseAmountCents: true,
+        finalAmountCents: true,
         ride: {
           select: {
             id: true,
@@ -169,33 +404,21 @@ export default async function handler(
             originCity: true,
             destinationCity: true,
             status: true,
+            totalPriceCents: true,
           },
         },
       },
     });
 
-    const rideIds = Array.from(
-      new Set(transactions.map((t) => t.rideId).filter((v): v is string => Boolean(v)))
-    );
+    const latestBookingByRideId = new Map<string, (typeof bookings)[number]>();
+    for (const booking of bookings) {
+      if (!latestBookingByRideId.has(booking.rideId)) {
+        latestBookingByRideId.set(booking.rideId, booking);
+      }
+    }
 
-    const relatedBookings = rideIds.length
-      ? await prisma.booking.findMany({
-          where: {
-            rideId: { in: rideIds },
-          },
-          orderBy: { updatedAt: "desc" },
-          select: {
-            id: true,
-            rideId: true,
-            paymentType: true,
-            originalPaymentType: true,
-            cashNotPaidAt: true,
-            fallbackCardChargedAt: true,
-            baseAmountCents: true,
-            finalAmountCents: true,
-          },
-        })
-      : [];
+    const uniqueBookings = Array.from(latestBookingByRideId.values());
+    const rideIds = uniqueBookings.map((booking) => booking.rideId);
 
     const disputes = rideIds.length
       ? await prisma.dispute.findMany({
@@ -215,26 +438,6 @@ export default async function handler(
         })
       : [];
 
-    const bookingByRideId = new Map<
-      string,
-      {
-        id: string;
-        rideId: string;
-        paymentType: PaymentType | null;
-        originalPaymentType: PaymentType | null;
-        cashNotPaidAt: Date | null;
-        fallbackCardChargedAt: Date | null;
-        baseAmountCents: number | null;
-        finalAmountCents: number | null;
-      }
-    >();
-
-    for (const b of relatedBookings) {
-      if (!bookingByRideId.has(b.rideId)) {
-        bookingByRideId.set(b.rideId, b);
-      }
-    }
-
     const disputeByRideId = new Map<
       string,
       {
@@ -243,132 +446,249 @@ export default async function handler(
       }
     >();
 
-    for (const d of disputes) {
-      if (!disputeByRideId.has(d.rideId)) {
-        disputeByRideId.set(d.rideId, {
-          refundAmountCents: asNonNegativeCents(d.refundAmountCents),
-          refundIssuedAt: d.refundIssuedAt ?? null,
+    for (const dispute of disputes) {
+      if (!disputeByRideId.has(dispute.rideId)) {
+        disputeByRideId.set(dispute.rideId, {
+          refundAmountCents: asNonNegativeCents(dispute.refundAmountCents),
+          refundIssuedAt: dispute.refundIssuedAt ?? null,
         });
       }
     }
 
-    const allTransactions: DriverBillingRow[] = transactions.map((t) => {
-      const booking = bookingByRideId.get(t.rideId);
-      const dispute = disputeByRideId.get(t.rideId);
+    const allTransactions: DriverBillingRow[] = [];
 
-      const bookingFinalAmountCents = asNonNegativeCents(booking?.finalAmountCents);
-      const txGrossAmountCents = asNonNegativeCents(t.grossAmountCents);
-      const txServiceFeeCents = asNonNegativeCents(t.serviceFeeCents);
-      const txNetAmountCents = asNonNegativeCents(t.netAmountCents);
+    for (const booking of uniqueBookings) {
+      const ride = booking.ride;
+      if (!ride?.departureTime) continue;
 
+      const rideEstimateCents = asNonNegativeCents(ride.totalPriceCents);
+      const bookingFinalAmountCents =
+        asNonNegativeCents(booking.finalAmountCents) || rideEstimateCents;
+
+      const dispute = disputeByRideId.get(booking.rideId);
       const refundAmountCents = Math.min(
         asNonNegativeCents(dispute?.refundAmountCents),
-        Math.max(bookingFinalAmountCents, txGrossAmountCents)
+        bookingFinalAmountCents
       );
-
       const refundIssued = refundAmountCents > 0;
 
       const cashPreservedRefund = isCashPreservedRefund({
-        originalPaymentType: booking?.originalPaymentType,
-        paymentType: booking?.paymentType,
-        cashNotPaidAt: booking?.cashNotPaidAt,
-        fallbackCardChargedAt: booking?.fallbackCardChargedAt,
+        originalPaymentType: booking.originalPaymentType,
+        paymentType: booking.paymentType,
+        cashNotPaidAt: booking.cashNotPaidAt,
+        fallbackCardChargedAt: booking.fallbackCardChargedAt,
         refundAmountCents,
       });
 
-      let displayGrossAmountCents = txGrossAmountCents;
-      let displayServiceFeeCents = txServiceFeeCents;
-      let displayNetAmountCents = txNetAmountCents;
+      const originalSplit = computeDriverSplit(bookingFinalAmountCents);
 
-      // Correct special-case accounting:
-      // refunded fallback-card charge on an originally cash ride
-      // should still preserve ride-value fee/net accounting
-      if (cashPreservedRefund && bookingFinalAmountCents > 0) {
-        const split = computeDriverSplit(bookingFinalAmountCents);
-        displayGrossAmountCents = split.grossAmountCents;
-        displayServiceFeeCents = split.serviceFeeCents;
-        displayNetAmountCents = split.netAmountCents;
+      let displayGrossAmountCents = originalSplit.grossAmountCents;
+      let displayServiceFeeCents = originalSplit.serviceFeeCents;
+      let displayNetAmountCents = originalSplit.netAmountCents;
+
+      if (cashPreservedRefund) {
+        displayGrossAmountCents = originalSplit.grossAmountCents;
+        displayServiceFeeCents = originalSplit.serviceFeeCents;
+        displayNetAmountCents = originalSplit.netAmountCents;
       } else if (refundIssued) {
-        const adjustedBase = Math.max(0, txGrossAmountCents - refundAmountCents);
-        const split = computeDriverSplit(adjustedBase);
-        displayGrossAmountCents = split.grossAmountCents;
-        displayServiceFeeCents = split.serviceFeeCents;
-        displayNetAmountCents = split.netAmountCents;
+        const adjustedBase = Math.max(
+          0,
+          bookingFinalAmountCents - refundAmountCents
+        );
+        const adjustedSplit = computeDriverSplit(adjustedBase);
+        displayGrossAmountCents = adjustedSplit.grossAmountCents;
+        displayServiceFeeCents = adjustedSplit.serviceFeeCents;
+        displayNetAmountCents = adjustedSplit.netAmountCents;
       }
 
-      return {
-        id: t.id,
-        rideId: t.rideId,
-        createdAt: t.createdAt.toISOString(),
-        status: refundIssued ? "REFUNDED" : String(t.status).toUpperCase(),
+      const paymentType = deriveDriverPaymentType({
+        paymentType: booking.paymentType,
+      });
+
+      const originalPaymentType = deriveDriverPaymentType({
+        paymentType: booking.originalPaymentType,
+      });
+
+      const settlementType = deriveSettlementType({
+        paymentType,
+        originalPaymentType,
+        cashPreservedRefund,
+        refundIssued,
+      });
+
+      const payoutEligible =
+        settlementType === "CARD_PAYOUT" &&
+        asNonNegativeCents(displayNetAmountCents) > 0;
+
+      const exclusionReason = deriveExclusionReason({
+        payoutEligible,
+        settlementType,
+      });
+
+      const weekMeta = getWeekMeta(ride.departureTime);
+
+      allTransactions.push({
+        id: booking.id,
+        bookingId: booking.id,
+        rideId: booking.rideId,
+        createdAt: booking.createdAt.toISOString(),
+        status: refundIssued ? "REFUNDED" : String(ride.status).toUpperCase(),
 
         grossAmountCents: displayGrossAmountCents,
         serviceFeeCents: displayServiceFeeCents,
         netAmountCents: displayNetAmountCents,
 
-        originalGrossAmountCents:
-          cashPreservedRefund && bookingFinalAmountCents > 0
-            ? bookingFinalAmountCents
-            : txGrossAmountCents,
-        originalServiceFeeCents:
-          cashPreservedRefund && bookingFinalAmountCents > 0
-            ? computeDriverSplit(bookingFinalAmountCents).serviceFeeCents
-            : txServiceFeeCents,
-        originalNetAmountCents:
-          cashPreservedRefund && bookingFinalAmountCents > 0
-            ? computeDriverSplit(bookingFinalAmountCents).netAmountCents
-            : txNetAmountCents,
+        originalGrossAmountCents: originalSplit.grossAmountCents,
+        originalServiceFeeCents: originalSplit.serviceFeeCents,
+        originalNetAmountCents: originalSplit.netAmountCents,
 
         refundIssued,
         refundAmountCents,
         refundIssuedAt: toIso(dispute?.refundIssuedAt),
 
-        paymentType: deriveDriverPaymentType({
-          paymentType: booking?.paymentType,
-        }),
+        paymentType,
+        originalPaymentType,
 
-        payoutEligible: isPayoutEligible({
-          adjustedNetAmountCents: displayNetAmountCents,
-          cashPreservedRefund,
-        }),
+        settlementType,
+        payoutEligible,
+        exclusionReason,
 
-        ride: t.ride
-          ? {
-              id: t.ride.id,
-              departureTime: toIso(t.ride.departureTime as Date | null | undefined),
-              originCity: t.ride.originCity ?? null,
-              destinationCity: t.ride.destinationCity ?? null,
-              status: t.ride.status ?? null,
-            }
-          : null,
-      };
+        payoutWeekKey: weekMeta.weekKey,
+        payoutWeekStart: weekMeta.weekStart.toISOString(),
+        payoutWeekEnd: weekMeta.weekEnd.toISOString(),
+
+        ride: {
+          id: ride.id,
+          departureTime: toIso(ride.departureTime),
+          originCity: ride.originCity ?? null,
+          destinationCity: ride.destinationCity ?? null,
+          status: ride.status ? String(ride.status) : null,
+        },
+      });
+    }
+
+    allTransactions.sort((a, b) => {
+      const aTime = new Date(a.ride?.departureTime ?? a.createdAt).getTime();
+      const bTime = new Date(b.ride?.departureTime ?? b.createdAt).getTime();
+      return bTime - aTime;
     });
 
     const grossAmountCents = allTransactions.reduce(
-      (sum, t) => sum + (t.grossAmountCents || 0),
+      (sum, tx) => sum + tx.grossAmountCents,
       0
     );
     const serviceFeeCents = allTransactions.reduce(
-      (sum, t) => sum + (t.serviceFeeCents || 0),
+      (sum, tx) => sum + tx.serviceFeeCents,
       0
     );
     const netAmountCents = allTransactions.reduce(
-      (sum, t) => sum + (t.netAmountCents || 0),
+      (sum, tx) => sum + tx.netAmountCents,
       0
     );
 
-    const paidPayoutAmountCents = payouts
-      .filter((p) => String(p.status).toUpperCase() === "PAID")
-      .reduce((sum, p) => sum + p.amountCents, 0);
+    const bankPayoutEligibleNetAmountCents = allTransactions
+      .filter((tx) => tx.payoutEligible)
+      .reduce((sum, tx) => sum + tx.netAmountCents, 0);
 
-    const payoutEligibleNetAmountCents = allTransactions
-      .filter((t) => t.payoutEligible)
-      .reduce((sum, t) => sum + (t.netAmountCents || 0), 0);
+    const excludedFromBankPayoutNetAmountCents = allTransactions
+      .filter((tx) => !tx.payoutEligible)
+      .reduce((sum, tx) => sum + tx.netAmountCents, 0);
+
+    const paidPayoutAmountCents = payouts
+      .filter((payout) => String(payout.status).toUpperCase() === "PAID")
+      .reduce((sum, payout) => sum + payout.amountCents, 0);
 
     const pendingNetAmountCents = Math.max(
       0,
-      payoutEligibleNetAmountCents - paidPayoutAmountCents
+      bankPayoutEligibleNetAmountCents - paidPayoutAmountCents
     );
+
+    const weeklyMap = new Map<string, DriverPayoutWeek>();
+
+    for (const tx of allTransactions) {
+      if (!weeklyMap.has(tx.payoutWeekKey)) {
+        weeklyMap.set(
+          tx.payoutWeekKey,
+          emptyWeekTotals({
+            key: tx.payoutWeekKey,
+            weekStart: tx.payoutWeekStart,
+            weekEnd: tx.payoutWeekEnd,
+            label: formatWeekLabel(
+              new Date(tx.payoutWeekStart),
+              new Date(tx.payoutWeekEnd)
+            ),
+          })
+        );
+      }
+
+      const week = weeklyMap.get(tx.payoutWeekKey)!;
+      week.rides.push(tx);
+
+      if (tx.payoutEligible) {
+        week.includedGrossAmountCents += tx.grossAmountCents;
+        week.includedServiceFeeCents += tx.serviceFeeCents;
+        week.includedNetAmountCents += tx.netAmountCents;
+        week.includedRideCount += 1;
+      } else {
+        week.excludedGrossAmountCents += tx.grossAmountCents;
+        week.excludedServiceFeeCents += tx.serviceFeeCents;
+        week.excludedNetAmountCents += tx.netAmountCents;
+        week.excludedRideCount += 1;
+      }
+
+      switch (tx.settlementType) {
+        case "CARD_PAYOUT":
+          week.cardPayableGrossAmountCents += tx.grossAmountCents;
+          week.cardPayableServiceFeeCents += tx.serviceFeeCents;
+          week.cardPayableNetAmountCents += tx.netAmountCents;
+          break;
+
+        case "CASH_COLLECTED":
+          week.cashCollectedGrossAmountCents += tx.grossAmountCents;
+          week.cashCollectedServiceFeeCents += tx.serviceFeeCents;
+          week.cashCollectedNetAmountCents += tx.netAmountCents;
+          break;
+
+        case "CASH_PRESERVED":
+          week.cashPreservedGrossAmountCents += tx.grossAmountCents;
+          week.cashPreservedServiceFeeCents += tx.serviceFeeCents;
+          week.cashPreservedNetAmountCents += tx.netAmountCents;
+          break;
+
+        case "REFUND_ADJUSTED":
+          week.refundAdjustedGrossAmountCents += tx.grossAmountCents;
+          week.refundAdjustedServiceFeeCents += tx.serviceFeeCents;
+          week.refundAdjustedNetAmountCents += tx.netAmountCents;
+          break;
+
+        default:
+          break;
+      }
+    }
+
+    const weeklyPayouts = Array.from(weeklyMap.values())
+      .map((week) => {
+        week.cashRideServiceFeeOffsetCents =
+          week.cashCollectedServiceFeeCents + week.cashPreservedServiceFeeCents;
+
+        week.finalTransferAmountCents = Math.max(
+          0,
+          week.cardPayableNetAmountCents - week.cashRideServiceFeeOffsetCents
+        );
+
+        return week;
+      })
+      .sort((a, b) => {
+        return new Date(b.weekStart).getTime() - new Date(a.weekStart).getTime();
+      });
+
+    const lastPaidWeek: DriverPayoutWeek | null = null;
+
+    const currentPendingWeek =
+      weeklyPayouts.find((week) => week.finalTransferAmountCents > 0) ?? null;
+
+    const defaultWeekKey =
+      currentPendingWeek?.key ?? weeklyPayouts[0]?.key ?? null;
 
     const membershipCharges = await prisma.membershipCharge.findMany({
       where: { userId },
@@ -387,12 +707,12 @@ export default async function handler(
 
     return res.status(200).json({
       ok: true,
-      payouts: payouts.map((p) => ({
-        id: p.id,
-        amountCents: p.amountCents,
-        currency: p.currency,
-        status: String(p.status),
-        createdAt: p.createdAt.toISOString(),
+      payouts: payouts.map((payout) => ({
+        id: payout.id,
+        amountCents: payout.amountCents,
+        currency: payout.currency,
+        status: String(payout.status),
+        createdAt: payout.createdAt.toISOString(),
       })),
       serviceFees: {
         totalFeesCents: serviceFeeCents,
@@ -406,16 +726,35 @@ export default async function handler(
         pendingNetAmountCents,
         paidNetAmountCents: paidPayoutAmountCents,
         rideCount: allTransactions.length,
+        bankPayoutEligibleNetAmountCents,
+        excludedFromBankPayoutNetAmountCents,
       },
       transactions: allTransactions,
-      membershipCharges: membershipCharges.map((c) => ({
-        id: c.id,
-        amountCents: c.amountCents,
-        currency: c.currency,
-        status: String(c.status),
-        createdAt: c.createdAt.toISOString(),
-        paidAt: toIso(c.paidAt),
-        failedAt: toIso(c.failedAt),
+      weeklyPayouts,
+      payoutView: {
+        defaultWeekKey,
+        lastPaidWeekKey: null,
+        currentPendingWeekKey: currentPendingWeek?.key ?? null,
+        weekOptions: weeklyPayouts.map((week) => ({
+          key: week.key,
+          label: week.label,
+          payoutStatus: week.payoutStatus,
+          payoutAmountCents: week.payoutAmountCents,
+          includedNetAmountCents: week.includedNetAmountCents,
+          includedRideCount: week.includedRideCount,
+          excludedRideCount: week.excludedRideCount,
+          finalTransferAmountCents: week.finalTransferAmountCents,
+          cashRideServiceFeeOffsetCents: week.cashRideServiceFeeOffsetCents,
+        })),
+      },
+      membershipCharges: membershipCharges.map((charge) => ({
+        id: charge.id,
+        amountCents: charge.amountCents,
+        currency: charge.currency,
+        status: String(charge.status),
+        createdAt: charge.createdAt.toISOString(),
+        paidAt: toIso(charge.paidAt),
+        failedAt: toIso(charge.failedAt),
       })),
     });
   } catch (err: unknown) {

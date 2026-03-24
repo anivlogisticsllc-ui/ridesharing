@@ -9,14 +9,14 @@ type BookingStatus = "PENDING" | "CONFIRMED" | "COMPLETED" | "CANCELLED" | "EXPI
 type PaymentType = "CARD" | "CASH";
 
 type Booking = {
-  id: string; // UI id (real booking id OR synthetic "ride-<rideId>")
-  bookingId: string | null; // REAL Booking row id (null for ride-only entries)
+  id: string;
+  bookingId: string | null;
 
   status: BookingStatus;
   rideId: string;
   originCity: string;
   destinationCity: string;
-  departureTime: string; // ISO string
+  departureTime: string;
   rideStatus: string;
   driverName: string | null;
   driverPublicId: string | null;
@@ -34,8 +34,19 @@ type Booking = {
   baseTotalPriceCents?: number | null;
   effectiveTotalPriceCents?: number | null;
 
-  // legacy fallback
   totalPriceCents?: number | null;
+
+  originalPaymentType?: PaymentType | null;
+  originalCashDiscountBps?: number | null;
+  cashNotPaidAt?: string | null;
+  cashDiscountRevokedAt?: string | null;
+  cashDiscountRevokedReason?: string | null;
+  fallbackCardChargedAt?: string | null;
+
+  refundIssued?: boolean | null;
+  refundAmountCents?: number | null;
+  refundIssuedAt?: string | null;
+  disputeResolvedAt?: string | null;
 };
 
 type ApiResponse = { ok: true; bookings: Booking[] } | { ok: false; error: string };
@@ -44,7 +55,7 @@ type ConversationNotification = {
   conversationId: string;
   latestMessageId: string | null;
   latestMessageCreatedAt: string | null;
-  latestMessageSenderId: string | null; // new
+  latestMessageSenderId: string | null;
   senderType: "RIDER" | "DRIVER" | "UNKNOWN";
 };
 
@@ -62,10 +73,21 @@ function formatMoney(cents: number) {
   return (cents / 100).toFixed(2);
 }
 
+function normalizeCents(v: number | null | undefined): number {
+  return typeof v === "number" && Number.isFinite(v) ? Math.max(0, Math.round(v)) : 0;
+}
+
 function isChatReadOnly(b: Booking): boolean {
   const completed = b.status === "COMPLETED" || b.rideStatus === "COMPLETED";
   const cancelledLike = b.status === "CANCELLED" || b.status === "EXPIRED";
   return completed || cancelledLike;
+}
+
+function getBaseFareCents(b: Booking): number | null {
+  if (typeof b.baseTotalPriceCents === "number") return b.baseTotalPriceCents;
+  if (typeof b.totalPriceCents === "number") return b.totalPriceCents;
+  if (typeof b.effectiveTotalPriceCents === "number") return b.effectiveTotalPriceCents;
+  return null;
 }
 
 function getEffectiveFareCents(b: Booking): number | null {
@@ -73,6 +95,67 @@ function getEffectiveFareCents(b: Booking): number | null {
   if (typeof b.totalPriceCents === "number") return b.totalPriceCents;
   if (typeof b.baseTotalPriceCents === "number") return b.baseTotalPriceCents;
   return null;
+}
+
+function getFallbackRefundState(b: Booking) {
+  const originalPaymentType = b.originalPaymentType ?? null;
+  const originallyCash = originalPaymentType === "CASH";
+
+  const fallbackCharged = Boolean(
+    originallyCash &&
+      b.paymentType === "CARD" &&
+      b.cashNotPaidAt &&
+      b.fallbackCardChargedAt
+  );
+
+  const refundAmountCents = normalizeCents(b.refundAmountCents);
+  const refundedAfterDispute = Boolean(b.refundIssued && refundAmountCents > 0);
+
+  const preservedCashAccounting = fallbackCharged && refundedAfterDispute;
+
+  return {
+    fallbackCharged,
+    refundedAfterDispute,
+    preservedCashAccounting,
+    refundAmountCents,
+  };
+}
+
+function getDisplayFareCents(b: Booking): number | null {
+  const { preservedCashAccounting } = getFallbackRefundState(b);
+  const base = getBaseFareCents(b);
+  const effective = getEffectiveFareCents(b);
+
+  if (preservedCashAccounting) {
+    return base;
+  }
+
+  return effective ?? base;
+}
+
+function getDisplayPaymentLabel(b: Booking): string {
+  const { fallbackCharged, preservedCashAccounting } = getFallbackRefundState(b);
+
+  if (preservedCashAccounting) return "CASH preserved";
+  if (fallbackCharged) return "CARD fallback";
+
+  if (b.paymentType === "CASH") return "CASH";
+  if (b.paymentType === "CARD") return "CARD";
+  return "n/a";
+}
+
+function getPaymentBadgeStyle(label: string) {
+  const isCashLike = label.startsWith("CASH");
+  return {
+    border: "1px solid " + (isCashLike ? "#bbf7d0" : "#d1d5db"),
+    background: isCashLike ? "#ecfdf5" : "#f9fafb",
+    color: isCashLike ? "#166534" : "#111827",
+  };
+}
+
+function formatDateTime(value: string | null | undefined): string | null {
+  const d = safeDate(value);
+  return d ? d.toLocaleString() : null;
 }
 
 // Dedupe: prefer real booking over ride-only
@@ -108,14 +191,16 @@ function dedupeByRideId(list: Booking[]): Booking[] {
   return Array.from(map.values());
 }
 
-function PaymentBadge(props: { paymentType?: PaymentType | null; cashDiscountBps?: number | null }) {
-  const pt = props.paymentType ?? null;
-  const bps = props.cashDiscountBps ?? 0;
+function PaymentBadge(props: { booking: Booking }) {
+  const { booking } = props;
+  const label = getDisplayPaymentLabel(booking);
+  if (label === "n/a") return null;
 
-  if (!pt) return null;
-
-  const isCash = pt === "CASH";
-  const percent = isCash && bps ? Math.round(bps / 100) : 0;
+  const style = getPaymentBadgeStyle(label);
+  const isTrueCashDiscount =
+    booking.paymentType === "CASH" &&
+    (booking.cashDiscountBps ?? 0) > 0 &&
+    !getFallbackRefundState(booking).preservedCashAccounting;
 
   return (
     <span
@@ -127,15 +212,17 @@ function PaymentBadge(props: { paymentType?: PaymentType | null; cashDiscountBps
         borderRadius: 999,
         fontSize: 11,
         fontWeight: 650,
-        border: "1px solid " + (isCash ? "#bbf7d0" : "#d1d5db"),
-        background: isCash ? "#ecfdf5" : "#f9fafb",
-        color: isCash ? "#166534" : "#111827",
         marginTop: 6,
+        ...style,
       }}
-      title={isCash ? "Cash payment (discount applies)" : "Card payment"}
+      title={label}
     >
-      {pt}
-      {isCash && percent > 0 ? <span style={{ fontWeight: 600, color: "#166534" }}>{percent}% off</span> : null}
+      {label}
+      {isTrueCashDiscount ? (
+        <span style={{ fontWeight: 600, color: "#166534" }}>
+          {Math.round((booking.cashDiscountBps ?? 0) / 100)}% off
+        </span>
+      ) : null}
     </span>
   );
 }
@@ -182,8 +269,6 @@ export default function RiderPortalPage() {
   useEffect(() => {
     lastSeenRef.current = lastSeenMessageId;
   }, [lastSeenMessageId]);
-
-  /* ---------- Load bookings (initial + light polling) ---------- */
 
   async function refreshBookings(opts?: { silent?: boolean }) {
     const silent = opts?.silent ?? false;
@@ -235,136 +320,101 @@ export default function RiderPortalPage() {
     };
   }, []);
 
-/* ---------- Poll chat notifications ---------- */
+  useEffect(() => {
+    let cancelled = false;
 
-useEffect(() => {
-  let cancelled = false;
+    async function pollChat() {
+      try {
+        const res = await fetch("/api/rider/chat-notifications", { method: "GET" });
+        if (!res.ok) return;
 
-  async function pollChat() {
-    try {
-      const res = await fetch("/api/rider/chat-notifications", { method: "GET" });
-      if (!res.ok) return;
+        const data = (await res.json()) as
+          | { ok: true; notifications: ConversationNotification[] }
+          | { ok: false; error: string };
 
-      const data = (await res.json()) as
-        | { ok: true; notifications: ConversationNotification[] }
-        | { ok: false; error: string };
+        if (cancelled || !data.ok) return;
 
-      if (cancelled || !data.ok) return;
+        const notifications = data.notifications || [];
+        const activeConvId = activeChatRef.current?.conversationId ?? null;
+        const seenMap = lastSeenRef.current || {};
 
-      const notifications = data.notifications || [];
-      const activeConvId = activeChatRef.current?.conversationId ?? null;
+        setChatNotifications((prev) => {
+          let changed = false;
+          const next = { ...prev };
 
-      // "Seen" means: last message id rider has acknowledged by opening/viewing chat.
-      const seenMap = lastSeenRef.current || {};
+          for (const n of notifications) {
+            const convId = n.conversationId;
+            const latestId = n.latestMessageId ?? null;
 
-      // Keep badges sticky: once unread=1, it stays 1 until rider opens chat.
-      setChatNotifications((prev) => {
-        let changed = false;
-        const next = { ...prev };
-
-        for (const n of notifications) {
-          const convId = n.conversationId;
-          const latestId = n.latestMessageId ?? null;
-
-          // If chat is open for this conversation, always clear.
-          if (activeConvId && convId === activeConvId) {
-            if ((next[convId] ?? 0) !== 0) {
-              next[convId] = 0;
-              changed = true;
+            if (activeConvId && convId === activeConvId) {
+              if ((next[convId] ?? 0) !== 0) {
+                next[convId] = 0;
+                changed = true;
+              }
+              continue;
             }
-            continue;
-          }
 
-          // If there is no latest message, no unread.
-          if (!latestId) {
-            if ((next[convId] ?? 0) !== 0) {
-              next[convId] = 0;
-              changed = true;
+            if (!latestId) {
+              if ((next[convId] ?? 0) !== 0) {
+                next[convId] = 0;
+                changed = true;
+              }
+              continue;
             }
-            continue;
-          }
 
-          const lastSeenId = seenMap[convId] ?? null;
+            const lastSeenId = seenMap[convId] ?? null;
 
-          // Only mark unread when:
-          // - latest message is from DRIVER
-          // - rider has not seen that message id yet
-          const shouldBeUnread =
-            n.senderType === "DRIVER" &&
-            latestId !== lastSeenId;
+            const shouldBeUnread =
+              n.senderType === "DRIVER" &&
+              latestId !== lastSeenId;
 
-          if (shouldBeUnread) {
-            if ((next[convId] ?? 0) !== 1) {
-              next[convId] = 1;
-              changed = true;
-            }
-          } else {
-            // IMPORTANT:
-            // Do NOT force-clear if it's currently unread.
-            // Example: driver sent msg (unread=1), rider replies (latest sender becomes RIDER),
-            // but rider still hasn't opened chat -> keep unread badge.
-            if ((next[convId] ?? 0) === 1) {
-              // keep as-is
-            } else if ((next[convId] ?? 0) !== 0) {
-              next[convId] = 0;
-              changed = true;
+            if (shouldBeUnread) {
+              if ((next[convId] ?? 0) !== 1) {
+                next[convId] = 1;
+                changed = true;
+              }
             } else {
-              // already 0
+              if ((next[convId] ?? 0) === 1) {
+                // keep as-is
+              } else if ((next[convId] ?? 0) !== 0) {
+                next[convId] = 0;
+                changed = true;
+              }
             }
           }
+
+          return changed ? next : prev;
+        });
+
+        if (activeConvId) {
+          const active = notifications.find((n) => n.conversationId === activeConvId);
+          const latestId = active?.latestMessageId ?? null;
+
+          if (latestId && (seenMap[activeConvId] ?? null) !== latestId) {
+            const nextSeen = { ...seenMap, [activeConvId]: latestId };
+            lastSeenRef.current = nextSeen;
+            setLastSeenMessageId(nextSeen);
+          }
         }
-
-        return changed ? next : prev;
-      });
-
-      // Mark seen only while actively viewing the chat (optional but recommended)
-      if (activeConvId) {
-        const active = notifications.find((n) => n.conversationId === activeConvId);
-        const latestId = active?.latestMessageId ?? null;
-
-        if (latestId && (seenMap[activeConvId] ?? null) !== latestId) {
-          const nextSeen = { ...seenMap, [activeConvId]: latestId };
-          lastSeenRef.current = nextSeen;
-          setLastSeenMessageId(nextSeen);
-        }
+      } catch (err) {
+        console.error("Error polling chat notifications:", err);
       }
-    } catch (err) {
-      console.error("Error polling chat notifications:", err);
     }
-  }
 
-  pollChat();
-  chatIntervalRef.current = setInterval(pollChat, 8_000);
+    pollChat();
+    chatIntervalRef.current = setInterval(pollChat, 8_000);
 
-  return () => {
-    cancelled = true;
-    if (chatIntervalRef.current) clearInterval(chatIntervalRef.current);
-    chatIntervalRef.current = null;
-  };
-}, []);
-
-
-
-  /* ---------- Unified openChat handler ---------- */
+    return () => {
+      cancelled = true;
+      if (chatIntervalRef.current) clearInterval(chatIntervalRef.current);
+      chatIntervalRef.current = null;
+    };
+  }, []);
 
   function openChat(conversationId: string, readOnly: boolean) {
     setActiveChat({ conversationId, readOnly });
-
-    // Clear the badge immediately
     setChatNotifications((prev) => ({ ...prev, [conversationId]: 0 }));
-
-    // Mark as "seen" when opening chat:
-    // We don't have the latest message id here directly.
-    // Two options:
-    //  1) Keep it as-is and let the next poll (active chat) mark seen to latestId (recommended).
-    //  2) Or, if you store "last known latest id" separately, set it here.
-    //
-    // We'll do option #1 cleanly: keep lastSeen as-is on open,
-    // and the poll (active chat branch) will update lastSeen to the current latestId.
   }
-
-
-  /* ---------- Derived sets ---------- */
 
   const isCompletedBooking = (b: Booking) => b.status === "COMPLETED" || b.rideStatus === "COMPLETED";
   const isCancelledLike = (b: Booking) => b.status === "CANCELLED" || b.status === "EXPIRED";
@@ -394,8 +444,6 @@ useEffect(() => {
 
   const cancelledCount = useMemo(() => bookings.filter((b) => b.status === "CANCELLED").length, [bookings]);
   const total = bookings.length;
-
-  /* ---------- Completed filters & stats ---------- */
 
   function applyCustomRange() {
     setCompletedFilter("CUSTOM");
@@ -459,21 +507,18 @@ useEffect(() => {
         }
         return true;
       }),
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [completed, completedFilter, customFrom, customTo, completedSearch]
+    [completed, completedFilter, customFrom, customTo, normalizedSearch]
   );
 
   const totalCompletedShown = filteredCompleted.length;
   const totalMiles = filteredCompleted.reduce((sum, b) => sum + (b.distanceMiles ?? 0), 0);
 
   const totalFareCents = filteredCompleted.reduce((sum, b) => {
-    const cents = getEffectiveFareCents(b);
+    const cents = getDisplayFareCents(b);
     return sum + (cents ?? 0);
   }, 0);
 
   const avgMiles = totalCompletedShown ? totalMiles / totalCompletedShown : 0;
-
-  /* ---------- Actions ---------- */
 
   async function handleAction(bookingOrRideId: string, action: "cancel" | "complete") {
     try {
@@ -543,22 +588,39 @@ useEffect(() => {
     if (!filteredCompleted.length) return;
 
     const rows: string[][] = [
-      ["Ride ID", "Booking ID", "From", "To", "Departure", "Distance (miles)", "Payment", "Base price", "Effective price", "Passengers"],
+      [
+        "Ride ID",
+        "Booking ID",
+        "From",
+        "To",
+        "Scheduled time",
+        "Trip started",
+        "Trip completed",
+        "Distance (miles)",
+        "Payment",
+        "Displayed fare",
+        "Base fare",
+        "Processor fare",
+        "Passengers",
+      ],
       ...filteredCompleted.map((b) => {
-        const base = typeof b.baseTotalPriceCents === "number" ? `$${formatMoney(b.baseTotalPriceCents)}` : "";
-        const effCents = getEffectiveFareCents(b);
-        const eff = typeof effCents === "number" ? `$${formatMoney(effCents)}` : "";
+        const base = typeof getBaseFareCents(b) === "number" ? `$${formatMoney(getBaseFareCents(b)!)}` : "";
+        const processor = typeof getEffectiveFareCents(b) === "number" ? `$${formatMoney(getEffectiveFareCents(b)!)}` : "";
+        const display = typeof getDisplayFareCents(b) === "number" ? `$${formatMoney(getDisplayFareCents(b)!)}` : "";
 
         return [
           b.rideId,
           b.bookingId ?? "",
           b.originCity,
           b.destinationCity,
-          new Date(b.departureTime).toLocaleString(),
+          formatDateTime(b.departureTime) ?? "",
+          formatDateTime(b.tripStartedAt) ?? "",
+          formatDateTime(b.tripCompletedAt) ?? "",
           b.distanceMiles != null ? b.distanceMiles.toFixed(2) : "",
-          b.paymentType ?? "",
+          getDisplayPaymentLabel(b),
+          display,
           base,
-          eff,
+          processor,
           b.passengerCount != null ? String(b.passengerCount) : "",
         ];
       }),
@@ -586,8 +648,6 @@ useEffect(() => {
     URL.revokeObjectURL(url);
   }
 
-  /* ---------- Render ---------- */
-
   return (
     <main
       style={{
@@ -614,10 +674,6 @@ useEffect(() => {
           </p>
         </div>
 
-        
-
-
-
         <Link href="/">
           <button
             type="button"
@@ -636,7 +692,6 @@ useEffect(() => {
             Request a new ride
           </button>
         </Link>
-
       </header>
 
       <section
@@ -1079,7 +1134,10 @@ function RideList(props: {
   return (
     <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
       {bookings.map((b) => {
-        const dt = safeDate(b.departureTime) ?? new Date(b.departureTime);
+        const scheduledLabel = formatDateTime(b.departureTime);
+        const startedLabel = formatDateTime(b.tripStartedAt);
+        const completedLabel = formatDateTime(b.tripCompletedAt);
+
         const isExpanded = expandedBookingId === b.id;
         const isInRoute = b.rideStatus === "IN_ROUTE";
         const isCompleted = b.status === "COMPLETED" || b.rideStatus === "COMPLETED";
@@ -1094,21 +1152,21 @@ function RideList(props: {
 
         const receiptBusy = receiptBusyId != null && hasRealBooking && receiptBusyId === b.bookingId;
 
-        const effFare = getEffectiveFareCents(b);
-        const dollars = typeof effFare === "number" ? formatMoney(effFare) : null;
+        const displayFare = getDisplayFareCents(b);
+        const displayDollars = typeof displayFare === "number" ? formatMoney(displayFare) : null;
 
         const distanceLabel =
           typeof b.distanceMiles === "number" && b.distanceMiles > 0 ? `${b.distanceMiles.toFixed(2)} miles` : null;
 
         const readOnly = isChatReadOnly(b);
+        const paymentLabel = getDisplayPaymentLabel(b);
+        const { preservedCashAccounting, refundedAfterDispute } = getFallbackRefundState(b);
 
-        // ✅ Receipt should always go to /receipt/<bookingId> (never driver page)
         const openReceipt = () => {
           if (!b.bookingId) return;
           window.open(`/receipt/${encodeURIComponent(b.bookingId)}`, "_blank");
         };
 
-        // ✅ Keep one primary action: Trip (always for any rideId)
         const goToTrip = () => {
           router.push(`/rider/trips/${encodeURIComponent(b.rideId)}`);
         };
@@ -1140,9 +1198,10 @@ function RideList(props: {
                 </div>
 
                 <div style={{ fontSize: 13, color: "#4b5563" }}>
-                  Departure: {dt.toLocaleString()}
+                  {isCompleted ? "Scheduled" : "Scheduled"}: {scheduledLabel ?? "—"}
+                  {startedLabel && ` • Started: ${startedLabel}`}
                   {distanceLabel && ` • ${distanceLabel}`}
-                  {dollars && ` • $${dollars}`}
+                  {displayDollars && ` • $${displayDollars}`}
                 </div>
 
                 <div style={{ fontSize: 12, color: "#6b7280" }}>
@@ -1152,7 +1211,19 @@ function RideList(props: {
 
                 {b.driverName && <div style={{ fontSize: 12, color: "#6b7280" }}>Driver: {b.driverName}</div>}
 
-                <PaymentBadge paymentType={b.paymentType ?? null} cashDiscountBps={b.cashDiscountBps ?? null} />
+                <PaymentBadge booking={b} />
+
+                {preservedCashAccounting && (
+                  <div style={{ marginTop: 4, fontSize: 12, color: "#166534", fontWeight: 600 }}>
+                    Fallback card was refunded. Ride remains cash-preserved.
+                  </div>
+                )}
+
+                {!preservedCashAccounting && refundedAfterDispute && (
+                  <div style={{ marginTop: 4, fontSize: 12, color: "#0f766e", fontWeight: 600 }}>
+                    Refund recorded after dispute.
+                  </div>
+                )}
 
                 {isInRoute && (
                   <>
@@ -1207,7 +1278,6 @@ function RideList(props: {
                   minWidth: allowChat || showActions ? 220 : 0,
                 }}
               >
-                {/* ✅ Primary: Trip (always) */}
                 <button
                   type="button"
                   onClick={goToTrip}
@@ -1224,7 +1294,6 @@ function RideList(props: {
                   Trip
                 </button>
 
-                {/* ✅ Receipt only when completed + real booking */}
                 {isCompleted && hasRealBooking && (
                   <button
                     type="button"
@@ -1243,7 +1312,6 @@ function RideList(props: {
                   </button>
                 )}
 
-                {/* ✅ Chat */}
                 {allowChat && (
                   <button
                     type="button"
@@ -1285,7 +1353,6 @@ function RideList(props: {
                   </button>
                 )}
 
-                {/* Actions only for upcoming/active lists */}
                 {showActions && !isCancelled && (
                   <div style={{ display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "flex-end" }}>
                     <button
@@ -1324,7 +1391,6 @@ function RideList(props: {
                   </div>
                 )}
 
-                {/* Optional details (kept, but no extra “receipt”/driver links inside) */}
                 <button
                   type="button"
                   onClick={() => onToggleExpand && onToggleExpand(b.id)}
@@ -1369,16 +1435,21 @@ function RideList(props: {
                   <strong>Status:</strong> {b.status} / {b.rideStatus}
                 </div>
                 <div>
-                  <strong>Departure time:</strong> {dt.toLocaleString()}
+                  <strong>Scheduled time:</strong> {scheduledLabel ?? "—"}
                 </div>
+                {startedLabel && (
+                  <div>
+                    <strong>Trip started:</strong> {startedLabel}
+                  </div>
+                )}
+                {completedLabel && (
+                  <div>
+                    <strong>Trip completed:</strong> {completedLabel}
+                  </div>
+                )}
 
                 <div>
-                  <strong>Payment:</strong> {b.paymentType ?? "n/a"}
-                  {b.paymentType === "CASH" && (b.cashDiscountBps ?? 0) > 0 ? (
-                    <span style={{ marginLeft: 8, color: "#166534", fontWeight: 600 }}>
-                      ({Math.round((b.cashDiscountBps ?? 0) / 100)}% off)
-                    </span>
-                  ) : null}
+                  <strong>Payment:</strong> {paymentLabel}
                 </div>
 
                 {isCompleted && (
@@ -1398,39 +1469,34 @@ function RideList(props: {
                         </span>
                       )}
 
-                      {typeof b.baseTotalPriceCents === "number" && (
+                      {typeof getBaseFareCents(b) === "number" && (
                         <span>
-                          <strong>Base fare:</strong> ${formatMoney(b.baseTotalPriceCents)}
+                          <strong>Ride fare:</strong> ${formatMoney(getBaseFareCents(b)!)}
                         </span>
                       )}
 
-                      {(() => {
-                        const cents = getEffectiveFareCents(b);
-                        return typeof cents === "number" ? (
+                      {preservedCashAccounting ? (
+                        <>
                           <span>
-                            <strong>Final fare:</strong> ${formatMoney(cents)}
+                            <strong>Card refund:</strong> -${formatMoney(normalizeCents(b.refundAmountCents))}
                           </span>
-                        ) : null;
-                      })()}
+                          <span>
+                            <strong>Net card result:</strong> $0.00
+                          </span>
+                        </>
+                      ) : typeof getEffectiveFareCents(b) === "number" ? (
+                        <span>
+                          <strong>Displayed fare:</strong> ${formatMoney(getEffectiveFareCents(b)!)}
+                        </span>
+                      ) : null}
 
                       {b.passengerCount != null && (
                         <span>
                           <strong>Passengers:</strong> {b.passengerCount}
                         </span>
                       )}
-                      {b.tripStartedAt && (
-                        <span>
-                          <strong>Trip started:</strong> {new Date(b.tripStartedAt).toLocaleString()}
-                        </span>
-                      )}
-                      {b.tripCompletedAt && (
-                        <span>
-                          <strong>Trip completed:</strong> {new Date(b.tripCompletedAt).toLocaleString()}
-                        </span>
-                      )}
                     </div>
 
-                    {/* ✅ Only one secondary action here: resend receipt (optional) */}
                     {onResendReceipt && hasRealBooking && (
                       <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 10 }}>
                         <button

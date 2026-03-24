@@ -26,20 +26,23 @@ type Booking = {
   tripStartedAt?: string | null;
   tripCompletedAt?: string | null;
 
-  // pricing / payment
   paymentType?: PaymentType | null;
   cashDiscountBps?: number | null;
   baseTotalPriceCents?: number | null;
   effectiveTotalPriceCents?: number | null;
   totalPriceCents?: number | null;
 
-  // cash override / audit trail (make sure your API returns these if you want them shown)
   originalPaymentType?: PaymentType | null;
   originalCashDiscountBps?: number | null;
   cashNotPaidAt?: string | null;
   cashDiscountRevokedAt?: string | null;
   cashDiscountRevokedReason?: string | null;
   fallbackCardChargedAt?: string | null;
+
+  refundIssued?: boolean | null;
+  refundAmountCents?: number | null;
+  refundIssuedAt?: string | null;
+  disputeResolvedAt?: string | null;
 };
 
 type ApiResponse = { ok: true; bookings: Booking[] } | { ok: false; error: string };
@@ -54,10 +57,21 @@ function formatMoney(cents: number) {
   return (cents / 100).toFixed(2);
 }
 
+function normalizeCents(v: number | null | undefined): number {
+  return typeof v === "number" && Number.isFinite(v) ? Math.max(0, Math.round(v)) : 0;
+}
+
 function isChatReadOnly(b: Booking): boolean {
   const completed = b.status === "COMPLETED" || b.rideStatus === "COMPLETED";
   const cancelledLike = b.status === "CANCELLED" || b.status === "EXPIRED";
   return completed || cancelledLike;
+}
+
+function getBaseFareCents(b: Booking): number | null {
+  if (typeof b.baseTotalPriceCents === "number") return b.baseTotalPriceCents;
+  if (typeof b.totalPriceCents === "number") return b.totalPriceCents;
+  if (typeof b.effectiveTotalPriceCents === "number") return b.effectiveTotalPriceCents;
+  return null;
 }
 
 function getEffectiveFareCents(b: Booking): number | null {
@@ -67,9 +81,44 @@ function getEffectiveFareCents(b: Booking): number | null {
   return null;
 }
 
+function getFallbackRefundState(b: Booking) {
+  const originalPaymentType = b.originalPaymentType ?? null;
+  const originallyCash = originalPaymentType === "CASH";
+
+  const fallbackCharged = Boolean(
+    originallyCash &&
+      b.paymentType === "CARD" &&
+      b.cashNotPaidAt &&
+      b.fallbackCardChargedAt
+  );
+
+  const refundAmountCents = normalizeCents(b.refundAmountCents);
+  const refundedAfterDispute = Boolean(b.refundIssued && refundAmountCents > 0);
+  const preservedCashAccounting = fallbackCharged && refundedAfterDispute;
+
+  return {
+    originallyCash,
+    fallbackCharged,
+    refundedAfterDispute,
+    preservedCashAccounting,
+    refundAmountCents,
+  };
+}
+
+function getDisplayPaymentLabel(b: Booking): string {
+  const { fallbackCharged, preservedCashAccounting } = getFallbackRefundState(b);
+
+  if (preservedCashAccounting) return "CASH preserved";
+  if (fallbackCharged) return "CARD fallback";
+
+  if (b.paymentType === "CASH") return "CASH";
+  if (b.paymentType === "CARD") return "CARD";
+  return "n/a";
+}
+
 function pctFromBps(bps: number | null | undefined): number {
   const n = typeof bps === "number" && Number.isFinite(bps) ? bps : 0;
-  return Math.round(n / 100); // 1000 bps => 10
+  return Math.round(n / 100);
 }
 
 export default function RiderTripPage() {
@@ -199,11 +248,25 @@ export default function RiderTripPage() {
 
   const dt = safeDate(booking.departureTime) ?? new Date(booking.departureTime);
 
-  const base = typeof booking.baseTotalPriceCents === "number" ? booking.baseTotalPriceCents : null;
-  const effective = getEffectiveFareCents(booking);
+  const baseFareCents = getBaseFareCents(booking);
+  const processorFareCents = getEffectiveFareCents(booking);
 
-  const hasDiscount =
-    base != null && effective != null && Number.isFinite(base) && Number.isFinite(effective) && effective < base;
+  const {
+    fallbackCharged,
+    refundedAfterDispute,
+    preservedCashAccounting,
+    refundAmountCents,
+  } = getFallbackRefundState(booking);
+
+  const displayPayment = getDisplayPaymentLabel(booking);
+
+  const trueCashDiscount =
+    !preservedCashAccounting &&
+    booking.paymentType === "CASH" &&
+    (booking.cashDiscountBps ?? 0) > 0 &&
+    typeof baseFareCents === "number" &&
+    typeof processorFareCents === "number" &&
+    processorFareCents < baseFareCents;
 
   const showCashOverrideAudit =
     booking.originalPaymentType != null ||
@@ -234,7 +297,7 @@ export default function RiderTripPage() {
               type="button"
               onClick={() => {
                 const id = booking.bookingId;
-                if (!id) return; // satisfies TS and protects runtime
+                if (!id) return;
                 const url = `/receipt/${encodeURIComponent(id)}?autoprint=1`;
                 window.open(url, "_blank", "noopener,noreferrer");
               }}
@@ -313,34 +376,64 @@ export default function RiderTripPage() {
             </div>
           )}
 
-          {effective != null && (
+          {typeof baseFareCents === "number" && (
             <div>
-              <strong>Fare:</strong>{" "}
-              {hasDiscount && base != null ? (
-                <>
-                  <span style={{ textDecoration: "line-through", color: "#6b7280", marginRight: 8 }}>
-                    ${formatMoney(base)}
-                  </span>
-                  <span style={{ fontWeight: 700 }}>${formatMoney(effective)}</span>
-                  <span style={{ marginLeft: 8, color: "#166534", fontWeight: 600 }}>
-                    ({booking.paymentType === "CASH" ? "cash discount" : "discount"})
-                  </span>
-                </>
-              ) : (
-                <span style={{ fontWeight: 700 }}>${formatMoney(effective)}</span>
-              )}
+              <strong>Ride fare:</strong> <span style={{ fontWeight: 700 }}>${formatMoney(baseFareCents)}</span>
             </div>
           )}
 
-          {booking.paymentType && (
+          {trueCashDiscount && typeof processorFareCents === "number" && typeof baseFareCents === "number" && (
             <div>
-              <strong>Payment:</strong> {booking.paymentType}
-              {booking.paymentType === "CASH" && (booking.cashDiscountBps ?? 0) > 0 ? (
+              <strong>Cash discount:</strong>{" "}
+              <span style={{ color: "#166534", fontWeight: 600 }}>
+                {pctFromBps(booking.cashDiscountBps)}% off
+              </span>
+              <span style={{ marginLeft: 8 }}>
+                Final cash fare: <strong>${formatMoney(processorFareCents)}</strong>
+              </span>
+            </div>
+          )}
+
+          {preservedCashAccounting && (
+            <>
+              <div>
+                <strong>Payment:</strong> CASH preserved
+              </div>
+              <div style={{ color: "#166534", fontWeight: 600 }}>
+                Originally booked as cash. Fallback card was charged after unpaid cash, then refunded after dispute.
+              </div>
+              <div>
+                <strong>Card refund:</strong> -${formatMoney(refundAmountCents)}
+              </div>
+              <div>
+                <strong>Net card result:</strong> $0.00
+              </div>
+            </>
+          )}
+
+          {!preservedCashAccounting && booking.paymentType && (
+            <div>
+              <strong>Payment:</strong> {displayPayment}
+              {booking.paymentType === "CASH" && (booking.cashDiscountBps ?? 0) > 0 && !trueCashDiscount ? (
                 <span style={{ marginLeft: 8, color: "#166534", fontWeight: 600 }}>
                   ({pctFromBps(booking.cashDiscountBps)}% off)
                 </span>
               ) : null}
             </div>
+          )}
+
+          {refundedAfterDispute && !preservedCashAccounting && (
+            <>
+              <div>
+                <strong>Refund after dispute:</strong> -${formatMoney(refundAmountCents)}
+              </div>
+              {typeof processorFareCents === "number" && (
+                <div>
+                  <strong>Net card result:</strong>{" "}
+                  ${formatMoney(Math.max(0, processorFareCents - refundAmountCents))}
+                </div>
+              )}
+            </>
           )}
 
           {booking.passengerCount != null && (
@@ -367,13 +460,15 @@ export default function RiderTripPage() {
         <div
           style={{
             marginTop: 14,
-            border: "1px solid #e5e7eb",
+            border: "1px solid #fcd34d",
             borderRadius: 12,
             padding: 14,
-            background: "#fff",
+            background: "#fffbeb",
           }}
         >
-          <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 8 }}>Cash override audit</div>
+          <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 8, color: "#92400e" }}>
+            Cash fallback history
+          </div>
 
           <div style={{ fontSize: 13, color: "#374151", display: "grid", gap: 6 }}>
             {booking.originalPaymentType && (
@@ -408,6 +503,53 @@ export default function RiderTripPage() {
             {booking.fallbackCardChargedAt && (
               <div>
                 <strong>Fallback card charged at:</strong> {new Date(booking.fallbackCardChargedAt).toLocaleString()}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {refundedAfterDispute && (
+        <div
+          style={{
+            marginTop: 14,
+            border: "1px solid #a7f3d0",
+            borderRadius: 12,
+            padding: 14,
+            background: "#ecfdf5",
+          }}
+        >
+          <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 8, color: "#065f46" }}>
+            Refund after dispute
+          </div>
+
+          <div style={{ fontSize: 13, color: "#374151", display: "grid", gap: 6 }}>
+            <div>
+              <strong>Refund recorded:</strong> Yes
+            </div>
+            <div>
+              <strong>Refund amount:</strong> -${formatMoney(refundAmountCents)}
+            </div>
+
+            {booking.refundIssuedAt && (
+              <div>
+                <strong>Refund issued at:</strong> {new Date(booking.refundIssuedAt).toLocaleString()}
+              </div>
+            )}
+
+            {booking.disputeResolvedAt && (
+              <div>
+                <strong>Dispute resolved at:</strong> {new Date(booking.disputeResolvedAt).toLocaleString()}
+              </div>
+            )}
+
+            {preservedCashAccounting ? (
+              <div style={{ color: "#166534", fontWeight: 600 }}>
+                Final outcome: this ride remains cash-preserved even though the fallback card charge was refunded.
+              </div>
+            ) : (
+              <div style={{ color: "#0f766e", fontWeight: 600 }}>
+                Refund affected the card-side result for this ride.
               </div>
             )}
           </div>

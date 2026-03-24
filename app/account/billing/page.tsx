@@ -1408,7 +1408,7 @@ export default function AccountBillingPage() {
                             })}
 
                             <tr className="border-t-2 border-slate-200 bg-slate-50">
-                              <td className="px-4 py-3 text-slate-500" colSpan={6}>
+                              <td className="px-4 py-3 text-slate-500" colSpan={5}>
                                 <span className="font-semibold text-slate-800">Total</span>
                                 <span className="ml-2 text-xs">
                                   ({filteredDriverSummary.rideCount}{" "}
@@ -1424,6 +1424,7 @@ export default function AccountBillingPage() {
                               <td className="px-4 py-3 text-right font-semibold text-slate-900">
                                 {money(filteredDriverSummary.netAmountCents, "USD")}
                               </td>
+                              <td className="px-4 py-3" />
                             </tr>
                           </tbody>
                         </table>
