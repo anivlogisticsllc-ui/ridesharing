@@ -7,7 +7,9 @@ import {
   BookingStatus,
   NotificationType,
   PaymentType,
+  RidePaymentStatus,
   RideStatus,
+  TransactionStatus,
   UserRole,
 } from "@prisma/client";
 import { guardMembership } from "@/lib/guardMembership";
@@ -24,6 +26,7 @@ type Body = {
 };
 
 const REPORT_WINDOW_MS = 10 * 60 * 1000;
+const PLATFORM_FEE_BPS = 1000;
 
 function asMessage(err: unknown) {
   return err instanceof Error ? err.message : typeof err === "string" ? err : "Unknown error";
@@ -34,7 +37,12 @@ function isValidReason(v: unknown): v is NonNullable<Body["reason"]> {
 }
 
 function clampCents(v: unknown): number | null {
-  return typeof v === "number" && Number.isFinite(v) ? Math.max(0, Math.round(v)) : null;
+  if (typeof v === "number" && Number.isFinite(v)) return Math.max(0, Math.round(v));
+  if (typeof v === "string" && v.trim() !== "") {
+    const n = Number(v);
+    if (Number.isFinite(n)) return Math.max(0, Math.round(n));
+  }
+  return null;
 }
 
 function escapeHtml(s: string) {
@@ -61,41 +69,12 @@ function getAppUrl() {
   return "http://localhost:3000";
 }
 
-async function createFallbackChargeNotification(args: {
-  riderId: string;
-  rideId: string;
-  bookingId: string;
-  driverId: string;
-  amountCents: number;
-  fallbackChargedAt: Date;
-  reason: "RIDER_REFUSED_CASH" | "RIDER_NO_CASH" | "OTHER";
-  note?: string;
-}) {
-  const title = "Cash ride updated to card charge";
-  const message = `Your driver reported that cash was not received for this ride. Your backup card was charged $${moneyFromCents(
-    args.amountCents
-  )}. If this is incorrect, you can dispute the charge.`;
+function computeDriverSplit(collectedAmountCents: number) {
+  const grossAmountCents = Math.max(0, Math.round(collectedAmountCents));
+  const serviceFeeCents = Math.round(grossAmountCents * (PLATFORM_FEE_BPS / 10000));
+  const netAmountCents = Math.max(0, grossAmountCents - serviceFeeCents);
 
-  return prisma.notification.create({
-    data: {
-      userId: args.riderId,
-      rideId: args.rideId,
-      bookingId: args.bookingId,
-      type: NotificationType.CASH_UNPAID_FALLBACK_CHARGED,
-      title,
-      message,
-      metadata: {
-        amountCents: args.amountCents,
-        originalPaymentType: "CASH",
-        finalPaymentType: "CARD",
-        driverId: args.driverId,
-        reason: args.reason,
-        note: args.note || null,
-        fallbackChargedAt: args.fallbackChargedAt.toISOString(),
-      },
-    },
-    select: { id: true },
-  });
+  return { grossAmountCents, serviceFeeCents, netAmountCents };
 }
 
 async function sendFallbackChargeAlertEmailSafe(args: {
@@ -280,6 +259,8 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
             riderId: true,
             paymentType: true,
             baseAmountCents: true,
+            finalAmountCents: true,
+            currency: true,
           },
         },
       },
@@ -320,7 +301,11 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     }
 
     const fareBaseline =
-      clampCents(booking.baseAmountCents) ?? clampCents(ride.totalPriceCents) ?? 0;
+      clampCents(booking.baseAmountCents) ??
+      clampCents(booking.finalAmountCents) ??
+      clampCents(ride.totalPriceCents) ??
+      0;
+
     const chargeCents = Math.max(0, Math.round(fareBaseline));
 
     if (chargeCents < 50) {
@@ -364,6 +349,7 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
     let piId = "";
     let piStatus = "";
+    let latestChargeId: string | null = null;
 
     try {
       const pi = await stripe.paymentIntents.create({
@@ -385,14 +371,37 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
       piId = pi.id;
       piStatus = String(pi.status ?? "");
+      latestChargeId =
+        typeof pi.latest_charge === "string"
+          ? pi.latest_charge
+          : (pi.latest_charge as { id?: string } | null)?.id ?? null;
     } catch (e: unknown) {
       const msg =
-        typeof e === "object" && e !== null && "message" in e && typeof (e as { message?: unknown }).message === "string"
+        typeof e === "object" &&
+        e !== null &&
+        "message" in e &&
+        typeof (e as { message?: unknown }).message === "string"
           ? String((e as { message: string }).message)
           : "Card charge failed.";
 
       return res.status(402).json({ ok: false, error: msg });
     }
+
+    const existingRidePayment = await prisma.ridePayment.findFirst({
+      where: {
+        rideId: ride.id,
+        riderId: rider.id,
+        paymentType: PaymentType.CARD,
+        provider: "STRIPE",
+        OR: [
+          ...(piId ? [{ stripePaymentIntentId: piId }] : []),
+          ...(latestChargeId ? [{ stripeChargeId: latestChargeId }] : []),
+        ],
+      },
+      select: { id: true },
+    });
+
+    const transactionSplit = computeDriverSplit(chargeCents);
 
     await prisma.$transaction(async (tx) => {
       await tx.booking.update({
@@ -413,30 +422,102 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
           discountCents: 0,
           baseAmountCents: chargeCents,
           finalAmountCents: chargeCents,
+          currency: "USD",
         },
       });
 
-      await tx.notification.create({
-        data: {
-          userId: rider.id,
-          rideId: ride.id,
-          bookingId: booking.id,
-          type: NotificationType.CASH_UNPAID_FALLBACK_CHARGED,
-          title: "Cash ride updated to card charge",
-          message: `Your driver reported that cash was not received for this ride. Your backup card was charged $${moneyFromCents(
-            chargeCents
-          )}. If this is incorrect, you can dispute the charge.`,
-          metadata: {
+      if (existingRidePayment) {
+        await tx.ridePayment.update({
+          where: { id: existingRidePayment.id },
+          data: {
             amountCents: chargeCents,
-            originalPaymentType: "CASH",
-            finalPaymentType: "CARD",
-            driverId,
-            reason,
-            note: note || null,
-            fallbackChargedAt: now.toISOString(),
+            currency: "usd",
+            status: RidePaymentStatus.SUCCEEDED,
+            provider: "STRIPE",
+            paymentType: PaymentType.CARD,
+            baseAmountCents: chargeCents,
+            discountCents: 0,
+            finalAmountCents: chargeCents,
+            capturedAt: now,
+            stripePaymentIntentId: piId,
+            stripeChargeId: latestChargeId,
+            stripeCustomerId: customerId,
           },
+        });
+      } else {
+        await tx.ridePayment.create({
+          data: {
+            rideId: ride.id,
+            riderId: rider.id,
+            amountCents: chargeCents,
+            currency: "usd",
+            status: RidePaymentStatus.SUCCEEDED,
+            provider: "STRIPE",
+            paymentType: PaymentType.CARD,
+            baseAmountCents: chargeCents,
+            discountCents: 0,
+            finalAmountCents: chargeCents,
+            capturedAt: now,
+            stripePaymentIntentId: piId,
+            stripeChargeId: latestChargeId,
+            stripeCustomerId: customerId,
+            idempotencyKey: `fallback_card:${ride.id}:${rider.id}`,
+          },
+        });
+      }
+
+      const existingTransaction = await tx.transaction.findFirst({
+        where: {
+          rideId: ride.id,
+          driverId,
         },
+        select: { id: true },
       });
+
+      if (existingTransaction) {
+        await tx.transaction.update({
+          where: { id: existingTransaction.id },
+          data: {
+            grossAmountCents: transactionSplit.grossAmountCents,
+            serviceFeeCents: transactionSplit.serviceFeeCents,
+            netAmountCents: transactionSplit.netAmountCents,
+            status: TransactionStatus.COMPLETED,
+          },
+        });
+      } else {
+        await tx.transaction.create({
+          data: {
+            rideId: ride.id,
+            driverId,
+            grossAmountCents: transactionSplit.grossAmountCents,
+            serviceFeeCents: transactionSplit.serviceFeeCents,
+            netAmountCents: transactionSplit.netAmountCents,
+            status: TransactionStatus.COMPLETED,
+          },
+        });
+      }
+    });
+
+    await prisma.notification.create({
+      data: {
+        userId: rider.id,
+        rideId: ride.id,
+        bookingId: booking.id,
+        type: NotificationType.CASH_UNPAID_FALLBACK_CHARGED,
+        title: "Cash ride updated to card charge",
+        message: `Your driver reported that cash was not received for this ride. Your backup card was charged $${moneyFromCents(
+          chargeCents
+        )}. If this is incorrect, you can dispute the charge.`,
+        metadata: {
+          amountCents: chargeCents,
+          originalPaymentType: "CASH",
+          finalPaymentType: "CARD",
+          driverId,
+          reason,
+          note: note || null,
+          fallbackChargedAt: now.toISOString(),
+        },
+      },
     });
 
     if (rider.email) {

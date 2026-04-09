@@ -64,6 +64,46 @@ function statusLabel(v: string | null | undefined) {
   return v;
 }
 
+function statusBadgeClass(v: string | null | undefined) {
+  if (v === "OPEN") {
+    return "bg-rose-100 text-rose-700 border border-rose-200";
+  }
+  if (v === "UNDER_REVIEW") {
+    return "bg-amber-100 text-amber-700 border border-amber-200";
+  }
+  if (v === "RESOLVED_RIDER" || v === "RESOLVED_DRIVER") {
+    return "bg-emerald-100 text-emerald-700 border border-emerald-200";
+  }
+  if (v === "CLOSED") {
+    return "bg-slate-100 text-slate-600 border border-slate-200";
+  }
+  return "bg-slate-100 text-slate-600 border border-slate-200";
+}
+
+function cardClass(v: string | null | undefined) {
+  if (v === "OPEN") {
+    return "border-rose-300 bg-rose-50/70 hover:border-rose-400";
+  }
+  if (v === "UNDER_REVIEW") {
+    return "border-amber-300 bg-amber-50/70 hover:border-amber-400";
+  }
+  if (v === "RESOLVED_RIDER" || v === "RESOLVED_DRIVER") {
+    return "border-slate-200 bg-white hover:border-slate-300";
+  }
+  if (v === "CLOSED") {
+    return "border-slate-200 bg-slate-50 hover:border-slate-300";
+  }
+  return "border-slate-200 bg-white hover:border-slate-300";
+}
+
+function leftAccentClass(v: string | null | undefined) {
+  if (v === "OPEN") return "bg-rose-500";
+  if (v === "UNDER_REVIEW") return "bg-amber-500";
+  if (v === "RESOLVED_RIDER" || v === "RESOLVED_DRIVER") return "bg-emerald-500";
+  if (v === "CLOSED") return "bg-slate-300";
+  return "bg-slate-300";
+}
+
 function FilterButton({
   active,
   onClick,
@@ -457,52 +497,74 @@ export default function AdminDisputesPageClient() {
                   <Link
                     key={item.disputeId}
                     href={`/admin/disputes/${encodeURIComponent(item.disputeId)}`}
-                    className="block rounded-2xl border border-slate-200 bg-white p-5 shadow-sm transition hover:border-slate-300 hover:shadow"
+                    className={`block overflow-hidden rounded-2xl border p-5 shadow-sm transition hover:shadow ${
+                      cardClass(item.disputeStatus)
+                    }`}
                   >
-                    <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
-                      <div className="min-w-0">
-                        <div className="text-sm font-semibold text-slate-900">
-                          {item.routeLabel}
-                        </div>
+                    <div className="flex gap-4">
+                      <div
+                        className={`hidden w-1 shrink-0 rounded-full md:block ${leftAccentClass(
+                          item.disputeStatus
+                        )}`}
+                      />
 
-                        <div className="mt-2 space-y-1 text-sm text-slate-600">
-                          <p>
-                            <span className="font-medium text-slate-700">Rider:</span>{" "}
-                            {item.riderName || "Unknown"}
-                          </p>
-                          <p>
-                            <span className="font-medium text-slate-700">Driver:</span>{" "}
-                            {item.driverName || "Unknown"}
-                          </p>
-                          <p>
-                            <span className="font-medium text-slate-700">
-                              Reported reason:
-                            </span>{" "}
-                            {reasonLabel(item.driverReportedReason)}
-                          </p>
-                          <p>
-                            <span className="font-medium text-slate-700">
-                              Fallback charged:
-                            </span>{" "}
-                            {item.fallbackCardChargedAt
-                              ? new Date(item.fallbackCardChargedAt).toLocaleString()
-                              : "Unknown"}
-                          </p>
-                          <p>
-                            <span className="font-medium text-slate-700">Status:</span>{" "}
-                            {statusLabel(item.disputeStatus)}
-                          </p>
-                        </div>
-                      </div>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
+                          <div className="min-w-0">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <div className="text-sm font-semibold text-slate-900">
+                                {item.routeLabel}
+                              </div>
 
-                      <div className="shrink-0 text-left md:text-right">
-                        <div className="text-sm font-semibold text-slate-900">
-                          {money(item.amountCents, item.currency)}
-                        </div>
-                        <div className="mt-2 text-xs text-slate-500">
-                          {item.riderDisputedAt
-                            ? `Submitted ${new Date(item.riderDisputedAt).toLocaleString()}`
-                            : "Open case"}
+                              <span
+                                className={`inline-flex rounded-full px-2.5 py-1 text-xs font-medium ${statusBadgeClass(
+                                  item.disputeStatus
+                                )}`}
+                              >
+                                {statusLabel(item.disputeStatus)}
+                              </span>
+                            </div>
+
+                            <div className="mt-2 space-y-1 text-sm text-slate-600">
+                              <p>
+                                <span className="font-medium text-slate-700">Rider:</span>{" "}
+                                {item.riderName || "Unknown"}
+                              </p>
+                              <p>
+                                <span className="font-medium text-slate-700">Driver:</span>{" "}
+                                {item.driverName || "Unknown"}
+                              </p>
+                              <p>
+                                <span className="font-medium text-slate-700">
+                                  Reported reason:
+                                </span>{" "}
+                                {reasonLabel(item.driverReportedReason)}
+                              </p>
+                              <p>
+                                <span className="font-medium text-slate-700">
+                                  Fallback charged:
+                                </span>{" "}
+                                {item.fallbackCardChargedAt
+                                  ? new Date(item.fallbackCardChargedAt).toLocaleString()
+                                  : "Unknown"}
+                              </p>
+                              <p>
+                                <span className="font-medium text-slate-700">Status:</span>{" "}
+                                {statusLabel(item.disputeStatus)}
+                              </p>
+                            </div>
+                          </div>
+
+                          <div className="shrink-0 text-left md:text-right">
+                            <div className="text-sm font-semibold text-slate-900">
+                              {money(item.amountCents, item.currency)}
+                            </div>
+                            <div className="mt-2 text-xs text-slate-500">
+                              {item.riderDisputedAt
+                                ? `Submitted ${new Date(item.riderDisputedAt).toLocaleString()}`
+                                : "Open case"}
+                            </div>
+                          </div>
                         </div>
                       </div>
                     </div>

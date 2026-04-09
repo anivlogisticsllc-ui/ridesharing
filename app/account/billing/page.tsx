@@ -63,6 +63,8 @@ type DriverTransaction = {
   originalServiceFeeCents?: number;
   originalNetAmountCents?: number;
   refundIssuedAt?: string | null;
+  driverDisputeFeeCents?: number;
+  netAfterDisputeFeeCents?: number;
   ride: {
     id: string;
     departureTime: string | null;
@@ -109,6 +111,8 @@ type DriverApiResponse =
         pendingNetAmountCents: number;
         paidNetAmountCents: number;
         rideCount: number;
+        refundFeeChargedToDriverCents?: number;
+        netAfterDisputeFeeCents?: number;
       };
       transactions: DriverTransaction[];
       membershipCharges: DriverMembershipCharge[];
@@ -197,7 +201,7 @@ function money(cents: number, currency: string) {
 }
 
 function safeCents(v: unknown) {
-  return typeof v === "number" && Number.isFinite(v) ? Math.max(0, Math.round(v)) : 0;
+  return typeof v === "number" && Number.isFinite(v) ? Math.round(v) : 0;
 }
 
 function isRefundRow(p: RiderPayment) {
@@ -373,14 +377,11 @@ function yyyyMmDd(d: Date) {
 
 function parseDateInput(v: string) {
   if (!v) return null;
-
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(v);
   if (!m) return null;
-
   const year = Number(m[1]);
   const month = Number(m[2]);
   const day = Number(m[3]);
-
   const d = new Date(year, month - 1, day);
   return Number.isNaN(d.getTime()) ? null : d;
 }
@@ -431,27 +432,23 @@ function matchesRange(rowDate: Date, range: RiderRange | DriverRange, from: stri
 
 function matchesRiderStatus(status: string, filter: RiderStatusFilter) {
   const s = String(status || "").toUpperCase();
-
   if (filter === "all") return true;
   if (filter === "succeeded") return s === "SUCCEEDED";
   if (filter === "completed") return s === "COMPLETED";
   if (filter === "failed") return s === "FAILED";
   if (filter === "refunded") return s === "REFUNDED";
   if (filter === "pending") return s === "PENDING" || s === "AUTHORIZED";
-
   return true;
 }
 
 function matchesDriverStatus(status: string, filter: DriverStatusFilter) {
   const s = String(status || "").toUpperCase();
-
   if (filter === "all") return true;
   if (filter === "completed") return s === "COMPLETED";
   if (filter === "pending") return s === "PENDING" || s === "AUTHORIZED";
   if (filter === "failed") return s === "FAILED";
   if (filter === "paid") return s === "PAID" || s === "SUCCEEDED";
   if (filter === "refunded") return s === "REFUNDED";
-
   return true;
 }
 
@@ -546,6 +543,10 @@ function RefundedDriverDetails({ t }: { t: DriverTransaction }) {
     t.originalServiceFeeCents ?? t.serviceFeeCents
   );
   const originalNetAmountCents = safeCents(t.originalNetAmountCents ?? t.netAmountCents);
+  const driverDisputeFeeCents = safeCents(t.driverDisputeFeeCents);
+  const netAfterDisputeFeeCents = safeCents(
+    t.netAfterDisputeFeeCents ?? Math.max(0, originalNetAmountCents - driverDisputeFeeCents)
+  );
   const netCardResultCents = Math.max(0, originalGrossAmountCents - refundAmountCents);
 
   return (
@@ -583,29 +584,37 @@ function RefundedDriverDetails({ t }: { t: DriverTransaction }) {
 
         <div className="rounded-lg border border-emerald-200 bg-white/80 p-3">
           <p className="text-[11px] font-semibold uppercase tracking-wide text-emerald-800">
-            Platform accounting view
+            Driver accounting view
           </p>
 
           <div className="mt-2 space-y-1 text-sm text-slate-700">
             <div className="flex items-center justify-between">
-              <span>Ride value kept for fee purposes</span>
+              <span>Ride value kept as cash preserved</span>
               <span className="font-medium">{money(originalGrossAmountCents, "USD")}</span>
             </div>
             <div className="flex items-center justify-between">
-              <span>Platform fee</span>
+              <span>Normal platform fee</span>
               <span className="font-medium">{money(originalServiceFeeCents, "USD")}</span>
             </div>
+            <div className="flex items-center justify-between">
+              <span>Driver earnings before dispute fee</span>
+              <span className="font-medium">{money(originalNetAmountCents, "USD")}</span>
+            </div>
+            <div className="flex items-center justify-between text-rose-700">
+              <span>Driver dispute fee</span>
+              <span className="font-medium">-{money(driverDisputeFeeCents, "USD")}</span>
+            </div>
             <div className="flex items-center justify-between border-t border-emerald-200 pt-2">
-              <span className="font-semibold">Driver earnings preserved</span>
-              <span className="font-semibold">{money(originalNetAmountCents, "USD")}</span>
+              <span className="font-semibold">Net after dispute fee</span>
+              <span className="font-semibold">{money(netAfterDisputeFeeCents, "USD")}</span>
             </div>
           </div>
         </div>
       </div>
 
       <p className="mt-3 text-xs text-slate-600">
-        Rider-favored dispute reversed the fallback card charge, but this ride is still treated
-        as cash-paid for driver/platform accounting.
+        Rider-favored dispute reversed the fallback card charge. The ride remains cash-preserved,
+        but a separate dispute fee is deducted from the driver.
       </p>
     </div>
   );
@@ -802,6 +811,14 @@ export default function AccountBillingPage() {
       (sum, t) => sum + (t.netAmountCents || 0),
       0
     );
+    const refundFeeChargedToDriverCents = visibleDriverTransactions.reduce(
+      (sum, t) => sum + safeCents(t.driverDisputeFeeCents),
+      0
+    );
+    const netAfterDisputeFeeCents = visibleDriverTransactions.reduce(
+      (sum, t) => sum + safeCents(t.netAfterDisputeFeeCents ?? t.netAmountCents),
+      0
+    );
 
     const pendingNetAmountCents = visibleDriverTransactions
       .filter((t) => t.payoutEligible)
@@ -813,6 +830,8 @@ export default function AccountBillingPage() {
       serviceFeeCents,
       netAmountCents,
       pendingNetAmountCents,
+      refundFeeChargedToDriverCents,
+      netAfterDisputeFeeCents,
     };
   }, [visibleDriverTransactions]);
 
@@ -1138,11 +1157,11 @@ export default function AccountBillingPage() {
                   <div>
                     <h2 className="text-sm font-semibold text-slate-900">Driver earnings</h2>
                     <p className="text-xs text-slate-500">
-                      Platform fees, your earned amount, and payout status.
+                      Platform fees, your earned amount, payout status, and dispute fee adjustments.
                     </p>
                   </div>
 
-                  <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+                  <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
                     <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
                       <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
                         Platform fees
@@ -1164,18 +1183,30 @@ export default function AccountBillingPage() {
                       <p className="mt-2 text-xl font-semibold text-slate-900">
                         {money(filteredDriverSummary.netAmountCents, "USD")}
                       </p>
-                      <p className="mt-1 text-[11px] text-slate-500">Net of platform fees</p>
+                      <p className="mt-1 text-[11px] text-slate-500">Before dispute fee deduction</p>
+                    </div>
+
+                    <div className="rounded-xl border border-rose-200 bg-rose-50 p-4">
+                      <p className="text-xs font-medium uppercase tracking-wide text-rose-600">
+                        Dispute fees
+                      </p>
+                      <p className="mt-2 text-xl font-semibold text-rose-700">
+                        -{money(filteredDriverSummary.refundFeeChargedToDriverCents, "USD")}
+                      </p>
+                      <p className="mt-1 text-[11px] text-rose-600">
+                        Charged to driver on rider-favored refunded cash-preserved disputes
+                      </p>
                     </div>
 
                     <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
                       <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
-                        Available to payout
+                        Net after dispute fees
                       </p>
                       <p className="mt-2 text-xl font-semibold text-slate-900">
-                        {money(filteredDriverSummary.pendingNetAmountCents, "USD")}
+                        {money(filteredDriverSummary.netAfterDisputeFeeCents, "USD")}
                       </p>
                       <p className="mt-1 text-[11px] text-slate-500">
-                        Excludes true cash rides already paid directly
+                        Earnings after dispute-fee deduction
                       </p>
                     </div>
 

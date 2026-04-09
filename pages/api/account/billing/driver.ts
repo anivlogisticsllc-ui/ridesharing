@@ -9,6 +9,7 @@ import {
   BookingStatus,
   DisputeStatus,
   PaymentType,
+  RefundStatus,
   RideStatus,
 } from "@prisma/client";
 
@@ -44,6 +45,9 @@ type DriverBillingRow = {
   originalGrossAmountCents: number;
   originalServiceFeeCents: number;
   originalNetAmountCents: number;
+
+  driverDisputeFeeCents: number;
+  netAfterDisputeFeeCents: number;
 
   payoutWeekKey: string;
   payoutWeekStart: string;
@@ -96,6 +100,9 @@ type DriverPayoutWeek = {
   refundAdjustedServiceFeeCents: number;
   refundAdjustedNetAmountCents: number;
 
+  driverDisputeFeeCents: number;
+  netAfterDisputeFeeCents: number;
+
   cashRideServiceFeeOffsetCents: number;
   finalTransferAmountCents: number;
 
@@ -126,6 +133,8 @@ type DriverBillingResponse =
         rideCount: number;
         bankPayoutEligibleNetAmountCents: number;
         excludedFromBankPayoutNetAmountCents: number;
+        refundFeeChargedToDriverCents: number;
+        netAfterDisputeFeeCents: number;
       };
       transactions: DriverBillingRow[];
       weeklyPayouts: DriverPayoutWeek[];
@@ -143,6 +152,8 @@ type DriverBillingResponse =
           excludedRideCount: number;
           finalTransferAmountCents: number;
           cashRideServiceFeeOffsetCents: number;
+          driverDisputeFeeCents: number;
+          netAfterDisputeFeeCents: number;
         }[];
       };
       membershipCharges: {
@@ -333,6 +344,9 @@ function emptyWeekTotals(args: {
     refundAdjustedServiceFeeCents: 0,
     refundAdjustedNetAmountCents: 0,
 
+    driverDisputeFeeCents: 0,
+    netAfterDisputeFeeCents: 0,
+
     cashRideServiceFeeOffsetCents: 0,
     finalTransferAmountCents: 0,
 
@@ -432,25 +446,70 @@ export default async function handler(
           select: {
             id: true,
             rideId: true,
+            ridePaymentId: true,
             refundAmountCents: true,
             refundIssuedAt: true,
           },
         })
       : [];
 
+    const ridePaymentIds = disputes
+      .map((d) => d.ridePaymentId)
+      .filter((v): v is string => typeof v === "string" && v.trim().length > 0);
+
+    const refunds = ridePaymentIds.length
+      ? await prisma.refund.findMany({
+          where: {
+            ridePaymentId: { in: ridePaymentIds },
+            status: RefundStatus.SUCCEEDED,
+          },
+          orderBy: { createdAt: "desc" },
+          select: {
+            id: true,
+            ridePaymentId: true,
+            processorFeeLostCents: true,
+            amountCents: true,
+            createdAt: true,
+          },
+        })
+      : [];
+
+    const refundFeeLostByRidePaymentId = new Map<string, number>();
+    for (const refund of refunds) {
+      if (!refundFeeLostByRidePaymentId.has(refund.ridePaymentId)) {
+        refundFeeLostByRidePaymentId.set(
+          refund.ridePaymentId,
+          asNonNegativeCents(refund.processorFeeLostCents)
+        );
+      }
+    }
+
     const disputeByRideId = new Map<
       string,
       {
         refundAmountCents: number;
         refundIssuedAt: Date | null;
+        ridePaymentId: string | null;
+        processorFeeLostCents: number;
       }
     >();
 
     for (const dispute of disputes) {
       if (!disputeByRideId.has(dispute.rideId)) {
+        const ridePaymentId =
+          typeof dispute.ridePaymentId === "string" && dispute.ridePaymentId.trim()
+            ? dispute.ridePaymentId
+            : null;
+
         disputeByRideId.set(dispute.rideId, {
           refundAmountCents: asNonNegativeCents(dispute.refundAmountCents),
           refundIssuedAt: dispute.refundIssuedAt ?? null,
+          ridePaymentId,
+          processorFeeLostCents: ridePaymentId
+            ? asNonNegativeCents(
+                refundFeeLostByRidePaymentId.get(ridePaymentId) ?? 0
+              )
+            : 0,
         });
       }
     }
@@ -525,6 +584,16 @@ export default async function handler(
         settlementType,
       });
 
+      const driverDisputeFeeCents =
+        settlementType === "CASH_PRESERVED" && refundIssued
+          ? asNonNegativeCents(dispute?.processorFeeLostCents)
+          : 0;
+
+      const netAfterDisputeFeeCents = Math.max(
+        0,
+        displayNetAmountCents - driverDisputeFeeCents
+      );
+
       const weekMeta = getWeekMeta(ride.departureTime);
 
       allTransactions.push({
@@ -541,6 +610,9 @@ export default async function handler(
         originalGrossAmountCents: originalSplit.grossAmountCents,
         originalServiceFeeCents: originalSplit.serviceFeeCents,
         originalNetAmountCents: originalSplit.netAmountCents,
+
+        driverDisputeFeeCents,
+        netAfterDisputeFeeCents,
 
         refundIssued,
         refundAmountCents,
@@ -583,6 +655,14 @@ export default async function handler(
     );
     const netAmountCents = allTransactions.reduce(
       (sum, tx) => sum + tx.netAmountCents,
+      0
+    );
+    const refundFeeChargedToDriverCents = allTransactions.reduce(
+      (sum, tx) => sum + tx.driverDisputeFeeCents,
+      0
+    );
+    const netAfterDisputeFeeCents = allTransactions.reduce(
+      (sum, tx) => sum + tx.netAfterDisputeFeeCents,
       0
     );
 
@@ -664,6 +744,9 @@ export default async function handler(
         default:
           break;
       }
+
+      week.driverDisputeFeeCents += tx.driverDisputeFeeCents;
+      week.netAfterDisputeFeeCents += tx.netAfterDisputeFeeCents;
     }
 
     const weeklyPayouts = Array.from(weeklyMap.values())
@@ -673,16 +756,18 @@ export default async function handler(
 
         week.finalTransferAmountCents = Math.max(
           0,
-          week.cardPayableNetAmountCents - week.cashRideServiceFeeOffsetCents
+          week.cardPayableNetAmountCents -
+            week.cashRideServiceFeeOffsetCents -
+            week.driverDisputeFeeCents
         );
 
         return week;
       })
       .sort((a, b) => {
-        return new Date(b.weekStart).getTime() - new Date(a.weekStart).getTime();
+        return (
+          new Date(b.weekStart).getTime() - new Date(a.weekStart).getTime()
+        );
       });
-
-    const lastPaidWeek: DriverPayoutWeek | null = null;
 
     const currentPendingWeek =
       weeklyPayouts.find((week) => week.finalTransferAmountCents > 0) ?? null;
@@ -728,6 +813,8 @@ export default async function handler(
         rideCount: allTransactions.length,
         bankPayoutEligibleNetAmountCents,
         excludedFromBankPayoutNetAmountCents,
+        refundFeeChargedToDriverCents,
+        netAfterDisputeFeeCents,
       },
       transactions: allTransactions,
       weeklyPayouts,
@@ -745,6 +832,8 @@ export default async function handler(
           excludedRideCount: week.excludedRideCount,
           finalTransferAmountCents: week.finalTransferAmountCents,
           cashRideServiceFeeOffsetCents: week.cashRideServiceFeeOffsetCents,
+          driverDisputeFeeCents: week.driverDisputeFeeCents,
+          netAfterDisputeFeeCents: week.netAfterDisputeFeeCents,
         })),
       },
       membershipCharges: membershipCharges.map((charge) => ({
