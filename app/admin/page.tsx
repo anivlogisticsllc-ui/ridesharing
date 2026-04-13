@@ -86,7 +86,10 @@ export default function AdminDashboardPage() {
 
       if (!res.ok || !data || !("ok" in data) || !data.ok) {
         setMetrics(null);
-        setError((data as { error?: string } | null)?.error || `Failed to load metrics (HTTP ${res.status})`);
+        setError(
+          (data as { error?: string } | null)?.error ||
+            `Failed to load metrics (HTTP ${res.status})`
+        );
         return;
       }
 
@@ -149,6 +152,7 @@ export default function AdminDashboardPage() {
             <TabLink href="/admin/drivers">Drivers</TabLink>
             <TabLink href="/admin/riders">Riders</TabLink>
             <TabLink href="/admin/disputes">Disputes</TabLink>
+            <TabLink href="/admin/payouts">Payouts</TabLink>
             <TabLink href="/admin/metrics">Metrics</TabLink>
             <TabLink href="/admin/rides">Rides</TabLink>
 
@@ -224,6 +228,13 @@ export default function AdminDashboardPage() {
                     Disputes
                   </Link>{" "}
                   to review rider claims, driver reports, and admin decisions.
+                </li>
+                <li>
+                  Go to{" "}
+                  <Link className="underline" href="/admin/payouts">
+                    Payouts
+                  </Link>{" "}
+                  to review weekly payout candidates and create manual payout records.
                 </li>
                 <li>
                   Go to{" "}

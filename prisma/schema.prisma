@@ -80,6 +80,13 @@ model User {
   riderRides                 Ride[]                   @relation("RiderRides")
   ridePayments               RidePayment[]
   transactions               Transaction[]            @relation("DriverTransactions")
+
+  stripeConnectedAccountId String? @unique
+  stripePayoutsEnabled     Boolean @default(false)
+  stripeChargesEnabled     Boolean @default(false)
+  stripeAccountReady       Boolean @default(false)
+  externalBankLast4        String?
+  externalBankName         String?
 }
 
 model DriverProfile {
@@ -417,11 +424,25 @@ model Payout {
   status      PayoutStatus @default(PENDING)
   provider    String       @default("STRIPE")
   providerRef String?      @unique
-  createdAt   DateTime     @default(now())
-  updatedAt   DateTime     @updatedAt
-  driver      User         @relation(fields: [driverId], references: [id])
+
+  payoutWeekKey   String?
+  payoutWeekStart DateTime?
+  payoutWeekEnd   DateTime?
+
+  cardPayableNetAmountCents     Int @default(0)
+  cashRideServiceFeeOffsetCents Int @default(0)
+  driverDisputeFeeCents         Int @default(0)
+
+  executedAt    DateTime?
+  failureReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  driver User @relation(fields: [driverId], references: [id])
 
   @@index([driverId])
+  @@index([driverId, payoutWeekKey])
 }
 
 model RideAuditLog {
