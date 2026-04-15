@@ -8,6 +8,7 @@ import { UserRole, PayoutStatus } from "@prisma/client";
 import { authOptions } from "@/pages/api/auth/[...nextauth]";
 import { prisma } from "@/lib/prisma";
 import { stripe } from "@/lib/stripe";
+import { sendEmail } from "@/lib/email";
 
 type SessionUser = {
   id?: string | null;
@@ -25,6 +26,118 @@ function asCleanString(v: unknown) {
 function getErrorMessage(error: unknown) {
   if (error instanceof Error && error.message) return error.message;
   return "Internal server error";
+}
+
+function formatMoney(cents: number, currency = "USD") {
+  return new Intl.NumberFormat(undefined, {
+    style: "currency",
+    currency,
+  }).format((Number.isFinite(cents) ? cents : 0) / 100);
+}
+
+function formatWeekLabel(start?: Date | null, end?: Date | null, key?: string | null) {
+  if (start && end) {
+    const startLabel = start.toLocaleDateString(undefined, {
+      month: "short",
+      day: "numeric",
+      year: "numeric",
+    });
+    const endLabel = end.toLocaleDateString(undefined, {
+      month: "short",
+      day: "numeric",
+      year: "numeric",
+    });
+    return `${startLabel} – ${endLabel}`;
+  }
+
+  return key || "Selected payout week";
+}
+
+async function sendPayoutSuccessEmail(args: {
+  to: string;
+  driverName: string | null;
+  amountCents: number;
+  currency: string;
+  payoutWeekKey: string | null;
+  payoutWeekStart: Date | null;
+  payoutWeekEnd: Date | null;
+  transferId: string;
+  externalBankName: string | null;
+  externalBankLast4: string | null;
+}) {
+  const amount = formatMoney(args.amountCents, args.currency || "USD");
+  const weekLabel = formatWeekLabel(
+    args.payoutWeekStart,
+    args.payoutWeekEnd,
+    args.payoutWeekKey
+  );
+
+  const bankLine =
+    args.externalBankName || args.externalBankLast4
+      ? `${args.externalBankName || "Bank"} / last4 ${args.externalBankLast4 || "—"}`
+      : "Your connected payout destination";
+
+  const greeting = args.driverName?.trim() ? `Hi ${args.driverName.trim()},` : "Hi,";
+
+  const subject = `Payout sent • ${amount}`;
+
+  const html = `
+    <div style="font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 640px; margin: 0 auto; padding: 16px;">
+      <h2 style="margin: 0 0 10px; font-size: 20px; color:#0f172a;">Payout sent</h2>
+
+      <p style="margin: 0 0 14px; font-size: 14px; color:#475569;">
+        ${greeting}
+      </p>
+
+      <p style="margin: 0 0 14px; font-size: 14px; color:#475569;">
+        Your payout has been sent successfully.
+      </p>
+
+      <div style="border-radius:14px; border:1px solid #e2e8f0; padding:16px; background:#ffffff; margin-bottom:14px;">
+        <div style="display:flex; justify-content:space-between; gap:10px; margin:6px 0; font-size:14px; color:#334155;">
+          <div>Amount</div>
+          <div style="font-weight:700; color:#0f172a;">${amount}</div>
+        </div>
+        <div style="display:flex; justify-content:space-between; gap:10px; margin:6px 0; font-size:14px; color:#334155;">
+          <div>Payout week</div>
+          <div style="font-weight:700; color:#0f172a;">${weekLabel}</div>
+        </div>
+        <div style="display:flex; justify-content:space-between; gap:10px; margin:6px 0; font-size:14px; color:#334155;">
+          <div>Transfer reference</div>
+          <div style="font-weight:700; color:#0f172a;">${args.transferId}</div>
+        </div>
+        <div style="display:flex; justify-content:space-between; gap:10px; margin:6px 0; font-size:14px; color:#334155;">
+          <div>Payout destination</div>
+          <div style="font-weight:700; color:#0f172a;">${bankLine}</div>
+        </div>
+      </div>
+
+      <p style="margin: 0; font-size: 12px; color:#64748b;">
+        Stripe dashboard balances and activity can take a short moment to refresh after payout submission.
+      </p>
+    </div>
+  `;
+
+  const text = [
+    subject,
+    "",
+    greeting,
+    "",
+    "Your payout has been sent successfully.",
+    `Amount: ${amount}`,
+    `Payout week: ${weekLabel}`,
+    `Transfer reference: ${args.transferId}`,
+    `Payout destination: ${bankLine}`,
+    "",
+    "Stripe dashboard balances and activity can take a short moment to refresh after payout submission.",
+  ].join("\n");
+
+  return sendEmail({
+    to: args.to,
+    subject,
+    html,
+    text,
+  });
 }
 
 export async function POST(req: NextRequest) {
@@ -190,8 +303,6 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // Atomic claim step:
-    // only one request should move forward while status is still PENDING
     const claim = await prisma.payout.updateMany({
       where: {
         id: payout.id,
@@ -268,6 +379,26 @@ export async function POST(req: NextRequest) {
           failureReason: true,
         },
       });
+
+      if (driver.email) {
+        void sendPayoutSuccessEmail({
+          to: driver.email,
+          driverName: driver.name ?? null,
+          amountCents: updated.amountCents,
+          currency: updated.currency,
+          payoutWeekKey: updated.payoutWeekKey ?? null,
+          payoutWeekStart: updated.payoutWeekStart ?? null,
+          payoutWeekEnd: updated.payoutWeekEnd ?? null,
+          transferId: transfer.id,
+          externalBankName: driver.externalBankName ?? null,
+          externalBankLast4: driver.externalBankLast4 ?? null,
+        }).catch((emailError) => {
+          console.error(
+            "[POST /api/admin/payouts/execute] payout success email error:",
+            emailError
+          );
+        });
+      }
 
       return NextResponse.json({
         ok: true,

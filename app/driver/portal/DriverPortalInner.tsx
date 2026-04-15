@@ -1,4 +1,3 @@
-// app/driver/portal/DriverPortalInner.tsx
 "use client";
 
 import { useEffect, useMemo, useState, type FormEvent } from "react";
@@ -34,7 +33,7 @@ type DriverRide = {
   bookingId: string | null;
   originCity: string;
   destinationCity: string;
-  departureTime: string; // ISO
+  departureTime: string;
   status: RideStatusUI;
 
   riderName: string | null;
@@ -87,6 +86,36 @@ type SessionUser = {
   name?: string | null;
 } & Record<string, unknown>;
 
+type CompleteRideResponse =
+  | {
+      ok: true;
+      payment?: {
+        method: "CARD" | "CASH";
+        amountCents: number;
+        stripeStatus?: string;
+      };
+      transaction?: {
+        grossAmountCents: number;
+        serviceFeeCents: number;
+        netAmountCents: number;
+      };
+      billing?: {
+        finalFareCents: number;
+        collectedAmountCents: number;
+        outstandingAmountCents: number;
+        note?: string;
+      };
+    }
+  | { ok: false; error: string };
+
+type RideActionBanner =
+  | {
+      tone: "good" | "warning";
+      title: string;
+      body: string;
+    }
+  | null;
+
 const REPORT_WINDOW_MS = 10 * 60 * 1000;
 
 /* ---------- Helpers ---------- */
@@ -103,6 +132,13 @@ function safeDate(value: string | null | undefined): Date | null {
 
 function isObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null;
+}
+
+function formatMoney(cents: number, currency = "USD") {
+  return new Intl.NumberFormat(undefined, {
+    style: "currency",
+    currency,
+  }).format((Number.isFinite(cents) ? cents : 0) / 100);
 }
 
 function extractProfilePayload(raw: unknown): DriverProfile | null {
@@ -265,16 +301,15 @@ export default function DriverPortalInner() {
   const [activeChat, setActiveChat] = useState<ActiveChatContext | null>(null);
 
   const [rideActionError, setRideActionError] = useState<string | null>(null);
+  const [rideActionBanner, setRideActionBanner] = useState<RideActionBanner>(null);
   const [busyRideId, setBusyRideId] = useState<string | null>(null);
 
-  // Report unpaid UI state
   const [reportingRideId, setReportingRideId] = useState<string | null>(null);
   const [reportModal, setReportModal] = useState<{ rideId: string; riderLabel: string } | null>(null);
   const [reportReason, setReportReason] = useState<"RIDER_REFUSED_CASH" | "RIDER_NO_CASH" | "OTHER">("RIDER_REFUSED_CASH");
   const [reportNote, setReportNote] = useState("");
   const [reportError, setReportError] = useState<string | null>(null);
 
-  // Tick every second (countdown redraw)
   const [nowTick, setNowTick] = useState(0);
   useEffect(() => {
     const t = setInterval(() => setNowTick((x) => x + 1), 1000);
@@ -306,8 +341,6 @@ export default function DriverPortalInner() {
       setRidesLoading(false);
     }
   }
-
-  /* ---------- Session / access control + initial loads ---------- */
 
   useEffect(() => {
     if (status === "loading") return;
@@ -364,8 +397,6 @@ export default function DriverPortalInner() {
     loadRides();
   }, [session, status, router, sessionRole]);
 
-  /* ---------- Auto-open chat from query params ---------- */
-
   useEffect(() => {
     if (activeChat) return;
 
@@ -413,8 +444,6 @@ export default function DriverPortalInner() {
 
     router.replace("/driver/portal");
   }, [searchParams, activeChat, ridesLoading, acceptedRides, router, sessionUser]);
-
-  /* ---------- Service cities actions ---------- */
 
   async function handleAddCity(e: FormEvent) {
     e.preventDefault();
@@ -473,12 +502,11 @@ export default function DriverPortalInner() {
     }
   }
 
-  /* ---------- Trip meter & ride actions ---------- */
-
   async function handleStartRide(rideId: string) {
     if (busyRideId) return;
 
     setRideActionError(null);
+    setRideActionBanner(null);
     setBusyRideId(rideId);
 
     try {
@@ -517,6 +545,7 @@ export default function DriverPortalInner() {
     if (busyRideId) return;
 
     setRideActionError(null);
+    setRideActionBanner(null);
     setBusyRideId(rideId);
 
     try {
@@ -533,10 +562,12 @@ export default function DriverPortalInner() {
 
       if (!res.ok) throw new Error(await readApiError(res));
 
-      const data = (await res.json().catch(() => null)) as unknown;
-      if (!isObject(data) || (data as any).ok !== true) {
+      const data = (await res.json().catch(() => null)) as CompleteRideResponse | null;
+      if (!data || !isObject(data) || data.ok !== true) {
         const errMsg =
-          isObject(data) && typeof (data as any).error === "string" ? (data as any).error : "Failed to complete ride.";
+          data && isObject(data) && typeof (data as any).error === "string"
+            ? (data as any).error
+            : "Failed to complete ride.";
         throw new Error(errMsg);
       }
 
@@ -549,9 +580,12 @@ export default function DriverPortalInner() {
         const completedRide: DriverRide = {
           ...ride,
           status: "COMPLETED",
-          tripCompletedAt: ride.tripCompletedAt ?? nowIso,
+          tripCompletedAt: nowIso,
           distanceMiles: summary?.distanceMiles ?? ride.distanceMiles ?? null,
-          totalPriceCents: summary?.fareCents ?? ride.totalPriceCents ?? null,
+          totalPriceCents:
+            typeof data.billing?.finalFareCents === "number"
+              ? data.billing.finalFareCents
+              : summary?.fareCents ?? ride.totalPriceCents ?? null,
           unreadCount: 0,
         };
 
@@ -562,6 +596,20 @@ export default function DriverPortalInner() {
 
         return prevAccepted.filter((r) => r.rideId !== rideId);
       });
+
+      if (data.billing && data.billing.outstandingAmountCents > 0) {
+        setRideActionBanner({
+          tone: "warning",
+          title: "Ride completed. Billing follow-up is still needed.",
+          body: `${formatMoney(data.billing.outstandingAmountCents)} is still outstanding.${data.billing.note ? ` ${data.billing.note}` : ""}`,
+        });
+      } else {
+        setRideActionBanner({
+          tone: "good",
+          title: "Ride completed successfully.",
+          body: "The ride was completed and removed from your active list.",
+        });
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : "Failed to complete ride.";
       console.error("Error completing ride:", err);
@@ -570,8 +618,6 @@ export default function DriverPortalInner() {
       setBusyRideId(null);
     }
   }
-
-  /* ---------- Report unpaid ---------- */
 
   function openReportModal(ride: DriverRide) {
     const riderLabel = ride.riderPublicId || ride.riderName || "Rider";
@@ -610,8 +656,6 @@ export default function DriverPortalInner() {
     }
   }
 
-  /* ---------- Membership banner ---------- */
-
   const membershipBanner = useMemo(() => {
     if (!membership) return null;
 
@@ -645,8 +689,6 @@ export default function DriverPortalInner() {
 
     return { tone: "warning" as const, title: "No membership found.", body: "If this is unexpected, open Membership & Billing to fix it." };
   }, [membership]);
-
-  /* ---------- Derived lists ---------- */
 
   const today = useMemo(() => new Date(), []);
 
@@ -729,7 +771,21 @@ export default function DriverPortalInner() {
           </section>
         ) : null}
 
-        {/* Accepted rides */}
+        {rideActionBanner ? (
+          <section>
+            <div
+              className={`rounded-2xl border px-4 py-3 text-xs ${
+                rideActionBanner.tone === "good"
+                  ? "border-emerald-200 bg-emerald-50 text-emerald-900"
+                  : "border-amber-200 bg-amber-50 text-amber-900"
+              }`}
+            >
+              <p className="font-semibold">{rideActionBanner.title}</p>
+              <p className="mt-1 text-[11px] opacity-90">{rideActionBanner.body}</p>
+            </div>
+          </section>
+        ) : null}
+
         <section className="space-y-3">
           <h2 className="text-sm font-semibold text-slate-800">My accepted rides</h2>
 
@@ -838,7 +894,6 @@ export default function DriverPortalInner() {
           )}
         </section>
 
-        {/* Completed rides */}
         <section className="space-y-3">
           <h2 className="text-sm font-semibold text-slate-800">Rides completed today</h2>
 
@@ -857,7 +912,6 @@ export default function DriverPortalInner() {
                 const { canReport, msLeft, alreadyReported } = reportWindowState(ride);
                 const reportDisabled = alreadyReported || !canReport || reportingRideId === ride.rideId;
 
-                // Only show report for CASH rides that have not been reported
                 const showReport = ride.paymentType === "CASH" && !ride.outstandingChargeId;
 
                 return (
@@ -960,7 +1014,6 @@ export default function DriverPortalInner() {
           )}
         </section>
 
-        {/* Service area UI */}
         <header className="space-y-1">
           <h1 className="text-2xl font-semibold text-slate-900">Driver service area</h1>
           <p className="text-sm text-slate-600">
@@ -1107,8 +1160,6 @@ export default function DriverPortalInner() {
     </main>
   );
 }
-
-/* ---------- Chat overlay ---------- */
 
 function ChatOverlay(props: { context: ActiveChatContext; onClose: () => void }) {
   const { context, onClose } = props;
