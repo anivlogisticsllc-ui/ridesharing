@@ -136,7 +136,8 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(
         {
           ok: false,
-          error: "This payout already has a provider reference and may have been executed.",
+          error:
+            "This payout already has a provider reference and may have been executed.",
           payout: {
             id: payout.id,
             status: payout.status,
@@ -189,6 +190,31 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    // Atomic claim step:
+    // only one request should move forward while status is still PENDING
+    const claim = await prisma.payout.updateMany({
+      where: {
+        id: payout.id,
+        status: PayoutStatus.PENDING,
+        providerRef: null,
+      },
+      data: {
+        executedAt: new Date(),
+        failureReason: null,
+      },
+    });
+
+    if (claim.count !== 1) {
+      return NextResponse.json(
+        {
+          ok: false,
+          error:
+            "This payout is no longer available for execution. Refresh and try again.",
+        },
+        { status: 409 }
+      );
+    }
+
     try {
       const transfer = await stripe.transfers.create(
         {
@@ -206,6 +232,7 @@ export async function POST(req: NextRequest) {
               payout.cashRideServiceFeeOffsetCents
             ),
             driverDisputeFeeCents: String(payout.driverDisputeFeeCents),
+            executedByAdminId: adminId,
           },
         },
         {
