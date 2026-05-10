@@ -25,7 +25,6 @@ type DistanceResult = {
   originLng: number;
   destLat: number;
   destLng: number;
-  
 };
 
 type GeoEstimateSuccess = {
@@ -55,9 +54,21 @@ type PaymentMethodStatus =
       ok: true;
       hasPaymentMethod: boolean;
       customerId: string | null;
-      defaultPaymentMethod: any | null;
+      defaultPaymentMethod: unknown | null;
     }
   | { ok: false; error: string };
+
+type PostRideSuccess = {
+  ok: true;
+  ride: { id: string };
+  booking?: { id: string } | null;
+};
+
+type PostRideFailure = {
+  ok: false;
+  error: string;
+  outstandingChargeId?: string;
+};
 
 function buildAddress(parts: {
   streetNumber: string;
@@ -89,28 +100,23 @@ export function RiderRequestFormHome() {
   const { data: session, status } = useSession();
   const router = useRouter();
 
-  // Top-level UI state
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [outstandingOcId, setOutstandingOcId] = useState<string | null>(null);
 
-  // Card-on-file status
   const [pmLoading, setPmLoading] = useState(false);
-  const [hasCardOnFile, setHasCardOnFile] = useState<boolean>(false);
-  const [pmChecked, setPmChecked] = useState<boolean>(false);
+  const [hasCardOnFile, setHasCardOnFile] = useState(false);
+  const [pmChecked, setPmChecked] = useState(false);
 
-  // Visible address search box values
   const [originQuery, setOriginQuery] = useState("");
   const [destQuery, setDestQuery] = useState("");
 
-  // Origin address
   const [originStreetNumber, setOriginStreetNumber] = useState("");
   const [originStreetName, setOriginStreetName] = useState("");
   const [originCity, setOriginCity] = useState("");
   const [originStateVal, setOriginStateVal] = useState("");
   const [originZip, setOriginZip] = useState("");
 
-  // Destination address
   const [destStreetNumber, setDestStreetNumber] = useState("");
   const [destStreetName, setDestStreetName] = useState("");
   const [destCity, setDestCity] = useState("");
@@ -169,7 +175,10 @@ export function RiderRequestFormHome() {
       if (!res.ok || !json || !("ok" in json) || !json.ok) {
         setHasCardOnFile(false);
         if (!opts?.silent) {
-          setError((json as any)?.error || `Failed to load payment method status (HTTP ${res.status}).`);
+          setError(
+            (json as { error?: string } | null)?.error ||
+              `Failed to load payment method status (HTTP ${res.status}).`
+          );
         }
         return;
       }
@@ -189,9 +198,23 @@ export function RiderRequestFormHome() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status, session]);
 
-  async function estimateDistanceOnce(opts?: { showUserError?: boolean }): Promise<DistanceResult | null> {
+  useEffect(() => {
+    router.prefetch("/rider/trips");
+  }, [router]);
+
+  useEffect(() => {
+    return () => {
+      setMessage(null);
+    };
+  }, []);
+
+  async function estimateDistanceOnce(
+    opts?: { showUserError?: boolean }
+  ): Promise<DistanceResult | null> {
     if (!originAddress || !destinationAddress) {
-      if (opts?.showUserError) setError("Please fill out all address fields for From and To.");
+      if (opts?.showUserError) {
+        setError("Please fill out all address fields for From and To.");
+      }
       return null;
     }
 
@@ -225,7 +248,9 @@ export function RiderRequestFormHome() {
       };
     } catch (err) {
       console.error("[estimateDistanceOnce] error", err);
-      if (opts?.showUserError) setError("Failed to estimate distance. Try again or enter it manually.");
+      if (opts?.showUserError) {
+        setError("Failed to estimate distance. Try again or enter it manually.");
+      }
       return null;
     } finally {
       setEstimating(false);
@@ -299,15 +324,24 @@ export function RiderRequestFormHome() {
       return;
     }
 
-    const passengersNumber = typeof passengerCount === "number" ? passengerCount : Number(passengerCount || 1);
+    const passengersNumber =
+      typeof passengerCount === "number" ? passengerCount : Number(passengerCount || 1);
+
     if (!passengersNumber || passengersNumber < 1 || passengersNumber > 6) {
       setError("Passenger count must be between 1 and 6.");
       return;
     }
 
     let distanceToSend =
-      typeof distanceMiles === "number" ? distanceMiles : distanceMiles === "" ? null : Number(distanceMiles);
-    if (distanceToSend != null && Number.isNaN(distanceToSend)) distanceToSend = null;
+      typeof distanceMiles === "number"
+        ? distanceMiles
+        : distanceMiles === ""
+        ? null
+        : Number(distanceMiles);
+
+    if (distanceToSend != null && Number.isNaN(distanceToSend)) {
+      distanceToSend = null;
+    }
 
     const geo = await estimateDistanceOnce({ showUserError: true });
     if (!geo) return;
@@ -359,26 +393,39 @@ export function RiderRequestFormHome() {
         }),
       });
 
-      type PostRideResponse =
-        | { ok: true }
-        | { ok: false; error: string; outstandingChargeId?: string };
-
-      const data = (await res.json().catch(() => null)) as PostRideResponse | null;
+      const data = (await res.json().catch(() => null)) as
+        | PostRideSuccess
+        | PostRideFailure
+        | null;
 
       if (!res.ok || !data || !data.ok) {
-        const msg = data && "error" in data ? data.error : "Failed to post ride request";
+        const msg =
+          data && "error" in data ? data.error : "Failed to post ride request";
         setError(msg);
 
-        const oc = data && "outstandingChargeId" in data ? data.outstandingChargeId : undefined;
+        const oc =
+          data && "outstandingChargeId" in data
+            ? data.outstandingChargeId
+            : undefined;
+
         setOutstandingOcId(typeof oc === "string" && oc.trim() ? oc : null);
         return;
       }
 
-      setMessage("Ride request posted. You can see it in your Rider portal.");
+      const createdRideId =
+        data.ride && typeof data.ride.id === "string" ? data.ride.id : null;
+
+      if (!createdRideId) {
+        setError("Ride was created, but rideId was not returned.");
+        return;
+      }
+
       resetForm();
-    } catch (err: any) {
+      router.push(`/rider/trips/${encodeURIComponent(createdRideId)}`);
+      return;
+    } catch (err: unknown) {
       console.error(err);
-      setError(err?.message || "Something went wrong");
+      setError(err instanceof Error ? err.message : "Something went wrong");
     } finally {
       setSubmitting(false);
     }
@@ -410,7 +457,6 @@ export function RiderRequestFormHome() {
     <section className="space-y-3">
       <h2 className="text-lg font-semibold text-slate-900">Request a ride</h2>
 
-      {/* Cash promo / warning */}
       <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
         <div className="font-medium">Cash rides</div>
         <div className="mt-1 text-amber-900">
@@ -421,7 +467,10 @@ export function RiderRequestFormHome() {
         </div>
       </div>
 
-      <form onSubmit={handleSubmit} className="space-y-3 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+      <form
+        onSubmit={handleSubmit}
+        className="space-y-3 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm"
+      >
         <div className="space-y-2">
           <span className="block text-sm font-medium text-slate-800">Payment method</span>
 
@@ -475,8 +524,31 @@ export function RiderRequestFormHome() {
           </div>
         ) : null}
 
+        {message && (
+          <div className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-800">
+            {message}
+          </div>
+        )}
+
+        {error && (
+          <div className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-800">
+            <div>{error}</div>
+
+            {outstandingOcId ? (
+              <button
+                type="button"
+                onClick={() =>
+                  router.push(`/rider/outstanding?oc=${encodeURIComponent(outstandingOcId)}`)
+                }
+                className="mt-2 inline-flex rounded-full bg-slate-900 px-3 py-1.5 text-[11px] font-medium text-white hover:bg-slate-800"
+              >
+                Pay now
+              </button>
+            ) : null}
+          </div>
+        )}
+
         <div className="grid gap-4 md:grid-cols-2">
-          {/* FROM */}
           <div className="space-y-2">
             <p className="text-sm font-medium text-slate-800">From (address)</p>
 
@@ -558,7 +630,6 @@ export function RiderRequestFormHome() {
             </div>
           </div>
 
-          {/* TO */}
           <div className="space-y-2">
             <p className="text-sm font-medium text-slate-800">To (address)</p>
 
@@ -641,7 +712,6 @@ export function RiderRequestFormHome() {
           </div>
         </div>
 
-        {/* Departure mode */}
         <div className="space-y-2">
           <span className="block text-sm font-medium text-slate-800">Departure time</span>
 
@@ -681,15 +751,18 @@ export function RiderRequestFormHome() {
           )}
         </div>
 
-        {/* Distance + passengers */}
         <div className="grid gap-3 md:grid-cols-2">
           <div>
-            <label className="mb-1 block text-sm font-medium text-slate-800">Distance (miles)</label>
+            <label className="mb-1 block text-sm font-medium text-slate-800">
+              Distance (miles)
+            </label>
             <input
               type="number"
               min={1}
               value={distanceMiles}
-              onChange={(e) => setDistanceMiles(e.target.value === "" ? "" : Number(e.target.value))}
+              onChange={(e) =>
+                setDistanceMiles(e.target.value === "" ? "" : Number(e.target.value))
+              }
               placeholder="Leave blank to auto-estimate"
               className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
             />
@@ -709,54 +782,38 @@ export function RiderRequestFormHome() {
           </div>
 
           <div>
-            <label className="mb-1 block text-sm font-medium text-slate-800">Number of passengers</label>
+            <label className="mb-1 block text-sm font-medium text-slate-800">
+              Number of passengers
+            </label>
             <input
               type="number"
               min={1}
               max={6}
               value={passengerCount}
-              onChange={(e) => setPassengerCount(e.target.value === "" ? "" : Number(e.target.value))}
+              onChange={(e) =>
+                setPassengerCount(e.target.value === "" ? "" : Number(e.target.value))
+              }
               required
               className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
             />
           </div>
         </div>
 
-        {message && (
-          <div className="rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-800">
-            {message}
-          </div>
-        )}
-
-        {error && (
-          <div className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-800">
-            <div>{error}</div>
-
-            {outstandingOcId ? (
-              <button
-                type="button"
-                onClick={() => router.push(`/rider/outstanding?oc=${encodeURIComponent(outstandingOcId)}`)}
-                className="mt-2 inline-flex rounded-full bg-slate-900 px-3 py-1.5 text-[11px] font-medium text-white hover:bg-slate-800"
-              >
-                Pay now
-              </button>
-            ) : null}
-          </div>
-        )}
-
         <button
           type="submit"
           disabled={submitting || estimating || bookingBlockedNoCard || pmLoading}
           className="rounded-full bg-indigo-600 px-4 py-2 text-xs font-medium text-white hover:bg-indigo-700 disabled:opacity-60"
         >
-          {submitting ? "Posting…" : bookingBlockedNoCard ? "Add a card to book" : "Post ride request"}
+          {submitting
+            ? "Posting…"
+            : bookingBlockedNoCard
+            ? "Add a card to book"
+            : "Post ride request"}
         </button>
       </form>
     </section>
   );
 }
-
-/* ---------- Address search box (Mapbox autocomplete) ---------- */
 
 function AddressSearchBox(props: {
   placeholder?: string;

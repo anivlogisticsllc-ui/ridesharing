@@ -1,17 +1,17 @@
 // pages/api/rider/chat-notifications.ts
 import type { NextApiRequest, NextApiResponse } from "next";
 import { getServerSession } from "next-auth";
+import { Prisma } from "@prisma/client";
+
 import { authOptions } from "../auth/[...nextauth]";
 import { prisma } from "../../../lib/prisma";
 
 type ConversationNotification = {
   conversationId: string;
   unreadCount: number;
-
   latestMessageId: string | null;
   latestMessageCreatedAt: string | null;
   latestMessageSenderId: string | null;
-
   senderType: "RIDER" | "DRIVER" | "UNKNOWN";
 };
 
@@ -62,23 +62,31 @@ export default async function handler(
       return res.status(200).json({ ok: true, totalUnread: 0, notifications: [] });
     }
 
-    const rows: ConversationNotification[] = [];
-    let totalUnread = 0;
+    const conversationIds = conversations.map((c) => c.id);
 
-    // IMPORTANT: sequential (avoids connection pool explosion)
-    for (const c of conversations) {
+    const unreadRows = await prisma.$queryRaw<
+      { conversationId: string; unreadCount: bigint }[]
+    >(Prisma.sql`
+      SELECT
+        c."id" AS "conversationId",
+        COUNT(m."id")::bigint AS "unreadCount"
+      FROM "Conversation" c
+      LEFT JOIN "Message" m
+        ON m."conversationId" = c."id"
+       AND m."createdAt" > COALESCE(c."riderLastReadAt", c."createdAt")
+       AND m."senderId" <> ${riderId}
+      WHERE c."riderId" = ${riderId}
+        AND c."id" IN (${Prisma.join(conversationIds)})
+      GROUP BY c."id"
+    `);
+
+    const unreadMap = new Map<string, number>(
+      unreadRows.map((row) => [row.conversationId, Number(row.unreadCount)])
+    );
+
+    const rows: ConversationNotification[] = conversations.map((c) => {
       const latest = c.messages[0] ?? null;
-      const since = c.riderLastReadAt ?? c.createdAt;
-
-      const unreadCount = await prisma.message.count({
-        where: {
-          conversationId: c.id,
-          createdAt: { gt: since },
-          senderId: { not: riderId }, // don't count my own messages
-        },
-      });
-
-      totalUnread += unreadCount;
+      const unreadCount = unreadMap.get(c.id) ?? 0;
 
       let senderType: "RIDER" | "DRIVER" | "UNKNOWN" = "UNKNOWN";
       if (latest) {
@@ -86,18 +94,24 @@ export default async function handler(
         else if (latest.senderId === c.driverId) senderType = "DRIVER";
       }
 
-      rows.push({
+      return {
         conversationId: c.id,
         unreadCount,
         latestMessageId: latest?.id ?? null,
         latestMessageCreatedAt: latest?.createdAt?.toISOString() ?? null,
         latestMessageSenderId: latest?.senderId ?? null,
         senderType,
-      });
-    }
+      };
+    });
 
-    const notifications = rows.filter((r) => r.unreadCount > 0);
-    return res.status(200).json({ ok: true, totalUnread, notifications });
+    const totalUnread = rows.reduce((sum, row) => sum + row.unreadCount, 0);
+    const notifications = rows.filter((row) => row.unreadCount > 0);
+
+    return res.status(200).json({
+      ok: true,
+      totalUnread,
+      notifications,
+    });
   } catch (err) {
     console.error("Error loading rider chat notifications:", err);
     return res.status(500).json({ ok: false, error: "Failed to load notifications" });

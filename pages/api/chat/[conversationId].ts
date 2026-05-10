@@ -34,7 +34,6 @@ export default async function handler(
     return res.status(400).json({ ok: false, error: "Invalid conversation id" });
   }
 
-  // Ensure this user belongs to the conversation (+ pull ride status for POST blocking)
   const convo = await prisma.conversation.findUnique({
     where: { id: conversationId },
     select: {
@@ -48,6 +47,9 @@ export default async function handler(
   if (!convo || (convo.driverId !== userId && convo.riderId !== userId)) {
     return res.status(404).json({ ok: false, error: "Conversation not found" });
   }
+
+  const isRider = convo.riderId === userId;
+  const isDriver = convo.driverId === userId;
 
   if (req.method === "GET") {
     const messages = await prisma.message.findMany({
@@ -64,11 +66,28 @@ export default async function handler(
       },
     });
 
+    try {
+      const now = new Date();
+
+      if (isRider) {
+        await prisma.conversation.update({
+          where: { id: conversationId },
+          data: { riderLastReadAt: now },
+        });
+      } else if (isDriver) {
+        await prisma.conversation.update({
+          where: { id: conversationId },
+          data: { driverLastReadAt: now },
+        });
+      }
+    } catch (err) {
+      console.error("Failed to mark conversation as read:", err);
+    }
+
     return res.status(200).json({ ok: true, messages });
   }
 
   if (req.method === "POST") {
-    // Server-side read-only enforcement
     const rideStatus = convo.ride?.status;
     if (rideStatus === "COMPLETED" || rideStatus === "CANCELLED") {
       return res.status(403).json({
@@ -100,8 +119,27 @@ export default async function handler(
       },
     });
 
+    try {
+      const now = new Date();
+
+      if (isRider) {
+        await prisma.conversation.update({
+          where: { id: conversationId },
+          data: { riderLastReadAt: now },
+        });
+      } else if (isDriver) {
+        await prisma.conversation.update({
+          where: { id: conversationId },
+          data: { driverLastReadAt: now },
+        });
+      }
+    } catch (err) {
+      console.error("Failed to update sender read marker:", err);
+    }
+
     return res.status(201).json({ ok: true, message });
   }
 
-  return res.status(405).end();
+  res.setHeader("Allow", "GET, POST");
+  return res.status(405).json({ ok: false, error: "Method not allowed" });
 }

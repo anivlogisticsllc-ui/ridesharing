@@ -22,7 +22,9 @@ async function requireDriverOrAdmin() {
   const isAdmin = Boolean((session?.user as any)?.isAdmin);
 
   if (!userId) return null;
-  if (role === "DRIVER" || role === "ADMIN" || isAdmin) return { userId, role, isAdmin };
+  if (role === "DRIVER" || role === "ADMIN" || isAdmin) {
+    return { userId, role, isAdmin };
+  }
   return null;
 }
 
@@ -33,14 +35,9 @@ function mapStripeStatusToRidePaymentStatus(stripeStatus: string): RidePaymentSt
   return RidePaymentStatus.PENDING;
 }
 
-// Buffer: 25%, min $2, max $20 (tune later)
-function computeBufferCents(estimateCents: number) {
-  const bufferPct = 0.25;
-  const minBufferCents = 200;
-  const maxBufferCents = 2000;
-
-  const computed = Math.round(estimateCents * bufferPct);
-  return Math.min(maxBufferCents, Math.max(minBufferCents, computed));
+function computeAuthorizedCents(estimateCents: number) {
+  const estimate = Math.max(50, Math.round(estimateCents));
+  return estimate * 2;
 }
 
 export async function POST(req: Request) {
@@ -51,7 +48,6 @@ export async function POST(req: Request) {
   const bookingId = String(body?.bookingId || "").trim();
   if (!bookingId) return jsonError(400, "Missing bookingId");
 
-  // Load booking + ride + rider
   const booking = await prisma.booking.findUnique({
     where: { id: bookingId },
     select: {
@@ -62,7 +58,12 @@ export async function POST(req: Request) {
       currency: true,
       riderId: true,
       rideId: true,
-      ride: { select: { driverId: true, totalPriceCents: true } },
+      ride: {
+        select: {
+          driverId: true,
+          totalPriceCents: true,
+        },
+      },
       rider: {
         select: {
           id: true,
@@ -81,8 +82,9 @@ export async function POST(req: Request) {
 
   if (!booking) return jsonError(404, "Booking not found");
 
-  // Only driver who accepted (or admin)
-  if (!auth.isAdmin && booking.ride.driverId !== auth.userId) return jsonError(403, "Forbidden");
+  if (!auth.isAdmin && booking.ride.driverId !== auth.userId) {
+    return jsonError(403, "Forbidden");
+  }
 
   if (booking.status !== BookingStatus.ACCEPTED) {
     return jsonError(400, `Cannot authorize for booking status ${booking.status}`);
@@ -92,7 +94,6 @@ export async function POST(req: Request) {
     return jsonError(400, "Booking paymentType is not CARD");
   }
 
-  // Estimate: prefer booking snapshot; fallback to ride.totalPriceCents
   const estimateCents =
     typeof booking.finalAmountCents === "number" && booking.finalAmountCents > 0
       ? booking.finalAmountCents
@@ -102,8 +103,8 @@ export async function POST(req: Request) {
     return jsonError(400, "Invalid estimated amount for authorization.");
   }
 
-  const bufferCents = computeBufferCents(estimateCents);
-  const authorizedCents = estimateCents + bufferCents;
+  const authorizedCents = computeAuthorizedCents(estimateCents);
+  const bufferCents = authorizedCents - estimateCents;
 
   const rider = booking.rider;
   if (!rider?.stripeCustomerId) {
@@ -119,21 +120,26 @@ export async function POST(req: Request) {
     return jsonError(400, "No default payment method found for rider.");
   }
 
-  // Idempotency per RIDE
   const idempotencyKey = `ride_auth_${booking.rideId}`;
 
-  // If already authorized for this ride and not captured, reuse it
   const existing = await prisma.ridePayment.findFirst({
     where: {
       rideId: booking.rideId,
       paymentType: PaymentType.CARD,
       stripePaymentIntentId: { not: null },
       capturedAt: null,
-      status: { in: [RidePaymentStatus.AUTHORIZED, RidePaymentStatus.PENDING] },
+      status: {
+        in: [RidePaymentStatus.AUTHORIZED, RidePaymentStatus.PENDING],
+      },
       idempotencyKey,
     },
     orderBy: { createdAt: "desc" },
-    select: { stripePaymentIntentId: true, status: true, amountCents: true, finalAmountCents: true },
+    select: {
+      stripePaymentIntentId: true,
+      status: true,
+      amountCents: true,
+      finalAmountCents: true,
+    },
   });
 
   if (existing?.stripePaymentIntentId) {
@@ -144,6 +150,10 @@ export async function POST(req: Request) {
       status: existing.status,
       authorizedAmountCents: existing.amountCents,
       estimatedAmountCents: existing.finalAmountCents,
+      bufferCents:
+        typeof existing.amountCents === "number" && typeof existing.finalAmountCents === "number"
+          ? Math.max(0, existing.amountCents - existing.finalAmountCents)
+          : 0,
     });
   }
 
@@ -153,7 +163,7 @@ export async function POST(req: Request) {
   try {
     pi = await stripe.paymentIntents.create(
       {
-        amount: authorizedCents, // ✅ authorize buffered amount
+        amount: authorizedCents,
         currency: stripeCurrency,
         customer: rider.stripeCustomerId,
         payment_method: defaultPm,
@@ -168,12 +178,15 @@ export async function POST(req: Request) {
           estimatedCents: String(estimateCents),
           authorizedCents: String(authorizedCents),
           bufferCents: String(bufferCents),
+          authModel: "2x_estimate",
         },
       },
       { idempotencyKey }
     );
   } catch (e: any) {
-    return jsonError(400, "Stripe authorization failed", { message: e?.message || String(e) });
+    return jsonError(400, "Stripe authorization failed", {
+      message: e?.message || String(e),
+    });
   }
 
   const mappedStatus = mapStripeStatusToRidePaymentStatus(pi.status);
@@ -184,32 +197,24 @@ export async function POST(req: Request) {
   await prisma.ridePayment.create({
     data: {
       rideId: booking.rideId,
-      riderId: booking.riderId!, // expected in your flow
-
-      // ✅ store both (Option 1)
-      amountCents: authorizedCents,     // authorized (estimate + buffer)
-      finalAmountCents: estimateCents,  // estimated final (will overwrite at capture with actual)
+      riderId: booking.riderId!,
+      amountCents: authorizedCents,
+      finalAmountCents: estimateCents,
       currency: stripeCurrency,
-
       provider: "STRIPE",
       status: mappedStatus,
-      authorizedAt: mappedStatus === RidePaymentStatus.AUTHORIZED ? new Date() : null,
-
+      authorizedAt:
+        mappedStatus === RidePaymentStatus.AUTHORIZED ? new Date() : null,
       baseAmountCents: base,
       discountCents: discount,
-
       idempotencyKey,
       paymentType: PaymentType.CARD,
-
       stripeCustomerId: rider.stripeCustomerId,
       stripePaymentIntentId: pi.id,
-
-      // store the PaymentMethod row id if we have it
       paymentMethodId: rider.paymentMethods?.[0]?.id ?? null,
-    },
+    } as any,
   });
 
-  // convenience stamp on booking
   if (rider.paymentMethods?.[0]?.id) {
     await prisma.booking.update({
       where: { id: booking.id },

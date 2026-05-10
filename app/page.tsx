@@ -27,8 +27,6 @@ export default async function Home() {
   const session = await getServerSession(authOptions);
   const role = (session?.user as any)?.role as "RIDER" | "DRIVER" | undefined;
 
-  // Only rides that are OPEN and have no ACCEPTED booking
-  // Include the PENDING booking so we can show CASH vs CARD + discounted total correctly
   const rides = await prisma.ride.findMany({
     where: {
       status: "OPEN",
@@ -60,19 +58,20 @@ export default async function Home() {
 
   return (
     <main className="min-h-[calc(100vh-4rem)] bg-slate-50">
-      <div className="mx-auto max-w-6xl px-4 py-10 space-y-10">
-        {/* Hero */}
-        <section className="grid gap-8 md:grid-cols-2 items-center">
+      <div className="mx-auto max-w-6xl space-y-10 px-4 py-10">
+        <section className="grid items-center gap-8 md:grid-cols-2">
           <div>
-            <p className="text-xs font-semibold tracking-wide text-indigo-600 uppercase">
+            <p className="text-xs font-semibold uppercase tracking-wide text-indigo-600">
               Community Ride Sharing
             </p>
-            <h1 className="mt-2 text-3xl md:text-4xl font-semibold text-slate-900">
+
+            <h1 className="mt-2 text-3xl font-semibold text-slate-900 md:text-4xl">
               Share rides, save money,
               <br />
               travel together.
             </h1>
-            <p className="mt-4 text-sm md:text-base text-slate-600">
+
+            <p className="mt-4 text-sm text-slate-600 md:text-base">
               Riders pay a simple, transparent price. Drivers earn extra cash on
               trips they&apos;re already taking. Membership keeps the platform
               safe and sustainable for everyone.
@@ -82,6 +81,7 @@ export default async function Home() {
               <p className="text-xs font-semibold uppercase tracking-wide text-emerald-700">
                 Membership – first month free
               </p>
+
               <p className="mt-2 text-sm text-slate-800">
                 Both <span className="font-semibold">driver</span> and{" "}
                 <span className="font-semibold">rider</span> plans start with a{" "}
@@ -90,7 +90,8 @@ export default async function Home() {
                 </span>
                 . No payment is required during setup.
               </p>
-              <ul className="mt-2 space-y-1 text-xs text-slate-700 list-disc list-inside">
+
+              <ul className="mt-2 list-inside list-disc space-y-1 text-xs text-slate-700">
                 <li>Drivers can post routes and receive booking requests.</li>
                 <li>Riders can browse routes and request seats.</li>
                 <li>Decide after the trial whether to continue on a paid plan.</li>
@@ -99,10 +100,11 @@ export default async function Home() {
 
             {!session && <MembershipSelector />}
 
-            <div className="mt-6 rounded-2xl bg-white/90 border border-slate-100 p-4 shadow-sm">
-              <h2 className="text-sm font-semibold text-slate-800 mb-1">
+            <div className="mt-6 rounded-2xl border border-slate-100 bg-white/90 p-4 shadow-sm">
+              <h2 className="mb-1 text-sm font-semibold text-slate-800">
                 Pricing model
               </h2>
+
               <p className="text-sm text-slate-600">
                 Riders pay a{" "}
                 <span className="font-semibold text-slate-900">$3.00 booking fee</span>{" "}
@@ -110,40 +112,46 @@ export default async function Home() {
                 <span className="font-semibold text-slate-900">$2.00 per mile</span>{" "}
                 for each trip.
               </p>
+
               <p className="mt-2 text-xs text-slate-500">
                 Example: a 10 mile trip costs $3.00 + (10 × $2.00) = $23.00 total for the ride.
               </p>
             </div>
           </div>
 
-          {/* Illustration card */}
           <div className="md:justify-self-end">
             <div className="relative overflow-hidden rounded-3xl bg-gradient-to-br from-indigo-600 via-sky-500 to-emerald-400 p-[1px] shadow-lg">
-              <div className="bg-slate-950/95 rounded-[22px] p-5 h-full">
-                <p className="text-xs font-medium text-slate-300 mb-3">Live example</p>
+              <div className="h-full rounded-[22px] bg-slate-950/95 p-5">
+                <p className="mb-3 text-xs font-medium text-slate-300">Live example</p>
+
                 <div className="space-y-3 text-xs text-slate-200">
                   <div className="flex items-center justify-between">
                     <span>San Francisco → San Jose</span>
                     <span className="font-semibold text-emerald-300">$105.00</span>
                   </div>
+
                   <p className="text-slate-400">
                     51 miles · Total ride price: $3.00 booking + $102.00 distance = $105.00.
                   </p>
+
                   <div className="mt-3 grid grid-cols-3 gap-2 text-[11px]">
-                    <div className="rounded-xl bg-slate-900/70 border border-slate-800 p-2">
+                    <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-2">
                       <p className="text-slate-400">Booking</p>
                       <p className="font-semibold text-slate-50">$3.00</p>
                     </div>
-                    <div className="rounded-xl bg-slate-900/70 border border-slate-800 p-2">
+
+                    <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-2">
                       <p className="text-slate-400">Distance</p>
                       <p className="font-semibold text-slate-50">$102.00</p>
                     </div>
-                    <div className="rounded-xl bg-slate-900/70 border border-slate-800 p-2">
+
+                    <div className="rounded-xl border border-slate-800 bg-slate-900/70 p-2">
                       <p className="text-slate-400">Total</p>
                       <p className="font-semibold text-emerald-300">$105.00</p>
                     </div>
                   </div>
                 </div>
+
                 <div className="mt-4 text-[11px] text-slate-500">
                   Drivers see their earnings after platform fees in their dashboard.
                 </div>
@@ -152,10 +160,8 @@ export default async function Home() {
           </div>
         </section>
 
-        {/* Rider “Request a ride” */}
         {session && role === "RIDER" && <RiderRequestFormHome />}
 
-        {/* Available rides – guests + drivers */}
         {showAvailableRidesSection && (
           <section className="space-y-3">
             <h2 className="text-xl font-semibold text-slate-900">Available rides</h2>
@@ -185,7 +191,7 @@ export default async function Home() {
                   return (
                     <li
                       key={ride.id}
-                      className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm flex flex-col gap-1 md:flex-row md:items-center md:justify-between"
+                      className="flex flex-col gap-1 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm md:flex-row md:items-center md:justify-between"
                     >
                       <div>
                         <p className="text-sm font-semibold text-slate-900">
@@ -212,6 +218,7 @@ export default async function Home() {
                           <span className="inline-flex items-center rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-semibold text-slate-700">
                             Pay: {payLabel}
                           </span>
+
                           {payLabel === "CASH" && (pending?.cashDiscountBps ?? 0) > 0 && (
                             <span className="inline-flex items-center rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-semibold text-emerald-700">
                               CASH {(pending!.cashDiscountBps! / 100).toFixed(0)}% off
@@ -230,6 +237,7 @@ export default async function Home() {
                             {passengerCount === 1 ? "passenger" : "passengers"}
                           </p>
                         </div>
+
                         <BookRideButton rideId={ride.id} />
                       </div>
                     </li>

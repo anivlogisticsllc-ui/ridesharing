@@ -7,6 +7,7 @@ import {
   DisputeStatus,
   PaymentType,
   RefundStatus,
+  RidePaymentStatus,
   RideStatus,
 } from "@prisma/client";
 
@@ -454,6 +455,39 @@ export async function buildDriverPayoutView(
   const uniqueBookings = Array.from(latestBookingByRideId.values());
   const rideIds = uniqueBookings.map((booking) => booking.rideId);
 
+  const ridePayments = rideIds.length
+    ? await prisma.ridePayment.findMany({
+        where: {
+          rideId: { in: rideIds },
+          status: {
+            in: [
+              RidePaymentStatus.AUTHORIZED,
+              RidePaymentStatus.PENDING,
+              RidePaymentStatus.SUCCEEDED,
+            ],
+          },
+        },
+        orderBy: { createdAt: "desc" },
+        select: {
+          rideId: true,
+          baseAmountCents: true,
+          discountCents: true,
+          finalAmountCents: true,
+          tipAmountCents: true,
+          tipPercent: true,
+          tipStatus: true,
+        },
+      })
+    : [];
+
+const latestPaymentByRideId = new Map<string, (typeof ridePayments)[number]>();
+
+for (const payment of ridePayments) {
+  if (!latestPaymentByRideId.has(payment.rideId)) {
+    latestPaymentByRideId.set(payment.rideId, payment);
+  }
+}
+
   const disputes = rideIds.length
     ? await prisma.dispute.findMany({
         where: {
@@ -538,9 +572,14 @@ export async function buildDriverPayoutView(
     const ride = booking.ride;
     if (!ride?.departureTime) continue;
 
+    const latestPayment = latestPaymentByRideId.get(booking.rideId);
+
     const rideEstimateCents = asNonNegativeCents(ride.totalPriceCents);
+
     const bookingFinalAmountCents =
-      asNonNegativeCents(booking.finalAmountCents) || rideEstimateCents;
+      asNonNegativeCents(latestPayment?.finalAmountCents) ||
+      asNonNegativeCents(booking.finalAmountCents) ||
+      rideEstimateCents;
 
     const dispute = disputeByRideId.get(booking.rideId);
     const refundAmountCents = Math.min(

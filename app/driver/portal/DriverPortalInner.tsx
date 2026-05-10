@@ -1,3 +1,5 @@
+// app/driver/portal/DriverPortalInner.tsx
+
 "use client";
 
 import { useEffect, useMemo, useState, type FormEvent } from "react";
@@ -42,6 +44,8 @@ type DriverRide = {
   conversationId: string | null;
   unreadCount?: number;
 
+  fareCents: number;
+
   paymentType?: PaymentType | null;
   cashDiscountBps?: number | null;
 
@@ -54,6 +58,9 @@ type DriverRide = {
   hasOutstandingCharge?: boolean;
   outstandingChargeId?: string | null;
   outstandingChargeStatus?: OutstandingChargeStatusUI;
+
+  riderRequestedCompletion?: boolean;
+  riderRequestedCompletionAt?: string | null;
 };
 
 type PortalRidesResponse =
@@ -205,6 +212,8 @@ function normalizeRide(raw: DriverRide): DriverRide {
     hasOutstandingCharge: Boolean((raw as any).hasOutstandingCharge),
     outstandingChargeId: (raw as any).outstandingChargeId ?? null,
     outstandingChargeStatus: (raw as any).outstandingChargeStatus ?? null,
+    riderRequestedCompletion: Boolean((raw as any).riderRequestedCompletion),
+    riderRequestedCompletionAt: (raw as any).riderRequestedCompletionAt ?? null,
   };
 }
 
@@ -213,6 +222,22 @@ function formatCountdown(msLeft: number) {
   const m = Math.floor(s / 60);
   const r = s % 60;
   return `${m}:${String(r).padStart(2, "0")}`;
+}
+
+function formatRelativeAge(fromIso: string | null | undefined): string | null {
+  const d = safeDate(fromIso);
+  if (!d) return null;
+
+  const diffMs = Math.max(0, Date.now() - d.getTime());
+  const totalSeconds = Math.floor(diffMs / 1000);
+
+  if (totalSeconds < 60) return `${totalSeconds}s ago`;
+
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  if (totalMinutes < 60) return `${totalMinutes}m ago`;
+
+  const totalHours = Math.floor(totalMinutes / 60);
+  return `${totalHours}h ago`;
 }
 
 function reportWindowState(ride: DriverRide): { canReport: boolean; msLeft: number; alreadyReported: boolean } {
@@ -276,6 +301,20 @@ function OutstandingChargeBadge(props: { status?: OutstandingChargeStatusUI; id?
   );
 }
 
+function RiderCompletionRequestBanner(props: { requestedAt?: string | null }) {
+  const age = formatRelativeAge(props.requestedAt ?? null);
+
+  return (
+    <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+      <p className="font-semibold">Rider requested trip completion.</p>
+      <p className="mt-1 text-[11px] opacity-90">
+        Please stop the meter if the trip has ended.
+        {age ? ` Requested ${age}.` : ""}
+      </p>
+    </div>
+  );
+}
+
 /* ---------- Component ---------- */
 
 export default function DriverPortalInner() {
@@ -319,9 +358,12 @@ export default function DriverPortalInner() {
   const sessionUser = (session?.user ?? null) as SessionUser | null;
   const sessionRole = sessionUser?.role;
 
-  async function loadRides() {
+  async function loadRides(opts?: { silent?: boolean }) {
+    const silent = opts?.silent ?? false;
+
     try {
-      setRidesLoading(true);
+      if (!silent) setRidesLoading(true);
+
       const res = await fetch("/api/driver/portal-rides", { cache: "no-store" });
       const data = (await res.json().catch(() => null)) as PortalRidesResponse | null;
 
@@ -338,7 +380,7 @@ export default function DriverPortalInner() {
       console.error("Error loading driver rides:", err);
       setRidesError(message);
     } finally {
-      setRidesLoading(false);
+      if (!silent) setRidesLoading(false);
     }
   }
 
@@ -396,6 +438,22 @@ export default function DriverPortalInner() {
     loadMembership();
     loadRides();
   }, [session, status, router, sessionRole]);
+
+  useEffect(() => {
+    if (status === "loading") return;
+    if (!session) return;
+    if (sessionRole !== "DRIVER" && sessionRole !== "BOTH") return;
+
+    const interval = setInterval(() => {
+      if (activeChat) return;
+
+      loadRides({ silent: true }).catch((err) => {
+        console.error("Driver portal polling failed:", err);
+      });
+    }, 8000);
+
+    return () => clearInterval(interval);
+  }, [status, session, sessionRole, activeChat]);
 
   useEffect(() => {
     if (activeChat) return;
@@ -587,6 +645,8 @@ export default function DriverPortalInner() {
               ? data.billing.finalFareCents
               : summary?.fareCents ?? ride.totalPriceCents ?? null,
           unreadCount: 0,
+          riderRequestedCompletion: false,
+          riderRequestedCompletionAt: null,
         };
 
         setCompletedRides((prevCompleted) => {
@@ -808,7 +868,6 @@ export default function DriverPortalInner() {
                 const chatDisabled = !canChat || isInRoute;
                 const riderLabel = ride.riderPublicId || ride.riderName || "there";
                 const isBusy = busyRideId === ride.rideId;
-
                 const unread = ride.unreadCount ?? 0;
 
                 return (
@@ -878,16 +937,23 @@ export default function DriverPortalInner() {
                       </button>
                     </div>
 
+                    {ride.status === "IN_ROUTE" && ride.riderRequestedCompletion ? (
+                      <RiderCompletionRequestBanner requestedAt={ride.riderRequestedCompletionAt} />
+                    ) : null}
+
                     <TripMeter
+                      rideId={ride.rideId}
                       status={meterStatus}
                       tripStartedAt={ride.tripStartedAt}
                       tripCompletedAt={ride.tripCompletedAt}
                       paymentType={ride.paymentType ?? null}
                       cashDiscountBps={ride.cashDiscountBps ?? null}
+                      initialDistanceMiles={ride.distanceMiles ?? null}
+                      initialFareCents={ride.fareCents ?? null}
                       onStartRide={() => handleStartRide(ride.rideId)}
                       onCompleteRide={(summary) => handleCompleteRide(ride.rideId, summary)}
-                    />
-                  </li>
+                    />                  
+                    </li>
                 );
               })}
             </ul>

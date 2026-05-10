@@ -1,7 +1,7 @@
 // pages/api/receipt/email.ts
 import type { NextApiRequest, NextApiResponse } from "next";
 import { getServerSession } from "next-auth";
-import { DisputeStatus, RideStatus, PaymentType } from "@prisma/client";
+import { DisputeStatus, RideStatus, PaymentType, RidePaymentStatus } from "@prisma/client";
 
 import { authOptions } from "../auth/[...nextauth]";
 import { prisma } from "@/lib/prisma";
@@ -103,6 +103,30 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     },
   });
 
+  const latestPayment = await prisma.ridePayment.findFirst({
+    where: {
+      rideId: ride.id,
+       ...(booking.riderId ? { riderId: booking.riderId } : {}),
+      paymentType: PaymentType.CARD,
+      status: {
+        in: [
+          RidePaymentStatus.AUTHORIZED,
+          RidePaymentStatus.PENDING,
+          RidePaymentStatus.SUCCEEDED,
+        ],
+      },
+    },
+    orderBy: { createdAt: "desc" },
+    select: {
+      baseAmountCents: true,
+      discountCents: true,
+      finalAmountCents: true,
+      tipAmountCents: true,
+      tipPercent: true,
+      tipStatus: true,
+    },
+  });
+
   const originDisplay =
     toStr((ride as any).originAddress).trim() || toStr((ride as any).originCity).trim();
 
@@ -111,9 +135,12 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
 
   // Source of truth: booking amounts first, then ride fallback
   const base =
+    asInt(latestPayment?.baseAmountCents) ??
     asInt((booking as any).baseAmountCents) ??
     asInt((ride as any).totalPriceCents) ??
     0;
+
+  const tip = asInt(latestPayment?.tipAmountCents) ?? 0;
 
   const disc =
     booking.originalPaymentType === PaymentType.CASH &&
@@ -121,16 +148,20 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     booking.cashNotPaidAt &&
     booking.fallbackCardChargedAt
       ? 0
-      : asInt((booking as any).discountCents) ?? 0;
+      : asInt(latestPayment?.discountCents) ??
+        asInt((booking as any).discountCents) ??
+        0;
 
   const final =
+    asInt(latestPayment?.finalAmountCents) ??
     asInt((booking as any).finalAmountCents) ??
-    Math.max(0, base - disc);
+    Math.max(0, base - disc + tip);
 
   const netAfterDiscount = Math.max(0, base - disc);
-  const fee = Math.max(0, final - netAfterDiscount);
+  const fee = Math.max(0, final - netAfterDiscount - tip);
 
   const baseFareCents = clampCents(base);
+  const tipAmountCents = clampCents(tip);
   const discountCents = clampCents(disc);
   const convenienceFeeCents = clampCents(fee);
   const finalTotalCents = clampCents(final);
@@ -161,6 +192,9 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse<
     originalPaymentType: toPaymentLabel(booking.originalPaymentType),
 
     baseFareCents,
+    tipAmountCents,
+    tipPercent: latestPayment?.tipPercent ?? null,
+    tipStatus: latestPayment?.tipStatus ?? null,
     convenienceFeeCents,
     discountCents,
     finalTotalCents,

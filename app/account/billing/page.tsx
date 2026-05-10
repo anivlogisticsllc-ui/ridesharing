@@ -1,3 +1,5 @@
+// app/account/billing/page.tsx
+
 "use client";
 
 import React, { useEffect, useMemo, useState } from "react";
@@ -16,8 +18,18 @@ type RiderPayment = {
   createdAt: string;
   status: string;
   currency: string;
+
   amountCents: number;
+  baseFareCents?: number;
+  tipCents?: number;
+  discountCents?: number;
+  convenienceFeeCents?: number;
+  totalChargedCents?: number;
+
   paymentType: "CARD" | "CASH" | "UNKNOWN";
+  tipStatus?: string | null;
+  tipPercent?: number | null;
+
   refundIssued?: boolean;
   refundAmountCents?: number;
   refundIssuedAt?: string | null;
@@ -206,6 +218,13 @@ function safeCents(v: unknown) {
 
 function isRefundRow(p: RiderPayment) {
   return String(p.status || "").toUpperCase() === "REFUNDED" || (p.amountCents || 0) < 0;
+}
+
+function riderTotalCharged(p: RiderPayment) {
+  return safeCents(
+    p.totalChargedCents ??
+      p.amountCents
+  );
 }
 
 function methodLabel(p: RiderPayment) {
@@ -1118,14 +1137,19 @@ export default function AccountBillingPage() {
                                   </td>
                                   <td className="px-4 py-2 text-slate-700">
                                     <div>{riderRouteLabel(p)}</div>
-                                  </td>
-                                  <td className="px-4 py-2">{statusPill(p.status)}</td>
+                                    <div className="mt-1 text-xs text-slate-500">
+                                      Base {money(safeCents(p.baseFareCents), p.currency)} · Tip {money(safeCents(p.tipCents), p.currency)}
+                                      {typeof p.tipPercent === "number" ? ` (${p.tipPercent}%)` : ""} ·
+                                      Discount {money(safeCents(p.discountCents), p.currency)} ·
+                                      Fee {money(safeCents(p.convenienceFeeCents), p.currency)}
+                                    </div>
+                                  </td>                                  <td className="px-4 py-2">{statusPill(p.status)}</td>
                                   <td className="px-4 py-2 text-slate-700">{methodLabel(p)}</td>
                                   <td className="px-4 py-2 text-slate-700">
                                     {finalPaymentLabel(p, group)}
                                   </td>
                                   <td className="px-4 py-2 text-right font-medium text-slate-900">
-                                    {money(p.amountCents, p.currency)}
+                                    {money(riderTotalCharged(p), p.currency)}
                                   </td>
                                 </tr>
                               ))}

@@ -1,12 +1,16 @@
-// app/rider/portal/page.tsx
 "use client";
 
 import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
+import { RiderTripMeter } from "@/components/rider/RiderTripMeter";
 
 type BookingStatus = "PENDING" | "CONFIRMED" | "COMPLETED" | "CANCELLED" | "EXPIRED";
 type PaymentType = "CARD" | "CASH";
+type RiderMeterStatus = "OPEN" | "FULL" | "IN_ROUTE" | "COMPLETED";
+type TipPercent = 10 | 15 | 20;
+
+const POST_TRIP_REVIEW_WINDOW_MS = 10 * 60 * 1000;
 
 type Booking = {
   id: string;
@@ -33,8 +37,13 @@ type Booking = {
 
   baseTotalPriceCents?: number | null;
   effectiveTotalPriceCents?: number | null;
-
   totalPriceCents?: number | null;
+
+  tipStatus?: "ELIGIBLE" | "SUCCEEDED" | "SKIPPED" | "FAILED" | "NOT_OFFERED" | null;
+  tipAmountCents?: number | null;
+  tipPercent?: number | null;
+  tipChargedAt?: string | null;
+  tipSkippedAt?: string | null;
 
   originalPaymentType?: PaymentType | null;
   originalCashDiscountBps?: number | null;
@@ -158,7 +167,38 @@ function formatDateTime(value: string | null | undefined): string | null {
   return d ? d.toLocaleString() : null;
 }
 
-// Dedupe: prefer real booking over ride-only
+function toRiderMeterStatus(rideStatus: string): RiderMeterStatus {
+  if (rideStatus === "IN_ROUTE") return "IN_ROUTE";
+  if (rideStatus === "COMPLETED") return "COMPLETED";
+  return "OPEN";
+}
+
+function getTipAmountCents(baseFareCents: number, percent: TipPercent | null) {
+  if (!percent) return 0;
+  return Math.round((baseFareCents * percent) / 100);
+}
+
+function isWithinPostTripReviewWindow(booking: Booking) {
+  if (booking.rideStatus !== "COMPLETED" && booking.status !== "COMPLETED") {
+    return false;
+  }
+
+  if (booking.paymentType !== "CARD") {
+    return false;
+  }
+
+  if (booking.tipStatus !== "ELIGIBLE") {
+    return false;
+  }
+
+  const completedAt = safeDate(booking.tripCompletedAt);
+  if (!completedAt) {
+    return false;
+  }
+
+  return Date.now() - completedAt.getTime() <= POST_TRIP_REVIEW_WINDOW_MS;
+}
+
 function dedupeByRideId(list: Booking[]): Booking[] {
   const map = new Map<string, Booking>();
 
@@ -181,7 +221,7 @@ function dedupeByRideId(list: Booking[]): Booking[] {
     const score = (x: Booking) => {
       if (x.status === "COMPLETED" || x.rideStatus === "COMPLETED") return 30;
       if (x.rideStatus === "IN_ROUTE") return 20;
-      if (x.status === "CONFIRMED") return 10;
+      if (x.rideStatus === "ACCEPTED" || x.status === "CONFIRMED") return 10;
       return 0;
     };
 
@@ -227,11 +267,9 @@ function PaymentBadge(props: { booking: Booking }) {
   );
 }
 
-/* ============================================
- *              MAIN PAGE
- * ==========================================*/
-
 export default function RiderPortalPage() {
+  const router = useRouter();
+
   const [bookings, setBookings] = useState<Booking[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -246,10 +284,21 @@ export default function RiderPortalPage() {
   const [chatNotifications, setChatNotifications] = useState<Record<string, number>>({});
   const [lastSeenMessageId, setLastSeenMessageId] = useState<Record<string, string | null>>({});
 
+  const [requestCompleteBusyRideId, setRequestCompleteBusyRideId] = useState<string | null>(null);
+  const [requestCompleteSentByRideId, setRequestCompleteSentByRideId] = useState<Record<string, boolean>>({});
+
+  const [selectedTipPercentByRideId, setSelectedTipPercentByRideId] = useState<Record<string, TipPercent | null>>({});
+  const [dismissedTipReviewByRideId, setDismissedTipReviewByRideId] = useState<Record<string, boolean>>({});
+  const [tipBusyRideId, setTipBusyRideId] = useState<string | null>(null);
+
+  const [liveRideBannerMessage, setLiveRideBannerMessage] = useState<string | null>(null);
+
   const lastSeenRef = useRef<Record<string, string | null>>({});
   const activeChatRef = useRef<{ conversationId: string; readOnly: boolean } | null>(null);
   const bookingsIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const chatIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const activeRideSectionRef = useRef<HTMLDivElement | null>(null);
+  const previousActiveRideIdsRef = useRef<string[]>([]);
 
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [toastVariant, setToastVariant] = useState<"success" | "error">("success");
@@ -282,7 +331,9 @@ export default function RiderPortalPage() {
       const res = await fetch("/api/rider/bookings", { method: "GET" });
       if (!res.ok) {
         const text = await res.text().catch(() => "");
-        if (!silent) setError(`Failed to load bookings. Status ${res.status}: ${text || "Unknown error"}`);
+        if (!silent) {
+          setError(`Failed to load bookings. Status ${res.status}: ${text || "Unknown error"}`);
+        }
         return;
       }
 
@@ -301,6 +352,7 @@ export default function RiderPortalPage() {
     }
   }
 
+
   useEffect(() => {
     let cancelled = false;
 
@@ -309,16 +361,54 @@ export default function RiderPortalPage() {
       await refreshBookings({ silent: false });
     })();
 
-    bookingsIntervalRef.current = setInterval(() => {
-      refreshBookings({ silent: true });
-    }, 25_000);
-
     return () => {
       cancelled = true;
-      if (bookingsIntervalRef.current) clearInterval(bookingsIntervalRef.current);
-      bookingsIntervalRef.current = null;
     };
   }, []);
+
+  const hasPotentialLiveRide = useMemo(() => {
+    return bookings.some(
+      (b) =>
+        b.rideStatus === "IN_ROUTE" ||
+        b.rideStatus === "ACCEPTED" ||
+        (b.status === "CONFIRMED" &&
+          b.rideStatus !== "COMPLETED" &&
+          b.rideStatus !== "CANCELLED")
+    );
+  }, [bookings]);
+
+  useEffect(() => {
+    const intervalMs = hasPotentialLiveRide ? 15000 : 45000;
+
+    const tick = async () => {
+      await refreshBookings({ silent: true });
+    };
+
+    bookingsIntervalRef.current = setInterval(() => {
+      void tick();
+    }, intervalMs);
+
+    const handleVisibility = () => {
+      if (document.visibilityState === "visible") {
+        void tick();
+      }
+    };
+
+    const handleFocus = () => {
+      void tick();
+    };
+
+    document.addEventListener("visibilitychange", handleVisibility);
+    window.addEventListener("focus", handleFocus);
+
+    return () => {
+      if (bookingsIntervalRef.current) clearInterval(bookingsIntervalRef.current);
+      bookingsIntervalRef.current = null;
+
+      document.removeEventListener("visibilitychange", handleVisibility);
+      window.removeEventListener("focus", handleFocus);
+    };
+  }, [hasPotentialLiveRide]);
 
   useEffect(() => {
     let cancelled = false;
@@ -363,10 +453,7 @@ export default function RiderPortalPage() {
             }
 
             const lastSeenId = seenMap[convId] ?? null;
-
-            const shouldBeUnread =
-              n.senderType === "DRIVER" &&
-              latestId !== lastSeenId;
+            const shouldBeUnread = n.senderType === "DRIVER" && latestId !== lastSeenId;
 
             if (shouldBeUnread) {
               if ((next[convId] ?? 0) !== 1) {
@@ -401,8 +488,8 @@ export default function RiderPortalPage() {
       }
     }
 
-    pollChat();
-    chatIntervalRef.current = setInterval(pollChat, 8_000);
+    void pollChat();
+    chatIntervalRef.current = setInterval(pollChat, 8000);
 
     return () => {
       cancelled = true;
@@ -430,9 +517,7 @@ export default function RiderPortalPage() {
     const completedRaw = bookings.filter(isCompletedBooking);
 
     active.sort((a, b) => (safeDate(a.departureTime)?.getTime() ?? 0) - (safeDate(b.departureTime)?.getTime() ?? 0));
-    upcomingRaw.sort(
-      (a, b) => (safeDate(a.departureTime)?.getTime() ?? 0) - (safeDate(b.departureTime)?.getTime() ?? 0)
-    );
+    upcomingRaw.sort((a, b) => (safeDate(a.departureTime)?.getTime() ?? 0) - (safeDate(b.departureTime)?.getTime() ?? 0));
     completedRaw.sort((a, b) => {
       const da = safeDate(a.tripCompletedAt || a.departureTime)?.getTime() ?? 0;
       const db = safeDate(b.tripCompletedAt || b.departureTime)?.getTime() ?? 0;
@@ -442,7 +527,56 @@ export default function RiderPortalPage() {
     return { activeRides: active, upcoming: upcomingRaw, completed: completedRaw };
   }, [bookings]);
 
-  const cancelledCount = useMemo(() => bookings.filter((b) => b.status === "CANCELLED").length, [bookings]);
+  useEffect(() => {
+    const currentActiveIds = activeRides.map((r) => r.rideId).sort();
+    const previousActiveIds = previousActiveRideIdsRef.current;
+    const hadNoActiveRide = previousActiveIds.length === 0;
+    const hasActiveRideNow = currentActiveIds.length > 0;
+
+    if (hadNoActiveRide && hasActiveRideNow) {
+      setActiveTab("UPCOMING");
+      setLiveRideBannerMessage("Your trip is now live. Meter started.");
+      setTimeout(() => {
+        activeRideSectionRef.current?.scrollIntoView({
+          behavior: "smooth",
+          block: "start",
+        });
+      }, 120);
+    }
+
+    previousActiveRideIdsRef.current = currentActiveIds;
+  }, [activeRides]);
+
+
+
+  const postTripReviewRides = useMemo(() => {
+    return completed
+      .filter(
+        (b) =>
+          isWithinPostTripReviewWindow(b) &&
+          !dismissedTipReviewByRideId[b.rideId]
+      )
+      .sort((a, b) => {
+        const da = safeDate(a.tripCompletedAt)?.getTime() ?? 0;
+        const db = safeDate(b.tripCompletedAt)?.getTime() ?? 0;
+        return db - da;
+      });
+  }, [completed, dismissedTipReviewByRideId]);
+
+  const postTripReviewRideIds = useMemo(
+    () => new Set(postTripReviewRides.map((b) => b.rideId)),
+    [postTripReviewRides]
+  );
+
+  const completedHistory = useMemo(
+    () => completed.filter((b) => !postTripReviewRideIds.has(b.rideId)),
+    [completed, postTripReviewRideIds]
+  );
+
+  const cancelledCount = useMemo(
+    () => bookings.filter((b) => b.status === "CANCELLED").length,
+    [bookings]
+  );
   const total = bookings.length;
 
   function applyCustomRange() {
@@ -499,7 +633,7 @@ export default function RiderPortalPage() {
 
   const filteredCompleted = useMemo(
     () =>
-      completed.filter((b) => {
+      completedHistory.filter((b) => {
         if (!inDateRange(b)) return false;
         if (normalizedSearch) {
           const text = `${b.originCity} ${b.destinationCity}`.toLowerCase();
@@ -507,7 +641,7 @@ export default function RiderPortalPage() {
         }
         return true;
       }),
-    [completed, completedFilter, customFrom, customTo, normalizedSearch]
+    [completedHistory, completedFilter, customFrom, customTo, normalizedSearch]
   );
 
   const totalCompletedShown = filteredCompleted.length;
@@ -519,6 +653,98 @@ export default function RiderPortalPage() {
   }, 0);
 
   const avgMiles = totalCompletedShown ? totalMiles / totalCompletedShown : 0;
+
+  function handleSelectTipPercent(rideId: string, percent: TipPercent) {
+    setSelectedTipPercentByRideId((prev) => ({ ...prev, [rideId]: percent }));
+  }
+
+  async function handleSkipTipReview(rideId: string) {
+    try {
+      setTipBusyRideId(rideId);
+      setToastMessage(null);
+
+      const res = await fetch("/api/rider/skip-tip", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ rideId }),
+      });
+
+      const data = await res.json().catch(() => null);
+
+      if (!res.ok || !data?.ok) {
+        setToastVariant("error");
+        setToastMessage(data?.error || "Failed to skip tip.");
+        return;
+      }
+
+      setDismissedTipReviewByRideId((prev) => ({ ...prev, [rideId]: true }));
+      setSelectedTipPercentByRideId((prev) => ({ ...prev, [rideId]: null }));
+
+      setToastVariant("success");
+      setToastMessage("Tip skipped.");
+
+      await refreshBookings({ silent: true });
+    } catch (err) {
+      console.error("Skip tip error:", err);
+      setToastVariant("error");
+      setToastMessage("Failed to skip tip.");
+    } finally {
+      setTipBusyRideId(null);
+    }
+  }
+
+  async function handleSubmitTip(booking: Booking) {
+    const rideId = booking.rideId;
+    const percent = selectedTipPercentByRideId[rideId] ?? null;
+    const fareCents = getDisplayFareCents(booking) ?? 0;
+    const tipCents = getTipAmountCents(fareCents, percent);
+
+    if (!percent || tipCents <= 0) {
+      setToastVariant("error");
+      setToastMessage("Please choose a tip amount first.");
+      return;
+    }
+
+    try {
+      setTipBusyRideId(rideId);
+      setToastMessage(null);
+
+      const res = await fetch("/api/rider/add-tip", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          rideId,
+          tipAmountCents: tipCents,
+          tipPercent: percent,
+        }),
+      });
+
+      const data = (await res.json().catch(() => null)) as
+        | { ok?: boolean; error?: string; stripeStatus?: string }
+        | null;
+
+      if (!res.ok || !data?.ok) {
+        setToastVariant("error");
+        setToastMessage(data?.error || "Failed to process tip.");
+        return;
+      }
+
+      setDismissedTipReviewByRideId((prev) => ({ ...prev, [rideId]: true }));
+      setSelectedTipPercentByRideId((prev) => ({ ...prev, [rideId]: null }));
+      setToastVariant("success");
+      setToastMessage(`Tip of $${formatMoney(tipCents)} charged successfully.`);
+
+      await refreshBookings({ silent: true });
+    } catch (err) {
+      console.error("Error submitting tip:", err);
+      setToastVariant("error");
+      setToastMessage("Failed to process tip.");
+    } finally {
+      setTipBusyRideId(null);
+    }
+  }
 
   async function handleAction(bookingOrRideId: string, action: "cancel" | "complete") {
     try {
@@ -533,7 +759,7 @@ export default function RiderPortalPage() {
         body: JSON.stringify({ bookingId: bookingOrRideId }),
       });
 
-      const data: any = await res.json().catch(() => null);
+      const data: { ok?: boolean; error?: string } | null = await res.json().catch(() => null);
 
       if (!res.ok || !data?.ok) {
         setError(data?.error || `Failed to ${action} booking.`);
@@ -546,6 +772,39 @@ export default function RiderPortalPage() {
       setError(`Unexpected error while trying to ${action} booking.`);
     } finally {
       setActionBusyId(null);
+    }
+  }
+
+  async function handleRequestCompleteTrip(rideId: string) {
+    try {
+      setRequestCompleteBusyRideId(rideId);
+      setToastMessage(null);
+
+      const res = await fetch("/api/rider/request-complete-trip", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ rideId }),
+      });
+
+      const data = (await res.json().catch(() => null)) as
+        | { ok?: boolean; error?: string }
+        | null;
+
+      if (!res.ok || !data?.ok) {
+        setToastVariant("error");
+        setToastMessage(data?.error || "Failed to send completion request.");
+        return;
+      }
+
+      setRequestCompleteSentByRideId((prev) => ({ ...prev, [rideId]: true }));
+      setToastVariant("success");
+      setToastMessage("Completion request sent to your driver.");
+    } catch (err) {
+      console.error("Error requesting trip completion:", err);
+      setToastVariant("error");
+      setToastMessage("Failed to send completion request.");
+    } finally {
+      setRequestCompleteBusyRideId(null);
     }
   }
 
@@ -605,8 +864,10 @@ export default function RiderPortalPage() {
       ],
       ...filteredCompleted.map((b) => {
         const base = typeof getBaseFareCents(b) === "number" ? `$${formatMoney(getBaseFareCents(b)!)}` : "";
-        const processor = typeof getEffectiveFareCents(b) === "number" ? `$${formatMoney(getEffectiveFareCents(b)!)}` : "";
-        const display = typeof getDisplayFareCents(b) === "number" ? `$${formatMoney(getDisplayFareCents(b)!)}` : "";
+        const processor =
+          typeof getEffectiveFareCents(b) === "number" ? `$${formatMoney(getEffectiveFareCents(b)!)}` : "";
+        const display =
+          typeof getDisplayFareCents(b) === "number" ? `$${formatMoney(getDisplayFareCents(b)!)}` : "";
 
         return [
           b.rideId,
@@ -668,7 +929,7 @@ export default function RiderPortalPage() {
         }}
       >
         <div>
-          <h1 style={{ fontSize: 30, fontWeight: 650, marginBottom: 6 }}>Rider portal</h1>
+          <h1 style={{ fontSize: 30, fontWeight: 700, marginBottom: 6 }}>Rider portal</h1>
           <p style={{ margin: 0, color: "#555", maxWidth: 520, fontSize: 14 }}>
             Track your upcoming and completed rides, chat with drivers, and manage your trips.
           </p>
@@ -678,15 +939,16 @@ export default function RiderPortalPage() {
           <button
             type="button"
             style={{
-              padding: "10px 18px",
+              padding: "12px 20px",
               borderRadius: 999,
               border: "none",
               background: "#4f46e5",
               color: "#fff",
               fontSize: 14,
-              fontWeight: 500,
+              fontWeight: 600,
               cursor: "pointer",
               whiteSpace: "nowrap",
+              boxShadow: "0 8px 20px rgba(79,70,229,0.18)",
             }}
           >
             Request a new ride
@@ -721,6 +983,42 @@ export default function RiderPortalPage() {
         </p>
       )}
 
+      {liveRideBannerMessage && (
+        <div
+          style={{
+            marginBottom: 16,
+            padding: "12px 14px",
+            borderRadius: 12,
+            border: "1px solid #86efac",
+            background: "#ecfdf5",
+            color: "#166534",
+            fontSize: 14,
+            fontWeight: 600,
+            boxShadow: "0 8px 20px rgba(34,197,94,0.08)",
+          }}
+        >
+          {liveRideBannerMessage}
+        </div>
+      )}
+
+      {postTripReviewRides.length > 0 && (
+        <section style={{ marginBottom: 24 }}>
+          <SectionHeader
+            title="Just completed"
+            subtitle="Review your finished trip and add a tip before it moves into your completed history."
+          />
+
+          <PostTripReviewList
+            bookings={postTripReviewRides}
+            selectedTipPercentByRideId={selectedTipPercentByRideId}
+            tipBusyRideId={tipBusyRideId}
+            onSelectTipPercent={handleSelectTipPercent}
+            onSkipTipReview={handleSkipTipReview}
+            onSubmitTip={handleSubmitTip}
+          />
+        </section>
+      )}
+
       {loading && <p>Loading your bookings...</p>}
       {!loading && error && <p style={{ color: "red", marginBottom: 16 }}>{error}</p>}
 
@@ -742,9 +1040,9 @@ export default function RiderPortalPage() {
               style={{
                 border: "none",
                 background: "transparent",
-                padding: "6px 0",
+                padding: "8px 0",
                 cursor: "pointer",
-                fontWeight: activeTab === "UPCOMING" ? 600 : 500,
+                fontWeight: activeTab === "UPCOMING" ? 700 : 500,
                 color: activeTab === "UPCOMING" ? "#111827" : "#6b7280",
                 borderBottom: activeTab === "UPCOMING" ? "2px solid #111827" : "2px solid transparent",
               }}
@@ -757,19 +1055,19 @@ export default function RiderPortalPage() {
               style={{
                 border: "none",
                 background: "transparent",
-                padding: "6px 0",
+                padding: "8px 0",
                 cursor: "pointer",
-                fontWeight: activeTab === "COMPLETED" ? 600 : 500,
+                fontWeight: activeTab === "COMPLETED" ? 700 : 500,
                 color: activeTab === "COMPLETED" ? "#111827" : "#6b7280",
                 borderBottom: activeTab === "COMPLETED" ? "2px solid #111827" : "2px solid transparent",
               }}
             >
-              Completed ({completed.length})
+              Completed ({completedHistory.length})
             </button>
           </div>
 
           {activeTab === "UPCOMING" && (
-            <section>
+            <section ref={activeRideSectionRef}>
               <SectionHeader
                 title="Upcoming rides"
                 subtitle={activeRides.length > 0 ? "Your active and upcoming rides." : "Your next rides."}
@@ -778,26 +1076,27 @@ export default function RiderPortalPage() {
               {activeRides.length > 0 && (
                 <div
                   style={{
-                    marginBottom: 12,
-                    padding: "8px 12px",
+                    marginBottom: 14,
+                    padding: "10px 14px",
                     borderRadius: 999,
                     background: "#ecfdf5",
                     border: "1px solid #bbf7d0",
-                    fontSize: 12,
+                    fontSize: 13,
                     color: "#166534",
+                    fontWeight: 600,
                   }}
                 >
                   <span
                     style={{
                       display: "inline-block",
-                      width: 6,
-                      height: 6,
+                      width: 8,
+                      height: 8,
                       borderRadius: "999px",
                       backgroundColor: "#22c55e",
-                      marginRight: 6,
+                      marginRight: 8,
                     }}
                   />
-                  Your driver is on the way for an active trip.
+                  Your driver started the trip. Meter is running.
                 </div>
               )}
 
@@ -807,7 +1106,7 @@ export default function RiderPortalPage() {
                 <>
                   {activeRides.length > 0 && (
                     <>
-                      <h3 style={{ margin: "8px 0 4px", fontSize: 14, fontWeight: 600 }}>Active ride</h3>
+                      <h3 style={{ margin: "8px 0 6px", fontSize: 15, fontWeight: 700 }}>Active ride</h3>
 
                       <RideList
                         bookings={activeRides}
@@ -815,6 +1114,9 @@ export default function RiderPortalPage() {
                         showActions
                         onCancel={(id) => handleAction(id, "cancel")}
                         onComplete={(bookingId) => handleAction(bookingId, "complete")}
+                        onRequestCompleteTrip={handleRequestCompleteTrip}
+                        requestCompleteBusyRideId={requestCompleteBusyRideId}
+                        requestCompleteSentByRideId={requestCompleteSentByRideId}
                         actionBusyId={actionBusyId}
                         expandedBookingId={expandedBookingId}
                         onToggleExpand={(id) => setExpandedBookingId((curr) => (curr === id ? null : id))}
@@ -830,7 +1132,7 @@ export default function RiderPortalPage() {
 
                   {upcoming.length > 0 && (
                     <>
-                      <h3 style={{ margin: "8px 0 4px", fontSize: 14, fontWeight: 600 }}>Upcoming rides</h3>
+                      <h3 style={{ margin: "8px 0 6px", fontSize: 15, fontWeight: 700 }}>Upcoming rides</h3>
 
                       <RideList
                         bookings={upcoming}
@@ -838,6 +1140,9 @@ export default function RiderPortalPage() {
                         showActions
                         onCancel={(id) => handleAction(id, "cancel")}
                         onComplete={(bookingId) => handleAction(bookingId, "complete")}
+                        onRequestCompleteTrip={handleRequestCompleteTrip}
+                        requestCompleteBusyRideId={requestCompleteBusyRideId}
+                        requestCompleteSentByRideId={requestCompleteSentByRideId}
                         actionBusyId={actionBusyId}
                         expandedBookingId={expandedBookingId}
                         onToggleExpand={(id) => setExpandedBookingId((curr) => (curr === id ? null : id))}
@@ -987,33 +1292,224 @@ export default function RiderPortalPage() {
       )}
 
       {activeChat && (
-        <ChatOverlay conversationId={activeChat.conversationId} readOnly={activeChat.readOnly} onClose={() => setActiveChat(null)} />
+        <ChatOverlay
+          conversationId={activeChat.conversationId}
+          readOnly={activeChat.readOnly}
+          onClose={() => setActiveChat(null)}
+        />
       )}
     </main>
   );
 }
 
-/* ============================================
- *              SMALL UI HELPERS
- * ==========================================*/
+function PostTripReviewList(props: {
+  bookings: Booking[];
+  selectedTipPercentByRideId: Record<string, TipPercent | null>;
+  tipBusyRideId: string | null;
+  onSelectTipPercent: (rideId: string, percent: TipPercent) => void;
+  onSkipTipReview: (rideId: string) => void | Promise<void>;
+  onSubmitTip: (booking: Booking) => void | Promise<void>;
+}) {
+  const {
+    bookings,
+    selectedTipPercentByRideId,
+    tipBusyRideId,
+    onSelectTipPercent,
+    onSkipTipReview,
+    onSubmitTip,
+  } = props;
+
+  return (
+    <ul style={{ listStyle: "none", padding: 0, margin: 0 }}>
+      {bookings.map((b) => {
+        const finalFareCents = getDisplayFareCents(b) ?? 0;
+        const selectedPercent = selectedTipPercentByRideId[b.rideId] ?? null;
+        const tipCents = getTipAmountCents(finalFareCents, selectedPercent);
+        const totalWithTipCents = finalFareCents + tipCents;
+        const completedLabel = formatDateTime(b.tripCompletedAt);
+        const isBusy = tipBusyRideId === b.rideId;
+
+        return (
+          <li
+            key={`post-trip-${b.rideId}`}
+            style={{
+              border: "1px solid #dbeafe",
+              borderRadius: 18,
+              padding: 18,
+              marginBottom: 16,
+              background: "linear-gradient(180deg, #ffffff 0%, #f8fbff 100%)",
+              boxShadow: "0 12px 28px rgba(15,23,42,0.06)",
+            }}
+          >
+            <div style={{ marginBottom: 14 }}>
+              <div style={{ fontSize: 22, fontWeight: 800, lineHeight: 1.2, color: "#0f172a" }}>
+                Trip completed
+              </div>
+              <div style={{ fontSize: 16, fontWeight: 700, marginTop: 8 }}>
+                {b.originCity} → {b.destinationCity}
+              </div>
+              <div style={{ fontSize: 13, color: "#4b5563", marginTop: 4 }}>
+                {completedLabel ? `Completed: ${completedLabel}` : "Trip completed"}
+              </div>
+              {b.driverName ? (
+                <div style={{ fontSize: 13, color: "#6b7280", marginTop: 4 }}>
+                  Driver: {b.driverName}
+                </div>
+              ) : null}
+              <PaymentBadge booking={b} />
+            </div>
+
+            <RiderTripMeter
+              status="COMPLETED"
+              tripStartedAt={b.tripStartedAt ?? null}
+              tripCompletedAt={b.tripCompletedAt ?? null}
+              paymentType={b.paymentType ?? null}
+              cashDiscountBps={b.cashDiscountBps ?? null}
+              driverName={b.driverName}
+            />
+
+            <div
+              style={{
+                marginTop: 16,
+                border: "1px solid #c7d2fe",
+                borderRadius: 16,
+                padding: 18,
+                background: "#eef2ff",
+              }}
+            >
+              <div style={{ fontSize: 22, fontWeight: 800, marginBottom: 6, color: "#312e81" }}>
+                Add a tip for your driver
+              </div>
+
+              <div style={{ fontSize: 14, color: "#4338ca", marginBottom: 14 }}>
+                Show appreciation with a quick tip before this ride moves to your completed history.
+              </div>
+
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginBottom: 14 }}>
+                {[10, 15, 20].map((pct) => {
+                  const active = selectedPercent === pct;
+                  return (
+                    <button
+                      key={pct}
+                      type="button"
+                      onClick={() => onSelectTipPercent(b.rideId, pct as TipPercent)}
+                      disabled={isBusy}
+                      style={{
+                        padding: "12px 16px",
+                        minWidth: 120,
+                        borderRadius: 999,
+                        border: active ? "2px solid #111827" : "1px solid #c7d2fe",
+                        background: active ? "#111827" : "#ffffff",
+                        color: active ? "#ffffff" : "#111827",
+                        fontSize: 15,
+                        fontWeight: 700,
+                        cursor: isBusy ? "not-allowed" : "pointer",
+                        boxShadow: active ? "0 8px 18px rgba(15,23,42,0.18)" : "none",
+                        opacity: isBusy ? 0.65 : 1,
+                      }}
+                    >
+                      {pct}% ({`$${formatMoney(getTipAmountCents(finalFareCents, pct as TipPercent))}`})
+                    </button>
+                  );
+                })}
+              </div>
+
+              <div
+                style={{
+                  display: "flex",
+                  flexWrap: "wrap",
+                  gap: 10,
+                  alignItems: "center",
+                  marginBottom: 16,
+                  padding: "12px 14px",
+                  borderRadius: 12,
+                  background: "#ffffff",
+                  border: "1px solid #c7d2fe",
+                  fontSize: 15,
+                }}
+              >
+                <span>
+                  Ride fare: <strong>${formatMoney(finalFareCents)}</strong>
+                </span>
+
+                {selectedPercent ? (
+                  <>
+                    <span>
+                      Tip: <strong>${formatMoney(tipCents)}</strong>
+                    </span>
+                    <span>
+                      Total after tip: <strong>${formatMoney(totalWithTipCents)}</strong>
+                    </span>
+                  </>
+                ) : (
+                  <span style={{ color: "#4b5563" }}>Choose a tip amount to continue</span>
+                )}
+              </div>
+
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
+                <button
+                  type="button"
+                  onClick={() => onSubmitTip(b)}
+                  style={{
+                    padding: "12px 18px",
+                    borderRadius: 999,
+                    border: "1px solid #4f46e5",
+                    background: selectedPercent && !isBusy ? "#4f46e5" : "#c7d2fe",
+                    color: "#ffffff",
+                    fontSize: 15,
+                    fontWeight: 700,
+                    cursor: selectedPercent && !isBusy ? "pointer" : "not-allowed",
+                    boxShadow: selectedPercent && !isBusy ? "0 10px 22px rgba(79,70,229,0.22)" : "none",
+                  }}
+                  disabled={!selectedPercent || isBusy}
+                >
+                  {isBusy ? "Charging..." : "Add tip and charge"}
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => onSkipTipReview(b.rideId)}
+                  disabled={isBusy}
+                  style={{
+                    padding: "12px 18px",
+                    borderRadius: 999,
+                    border: "1px solid #d1d5db",
+                    background: "#ffffff",
+                    color: "#111827",
+                    fontSize: 15,
+                    fontWeight: 600,
+                    cursor: isBusy ? "not-allowed" : "pointer",
+                    opacity: isBusy ? 0.65 : 1,
+                  }}
+                >
+                  {isBusy ? "Please wait..." : "Skip for now"}
+                </button>
+              </div>
+            </div>
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
 
 function SummaryCard(props: { label: string; value: number }) {
   const { label, value } = props;
   return (
     <div
       style={{
-        borderRadius: 10,
+        borderRadius: 12,
         border: "1px solid #e5e7eb",
-        padding: "12px 14px",
+        padding: "14px 16px",
         background: "#f9fafb",
-        minHeight: 70,
+        minHeight: 78,
         display: "flex",
         flexDirection: "column",
         justifyContent: "center",
       }}
     >
-      <div style={{ fontSize: 12, textTransform: "uppercase", color: "#6b7280" }}>{label}</div>
-      <div style={{ fontSize: 20, fontWeight: 600 }}>{value}</div>
+      <div style={{ fontSize: 12, textTransform: "uppercase", color: "#6b7280", fontWeight: 600 }}>{label}</div>
+      <div style={{ fontSize: 28, fontWeight: 700 }}>{value}</div>
     </div>
   );
 }
@@ -1021,9 +1517,9 @@ function SummaryCard(props: { label: string; value: number }) {
 function SectionHeader(props: { title: string; subtitle?: string }) {
   const { title, subtitle } = props;
   return (
-    <div style={{ marginBottom: 8 }}>
-      <h2 style={{ margin: 0, fontSize: 20, fontWeight: 650 }}>{title}</h2>
-      {subtitle && <p style={{ margin: 0, fontSize: 13, color: "#6b7280" }}>{subtitle}</p>}
+    <div style={{ marginBottom: 10 }}>
+      <h2 style={{ margin: 0, fontSize: 20, fontWeight: 750 }}>{title}</h2>
+      {subtitle && <p style={{ margin: "4px 0 0", fontSize: 14, color: "#6b7280" }}>{subtitle}</p>}
     </div>
   );
 }
@@ -1095,10 +1591,6 @@ function FilterPill(props: { label: string; active: boolean; onClick: () => void
   );
 }
 
-/* ============================================
- *                RIDE LIST + TIMER + CHAT
- * ==========================================*/
-
 function RideList(props: {
   bookings: Booking[];
   compact?: boolean;
@@ -1106,6 +1598,9 @@ function RideList(props: {
   showActions?: boolean;
   onCancel?: (idForApi: string) => void;
   onComplete?: (bookingId: string) => void;
+  onRequestCompleteTrip?: (rideId: string) => void;
+  requestCompleteBusyRideId?: string | null;
+  requestCompleteSentByRideId?: Record<string, boolean>;
   actionBusyId?: string | null;
   expandedBookingId?: string | null;
   onToggleExpand?: (id: string) => void;
@@ -1120,6 +1615,9 @@ function RideList(props: {
     showActions = false,
     onCancel,
     onComplete,
+    onRequestCompleteTrip,
+    requestCompleteBusyRideId,
+    requestCompleteSentByRideId,
     actionBusyId,
     expandedBookingId,
     onToggleExpand,
@@ -1171,45 +1669,50 @@ function RideList(props: {
           router.push(`/rider/trips/${encodeURIComponent(b.rideId)}`);
         };
 
+        const requestBusy = requestCompleteBusyRideId === b.rideId;
+        const requestSent = Boolean(requestCompleteSentByRideId?.[b.rideId]);
+
         return (
           <li
             key={b.id}
             style={{
               border: "1px solid #e5e7eb",
-              borderRadius: 10,
-              padding: 12,
-              marginBottom: 10,
+              borderRadius: 12,
+              padding: 14,
+              marginBottom: 12,
               background: isCancelled ? "#fef2f2" : "#ffffff",
               opacity: isCancelled ? 0.85 : 1,
+              boxShadow: isInRoute ? "0 10px 22px rgba(15,23,42,0.05)" : "none",
             }}
           >
             <div style={{ display: "flex", justifyContent: "space-between", gap: 12 }}>
-              <div style={{ minWidth: 0 }}>
+              <div style={{ minWidth: 0, flex: 1 }}>
                 <div
                   style={{
-                    fontWeight: 600,
-                    marginBottom: 2,
+                    fontWeight: 700,
+                    marginBottom: 3,
                     whiteSpace: "nowrap",
                     overflow: "hidden",
                     textOverflow: "ellipsis",
+                    fontSize: 16,
                   }}
                 >
                   {b.originCity} → {b.destinationCity}
                 </div>
 
                 <div style={{ fontSize: 13, color: "#4b5563" }}>
-                  {isCompleted ? "Scheduled" : "Scheduled"}: {scheduledLabel ?? "—"}
+                  Scheduled: {scheduledLabel ?? "—"}
                   {startedLabel && ` • Started: ${startedLabel}`}
                   {distanceLabel && ` • ${distanceLabel}`}
                   {displayDollars && ` • $${displayDollars}`}
                 </div>
 
-                <div style={{ fontSize: 12, color: "#6b7280" }}>
+                <div style={{ fontSize: 12, color: "#6b7280", marginTop: 2 }}>
                   Booking: {b.status} · Ride: {b.rideStatus}
                   {b.isRideOnly && " (request pending)"}
                 </div>
 
-                {b.driverName && <div style={{ fontSize: 12, color: "#6b7280" }}>Driver: {b.driverName}</div>}
+                {b.driverName && <div style={{ fontSize: 12, color: "#6b7280", marginTop: 2 }}>Driver: {b.driverName}</div>}
 
                 <PaymentBadge booking={b} />
 
@@ -1226,28 +1729,21 @@ function RideList(props: {
                 )}
 
                 {isInRoute && (
-                  <>
-                    <div
-                      style={{
-                        display: "inline-block",
-                        marginTop: 6,
-                        padding: "2px 8px",
-                        borderRadius: 999,
-                        fontSize: 11,
-                        fontWeight: 600,
-                        backgroundColor: "#dcfce7",
-                        color: "#166534",
-                      }}
-                    >
-                      In route (active now)
-                    </div>
-
-                    {b.tripStartedAt && (
-                      <div style={{ marginTop: 4 }}>
-                        <InRouteTimer startedAt={b.tripStartedAt} />
-                      </div>
-                    )}
-                  </>
+                  <div style={{ marginTop: 12 }}>
+                    <RiderTripMeter
+                      status={toRiderMeterStatus(b.rideStatus)}
+                      tripStartedAt={b.tripStartedAt ?? null}
+                      tripCompletedAt={b.tripCompletedAt ?? null}
+                      paymentType={b.paymentType ?? null}
+                      cashDiscountBps={b.cashDiscountBps ?? null}
+                      driverName={b.driverName}
+                      onRequestCompleteTrip={
+                        onRequestCompleteTrip ? () => onRequestCompleteTrip(b.rideId) : undefined
+                      }
+                      requestBusy={requestBusy}
+                      requestSent={requestSent}
+                    />
+                  </div>
                 )}
 
                 {isCancelled && (
@@ -1525,28 +2021,6 @@ function RideList(props: {
         );
       })}
     </ul>
-  );
-}
-
-function InRouteTimer(props: { startedAt: string }) {
-  const { startedAt } = props;
-  const [now, setNow] = useState<Date>(() => new Date());
-
-  useEffect(() => {
-    const id = setInterval(() => setNow(new Date()), 1000);
-    return () => clearInterval(id);
-  }, []);
-
-  const start = safeDate(startedAt) ?? new Date(startedAt);
-  const diffMs = Math.max(0, now.getTime() - start.getTime());
-  const totalSeconds = Math.floor(diffMs / 1000);
-  const minutes = Math.floor(totalSeconds / 60).toString().padStart(2, "0");
-  const seconds = (totalSeconds % 60).toString().padStart(2, "0");
-
-  return (
-    <span style={{ fontSize: 12, color: "#4b5563" }}>
-      Trip time so far: <span style={{ fontWeight: 600 }}>{minutes}:{seconds}</span>
-    </span>
   );
 }
 

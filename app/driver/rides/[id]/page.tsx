@@ -1,8 +1,15 @@
 // app/driver/rides/[id]/page.tsx
+
 import Link from "next/link";
 import { notFound } from "next/navigation";
 import { prisma } from "@/lib/prisma";
-import { BookingStatus, DisputeStatus, RideStatus, PaymentType } from "@prisma/client";
+import {
+  BookingStatus,
+  DisputeStatus,
+  PaymentType,
+  RidePaymentStatus,
+  RideStatus,
+} from "@prisma/client";
 
 type Props = { params: Promise<{ id: string }> };
 
@@ -14,7 +21,9 @@ function money(cents: number | null | undefined) {
 }
 
 function normalizeCents(v: number | null | undefined): number {
-  return typeof v === "number" && Number.isFinite(v) ? Math.max(0, Math.round(v)) : 0;
+  return typeof v === "number" && Number.isFinite(v)
+    ? Math.max(0, Math.round(v))
+    : 0;
 }
 
 function computeDriverSplit(grossAmountCents: number) {
@@ -69,6 +78,35 @@ export default async function RideDetailPage({ params }: Props) {
       fallbackCardChargedAt: true,
     },
   });
+
+  const latestRidePayment =
+    booking?.paymentType === PaymentType.CARD
+      ? await prisma.ridePayment.findFirst({
+          where: {
+            rideId: id,
+            paymentType: PaymentType.CARD,
+            status: {
+              in: [
+                RidePaymentStatus.AUTHORIZED,
+                RidePaymentStatus.PENDING,
+                RidePaymentStatus.SUCCEEDED,
+              ],
+            },
+          },
+          orderBy: { createdAt: "desc" },
+          select: {
+            id: true,
+            status: true,
+            baseAmountCents: true,
+            discountCents: true,
+            finalAmountCents: true,
+            tipAmountCents: true,
+            tipPercent: true,
+            tipStatus: true,
+            capturedAt: true,
+          },
+        })
+      : null;
 
   const dispute = booking
     ? await prisma.dispute.findFirst({
@@ -127,17 +165,29 @@ export default async function RideDetailPage({ params }: Props) {
   }
 
   const distanceMiles = ride.distanceMiles ?? 0;
-
   const rideEstimateCents = normalizeCents((ride as any).totalPriceCents);
-  const baseCents = normalizeCents(booking?.baseAmountCents ?? rideEstimateCents);
-  const discountCents = normalizeCents(booking?.discountCents ?? 0);
 
-  const finalCents =
-    normalizeCents(booking?.finalAmountCents) ||
-    Math.max(0, baseCents - discountCents) ||
+  const baseCents =
+    normalizeCents(latestRidePayment?.baseAmountCents) ||
+    normalizeCents(booking?.baseAmountCents) ||
     rideEstimateCents;
 
-  const convenienceFeeCents = Math.max(0, finalCents - Math.max(0, baseCents - discountCents));
+  const discountCents =
+    normalizeCents(latestRidePayment?.discountCents) ||
+    normalizeCents(booking?.discountCents);
+
+  const tipCents = normalizeCents(latestRidePayment?.tipAmountCents);
+
+  const totalChargedCents =
+    normalizeCents(latestRidePayment?.finalAmountCents) ||
+    normalizeCents(booking?.finalAmountCents) ||
+    Math.max(0, baseCents - discountCents + tipCents) ||
+    rideEstimateCents;
+
+  const convenienceFeeCents = Math.max(
+    0,
+    totalChargedCents - Math.max(0, baseCents - discountCents) - tipCents
+  );
 
   const fallbackCharged = Boolean(booking?.cashNotPaidAt && booking?.fallbackCardChargedAt);
   const originallyCash = booking?.originalPaymentType === PaymentType.CASH;
@@ -146,12 +196,15 @@ export default async function RideDetailPage({ params }: Props) {
   const switchedToCardFallback =
     originallyCash && booking?.paymentType === PaymentType.CARD && fallbackCharged;
 
-  const refundAmountCents = Math.min(normalizeCents(dispute?.refundAmountCents), finalCents);
+  const refundAmountCents = Math.min(
+    normalizeCents(dispute?.refundAmountCents),
+    totalChargedCents
+  );
   const refundedAfterDispute = Boolean(dispute?.refundIssued && refundAmountCents > 0);
 
-  const netCardProcessorResultCents = Math.max(0, finalCents - refundAmountCents);
+  const netCardProcessorResultCents = Math.max(0, totalChargedCents - refundAmountCents);
 
-  const originalDriverSplit = computeDriverSplit(finalCents);
+  const originalDriverSplit = computeDriverSplit(totalChargedCents);
 
   const preservedCashAccounting = switchedToCardFallback && refundedAfterDispute;
 
@@ -245,16 +298,22 @@ export default async function RideDetailPage({ params }: Props) {
         <section className="space-y-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div>
-              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Trip status</p>
+              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                Trip status
+              </p>
               <p className="text-sm font-semibold text-slate-900">{ride.status}</p>
             </div>
 
             <div className="text-right">
               <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
-                {refundedAfterDispute ? "Original fare" : "Total fare"}
+                Total charged
               </p>
-              <p className="text-lg font-semibold text-slate-900">${money(finalCents)}</p>
-              <p className="text-[11px] text-slate-500">Stored as {finalCents} cents</p>
+              <p className="text-lg font-semibold text-slate-900">
+                ${money(totalChargedCents)}
+              </p>
+              <p className="text-[11px] text-slate-500">
+                Stored as {totalChargedCents} cents
+              </p>
             </div>
           </div>
 
@@ -281,14 +340,25 @@ export default async function RideDetailPage({ params }: Props) {
             </div>
           </div>
 
-          <div className="grid gap-2 text-sm text-slate-700 sm:grid-cols-4">
+          <div className="grid gap-2 text-sm text-slate-700 sm:grid-cols-5">
             <div>
-              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Base fare</p>
+              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                Base fare
+              </p>
               <p className="mt-1 font-semibold">${money(baseCents)}</p>
             </div>
 
             <div>
-              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Discount</p>
+              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                Tip
+              </p>
+              <p className="mt-1 font-semibold">${money(tipCents)}</p>
+            </div>
+
+            <div>
+              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                Discount
+              </p>
               <p className="mt-1 font-semibold">
                 {discountCents > 0 ? `-$${money(discountCents)}` : "$0.00"}
               </p>
@@ -307,25 +377,66 @@ export default async function RideDetailPage({ params }: Props) {
               <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
                 Driver earnings
               </p>
-              <p className="mt-1 font-semibold">${money(effectiveDriverSplit.netAmountCents)}</p>
+              <p className="mt-1 font-semibold">
+                ${money(effectiveDriverSplit.netAmountCents)}
+              </p>
             </div>
           </div>
 
+          {latestRidePayment?.tipStatus ? (
+            <div className="grid gap-2 pt-1 text-sm text-slate-700 sm:grid-cols-3">
+              <div>
+                <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                  Tip status
+                </p>
+                <p className="mt-1 font-semibold">{latestRidePayment.tipStatus}</p>
+              </div>
+
+              <div>
+                <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                  Tip percent
+                </p>
+                <p className="mt-1 font-semibold">
+                  {typeof latestRidePayment.tipPercent === "number"
+                    ? `${latestRidePayment.tipPercent}%`
+                    : "n/a"}
+                </p>
+              </div>
+
+              <div>
+                <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                  Payment captured
+                </p>
+                <p className="mt-1 font-semibold">
+                  {latestRidePayment.capturedAt
+                    ? latestRidePayment.capturedAt.toLocaleString()
+                    : "n/a"}
+                </p>
+              </div>
+            </div>
+          ) : null}
+
           <div className="grid gap-4 pt-2 text-sm text-slate-700 sm:grid-cols-3">
             <div>
-              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Distance</p>
+              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                Distance
+              </p>
               <p className="mt-1 font-semibold">
                 {distanceMiles > 0 ? `${distanceMiles.toFixed(2)} miles` : "n/a"}
               </p>
             </div>
 
             <div>
-              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Duration</p>
+              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                Duration
+              </p>
               <p className="mt-1 font-semibold">{formatDuration(durationMinutes)}</p>
             </div>
 
             <div>
-              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">Passenger count</p>
+              <p className="text-xs font-medium uppercase tracking-wide text-slate-500">
+                Passenger count
+              </p>
               <p className="mt-1 font-semibold">{ride.passengerCount}</p>
             </div>
           </div>
@@ -344,11 +455,13 @@ export default async function RideDetailPage({ params }: Props) {
               </div>
               <div>
                 <p className="text-xs text-amber-700">Fallback card charged amount</p>
-                <p className="mt-1 font-medium">${money(finalCents)}</p>
+                <p className="mt-1 font-medium">${money(totalChargedCents)}</p>
               </div>
               <div>
                 <p className="text-xs text-amber-700">Cash not paid at</p>
-                <p className="mt-1 font-medium">{booking?.cashNotPaidAt?.toLocaleString() ?? "n/a"}</p>
+                <p className="mt-1 font-medium">
+                  {booking?.cashNotPaidAt?.toLocaleString() ?? "n/a"}
+                </p>
               </div>
               <div>
                 <p className="text-xs text-amber-700">Fallback card charged at</p>
@@ -385,18 +498,22 @@ export default async function RideDetailPage({ params }: Props) {
               </div>
               <div>
                 <p className="text-xs text-emerald-700">Refund issued at</p>
-                <p className="mt-1 font-medium">{dispute?.refundIssuedAt?.toLocaleString() ?? "n/a"}</p>
+                <p className="mt-1 font-medium">
+                  {dispute?.refundIssuedAt?.toLocaleString() ?? "n/a"}
+                </p>
               </div>
               <div>
                 <p className="text-xs text-emerald-700">Dispute resolved at</p>
-                <p className="mt-1 font-medium">{dispute?.resolvedAt?.toLocaleString() ?? "n/a"}</p>
+                <p className="mt-1 font-medium">
+                  {dispute?.resolvedAt?.toLocaleString() ?? "n/a"}
+                </p>
               </div>
             </div>
 
             <div className="rounded-xl border border-emerald-200 bg-white/70 p-3">
               <div className="flex items-center justify-between">
-                <span>Original fallback charge</span>
-                <span className="font-semibold">${money(finalCents)}</span>
+                <span>Original captured amount</span>
+                <span className="font-semibold">${money(totalChargedCents)}</span>
               </div>
               <div className="mt-1 flex items-center justify-between">
                 <span>Refund after dispute</span>
@@ -415,7 +532,9 @@ export default async function RideDetailPage({ params }: Props) {
               <div className="mt-2 space-y-1">
                 <div className="flex items-center justify-between">
                   <span>Original driver earnings</span>
-                  <span className="font-semibold">${money(originalDriverSplit.netAmountCents)}</span>
+                  <span className="font-semibold">
+                    ${money(originalDriverSplit.netAmountCents)}
+                  </span>
                 </div>
                 <div className="flex items-center justify-between">
                   <span>
@@ -423,13 +542,17 @@ export default async function RideDetailPage({ params }: Props) {
                       ? "Effective driver earnings (cash preserved)"
                       : "Effective driver earnings"}
                   </span>
-                  <span className="font-semibold">${money(effectiveDriverSplit.netAmountCents)}</span>
+                  <span className="font-semibold">
+                    ${money(effectiveDriverSplit.netAmountCents)}
+                  </span>
                 </div>
                 <div className="flex items-center justify-between">
                   <span>
                     {preservedCashAccounting ? "Platform fee preserved" : "Effective platform fee"}
                   </span>
-                  <span className="font-semibold">${money(effectivePlatformFeeCents)}</span>
+                  <span className="font-semibold">
+                    ${money(effectivePlatformFeeCents)}
+                  </span>
                 </div>
               </div>
 
@@ -443,7 +566,9 @@ export default async function RideDetailPage({ params }: Props) {
         ) : null}
 
         <section className="space-y-3 rounded-2xl border border-slate-200 bg-white p-4 text-sm text-slate-700 shadow-sm">
-          <h2 className="text-xs font-semibold uppercase tracking-wide text-slate-500">Timing</h2>
+          <h2 className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+            Timing
+          </h2>
           <div className="grid gap-3 sm:grid-cols-2">
             <div>
               <p className="text-xs text-slate-500">Scheduled departure</p>
@@ -451,11 +576,15 @@ export default async function RideDetailPage({ params }: Props) {
             </div>
             <div>
               <p className="text-xs text-slate-500">Trip started</p>
-              <p className="mt-1 font-medium">{startedAt ? startedAt.toLocaleString() : "n/a"}</p>
+              <p className="mt-1 font-medium">
+                {startedAt ? startedAt.toLocaleString() : "n/a"}
+              </p>
             </div>
             <div>
               <p className="text-xs text-slate-500">Trip completed</p>
-              <p className="mt-1 font-medium">{completedAt ? completedAt.toLocaleString() : "n/a"}</p>
+              <p className="mt-1 font-medium">
+                {completedAt ? completedAt.toLocaleString() : "n/a"}
+              </p>
             </div>
           </div>
         </section>

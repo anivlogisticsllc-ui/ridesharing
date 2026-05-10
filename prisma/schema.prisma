@@ -392,7 +392,14 @@ model RidePayment {
   paymentMethod         PaymentMethod?    @relation("RidePaymentPaymentMethod", fields: [paymentMethodId], references: [id])
   ride                  Ride              @relation(fields: [rideId], references: [id], onDelete: Cascade)
   rider                 User              @relation(fields: [riderId], references: [id], onDelete: Cascade)
-
+  tipAmountCents        Int?      @default(0)
+  tipPercent            Int?
+  tipSelectedAt         DateTime?
+  tipChargedAt          DateTime?
+  stripeTipChargeId     String?   @unique
+  tipStatus             TipStatus @default(NOT_OFFERED)  
+  tipSkippedAt          DateTime?  
+  tipEligibleUntil      DateTime?
   @@index([riderId])
   @@index([rideId])
   @@index([paymentMethodId])
@@ -673,4 +680,13 @@ enum AdminTargetType {
   USER
   RIDE_PAYMENT
   REFUND
+}
+
+enum TipStatus {
+  NOT_OFFERED
+  ELIGIBLE
+  PENDING
+  SUCCEEDED
+  FAILED
+  SKIPPED
 }

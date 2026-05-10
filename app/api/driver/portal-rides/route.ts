@@ -26,9 +26,10 @@ type PortalRide = {
   tripCompletedAt: string | null;
   distanceMiles: number | null;
 
-  // Driver-facing amount to display
-  // Prefer booking.finalAmountCents when available
   fareCents: number;
+
+  riderRequestedCompletion: boolean;
+  riderRequestedCompletionAt: string | null;
 };
 
 type ApiResponse =
@@ -38,7 +39,7 @@ type ApiResponse =
 type SessionUser = { id?: string; role?: unknown } & Record<string, unknown>;
 
 function isDriverRole(role: unknown) {
-  return role === "DRIVER";
+  return role === "DRIVER" || role === "BOTH";
 }
 
 function computeFareCents(args: {
@@ -47,11 +48,17 @@ function computeFareCents(args: {
 }) {
   const { rideTotalCents, bookingFinalAmountCents } = args;
 
-  if (typeof bookingFinalAmountCents === "number" && bookingFinalAmountCents >= 0) {
+  if (
+    typeof bookingFinalAmountCents === "number" &&
+    Number.isFinite(bookingFinalAmountCents) &&
+    bookingFinalAmountCents >= 0
+  ) {
     return bookingFinalAmountCents;
   }
 
-  return typeof rideTotalCents === "number" ? rideTotalCents : 0;
+  return typeof rideTotalCents === "number" && Number.isFinite(rideTotalCents)
+    ? rideTotalCents
+    : 0;
 }
 
 export async function GET() {
@@ -63,15 +70,17 @@ export async function GET() {
     const role = user?.role;
 
     if (!userId) {
-      return NextResponse.json({ ok: false, error: "Not authenticated" } satisfies ApiResponse, {
-        status: 401,
-      });
+      return NextResponse.json(
+        { ok: false, error: "Not authenticated" } satisfies ApiResponse,
+        { status: 401 }
+      );
     }
 
     if (!isDriverRole(role)) {
-      return NextResponse.json({ ok: false, error: "Not a driver" } satisfies ApiResponse, {
-        status: 403,
-      });
+      return NextResponse.json(
+        { ok: false, error: "Not a driver" } satisfies ApiResponse,
+        { status: 403 }
+      );
     }
 
     const accepted = await prisma.ride.findMany({
@@ -174,6 +183,42 @@ export async function GET() {
       }
     }
 
+    const bookingIds = Array.from(
+      new Set(
+        allRides
+          .map((ride) => ride.bookings?.[0]?.id ?? null)
+          .filter((value): value is string => typeof value === "string" && value.length > 0)
+      )
+    );
+
+    const riderCompletionByBookingId: Record<
+      string,
+      { requested: boolean; requestedAt: string | null }
+    > = {};
+
+    if (bookingIds.length) {
+      const auditLogs = await prisma.rideAuditLog.findMany({
+        where: {
+          bookingId: { in: bookingIds },
+          type: "RIDER_REQUESTED_TRIP_COMPLETION",
+        },
+        orderBy: [{ createdAt: "desc" }],
+        select: {
+          bookingId: true,
+          createdAt: true,
+        },
+      });
+
+      for (const log of auditLogs) {
+        if (!riderCompletionByBookingId[log.bookingId]) {
+          riderCompletionByBookingId[log.bookingId] = {
+            requested: true,
+            requestedAt: log.createdAt.toISOString(),
+          };
+        }
+      }
+    }
+
     const mapRide = (ride: (typeof accepted)[number]): PortalRide => {
       const booking = ride.bookings?.[0] ?? null;
       const conversationId = ride.conversations?.[0]?.id ?? null;
@@ -182,6 +227,17 @@ export async function GET() {
         rideTotalCents: ride.totalPriceCents,
         bookingFinalAmountCents: booking?.finalAmountCents ?? null,
       });
+
+      const riderCompletion =
+        booking?.id != null
+          ? riderCompletionByBookingId[booking.id] ?? {
+              requested: false,
+              requestedAt: null,
+            }
+          : {
+              requested: false,
+              requestedAt: null,
+            };
 
       return {
         rideId: ride.id,
@@ -205,6 +261,9 @@ export async function GET() {
         distanceMiles: ride.distanceMiles ?? null,
 
         fareCents,
+
+        riderRequestedCompletion: riderCompletion.requested,
+        riderRequestedCompletionAt: riderCompletion.requestedAt,
       };
     };
 

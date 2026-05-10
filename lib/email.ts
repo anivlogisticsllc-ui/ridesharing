@@ -283,6 +283,10 @@ export type RideReceiptSnapshot = {
   refundAmountCents?: number | null;
   refundIssuedAt?: Date | null;
   disputeResolvedAt?: Date | null;
+
+  tipAmountCents?: number | null;
+  tipPercent?: number | null;
+  tipStatus?: string | null;
 };
 
 function computeDriverSplitForEmail(grossAmountCents: number) {
@@ -309,13 +313,14 @@ function moneyLine(label: string, valueCents: number, negative = false) {
 
 function getReceiptMoney(ride: RideReceiptSnapshot) {
   const base = normalizeCents(ride.baseFareCents);
+  const tip = normalizeCents((ride as any).tipAmountCents);
   const disc = normalizeCents(ride.discountCents);
   const fee = normalizeCents(ride.convenienceFeeCents);
 
   const originalTotal =
     normalizeCents(ride.finalTotalCents) ||
     normalizeCents(ride.totalPriceCents) ||
-    Math.max(0, base + fee - disc);
+    Math.max(0, base + tip + fee - disc);
 
   const refundAmountCents = Math.min(
     normalizeCents(ride.refundAmountCents),
@@ -327,6 +332,7 @@ function getReceiptMoney(ride: RideReceiptSnapshot) {
 
   return {
     base,
+    tip,
     disc,
     fee,
     originalTotal,
@@ -357,11 +363,12 @@ function getPaymentLabelForReceipt(ride: RideReceiptSnapshot) {
 }
 
 function receiptBreakdownHtml(ride: RideReceiptSnapshot) {
-  const { base, disc, fee, originalTotal } = getReceiptMoney(ride);
+  const { base, tip, disc, fee, originalTotal } = getReceiptMoney(ride);
 
   return `
     <div style="border-radius:14px; border:1px solid #e2e8f0; padding:14px; background:#ffffff;">
       ${moneyLine("Base fare", base)}
+      ${moneyLine("Tip", tip)}
       ${moneyLine("Discount", disc, true)}
       ${moneyLine("Convenience fee", fee)}
       <div style="height:1px; background:#e2e8f0; margin:10px 0;"></div>
