@@ -1,4 +1,5 @@
 // app/api/billing/membership/route.ts
+
 import { NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/pages/api/auth/[...nextauth]";
@@ -29,6 +30,8 @@ type BillingInfo = {
 
 type MeMembership = {
   plan: string | null;
+  kind: "TRIAL" | "PAID" | "ADMIN_GRANT" | "NONE";
+  source: "membership" | "freeMembershipEndsAt" | "none";
   active: boolean;
   status: "ACTIVE" | "EXPIRED" | null;
   trialEndsAt: string | null;
@@ -101,15 +104,40 @@ async function ensureTrialMembership(params: {
   return true;
 }
 
-function buildMembershipSummary(latest: {
-  plan: MembershipPlan | null;
-  amountPaidCents: number;
-  expiryDate: Date;
-  status: MembershipStatus;
-} | null): MeMembership {
+function buildMembershipSummary(args: {
+  latest: {
+    plan: MembershipPlan | null;
+    amountPaidCents: number;
+    expiryDate: Date;
+    status: MembershipStatus;
+  } | null;
+  freeMembershipEndsAt?: Date | null;
+}): MeMembership {
+  const nowMs = Date.now();
+
+  const grantEndsAt = args.freeMembershipEndsAt ?? null;
+  const grantMs = grantEndsAt?.getTime() ?? 0;
+
+  if (grantMs > nowMs) {
+    return {
+      plan: MembershipPlan.STANDARD,
+      kind: "ADMIN_GRANT",
+      source: "freeMembershipEndsAt",
+      active: true,
+      status: "ACTIVE",
+      trialEndsAt: null,
+      currentPeriodEnd: toIso(grantEndsAt),
+      cancelAtPeriodEnd: false,
+    };
+  }
+
+  const latest = args.latest;
+
   if (!latest) {
     return {
       plan: null,
+      kind: "NONE",
+      source: "none",
       active: false,
       status: null,
       trialEndsAt: null,
@@ -118,13 +146,14 @@ function buildMembershipSummary(latest: {
     };
   }
 
-  const nowMs = Date.now();
   const isActiveByDate = latest.expiryDate.getTime() > nowMs;
   const active = isActiveByDate && latest.status === MembershipStatus.ACTIVE;
   const isTrial = active && (latest.amountPaidCents ?? 0) === 0;
 
   return {
     plan: latest.plan ?? null,
+    kind: isTrial ? "TRIAL" : active ? "PAID" : "NONE",
+    source: "membership",
     active,
     status: active ? "ACTIVE" : "EXPIRED",
     trialEndsAt: isTrial ? toIso(latest.expiryDate) : null,
@@ -198,6 +227,7 @@ export async function GET() {
         role: true,
         onboardingCompleted: true,
         emailVerified: true,
+        freeMembershipEndsAt: true,
       },
     });
 
@@ -250,11 +280,15 @@ export async function GET() {
         onboardingCompleted: Boolean(user.onboardingCompleted),
         emailVerified: Boolean(user.emailVerified),
       },
-      membership: buildMembershipSummary(latest),
+      membership: buildMembershipSummary({
+        latest,
+        freeMembershipEndsAt: user.freeMembershipEndsAt ?? null,
+      }),
       billing,
     };
 
     return NextResponse.json(payload);
+
   } catch (err) {
     console.error("GET /api/billing/membership error:", err);
     return NextResponse.json<ApiErr>(
