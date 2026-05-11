@@ -1143,7 +1143,8 @@ export default function AccountBillingPage() {
                                       Discount {money(safeCents(p.discountCents), p.currency)} ·
                                       Fee {money(safeCents(p.convenienceFeeCents), p.currency)}
                                     </div>
-                                  </td>                                  <td className="px-4 py-2">{statusPill(p.status)}</td>
+                                  </td>                                  
+                                  <td className="px-4 py-2">{statusPill(p.status)}</td>
                                   <td className="px-4 py-2 text-slate-700">{methodLabel(p)}</td>
                                   <td className="px-4 py-2 text-slate-700">
                                     {finalPaymentLabel(p, group)}

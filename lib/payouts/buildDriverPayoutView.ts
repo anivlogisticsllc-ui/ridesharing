@@ -194,12 +194,24 @@ function asNonNegativeCents(v: unknown): number {
     : 0;
 }
 
-function computeDriverSplit(collectedAmountCents: number) {
-  const grossAmountCents = Math.max(0, Math.round(collectedAmountCents));
+function computeDriverSplit(args: {
+  fareAmountCents: number;
+  tipAmountCents?: number;
+}) {
+  const fareAmountCents = asNonNegativeCents(args.fareAmountCents);
+  const tipAmountCents = asNonNegativeCents(args.tipAmountCents);
+
+  const grossAmountCents = fareAmountCents + tipAmountCents;
+
+  // Platform fee applies to ride fare only. Tip passes through to driver.
   const serviceFeeCents = Math.round(
-    grossAmountCents * (PLATFORM_FEE_BPS / 10000)
+    fareAmountCents * (PLATFORM_FEE_BPS / 10000)
   );
-  const netAmountCents = Math.max(0, grossAmountCents - serviceFeeCents);
+
+  const netAmountCents = Math.max(
+    0,
+    fareAmountCents - serviceFeeCents + tipAmountCents
+  );
 
   return { grossAmountCents, serviceFeeCents, netAmountCents };
 }
@@ -235,11 +247,14 @@ function deriveSettlementType(args: {
   refundIssued: boolean;
 }): LedgerSettlementType {
   if (args.cashPreservedRefund) return "CASH_PRESERVED";
+
   if (args.paymentType === "CASH" || args.originalPaymentType === "CASH") {
     return "CASH_COLLECTED";
   }
+
   if (args.refundIssued) return "REFUND_ADJUSTED";
   if (args.paymentType === "CARD") return "CARD_PAYOUT";
+
   return "UNKNOWN";
 }
 
@@ -264,11 +279,82 @@ function deriveExclusionReason(args: {
   return "Not payout eligible";
 }
 
+function deriveTipAmountCents(payment: any): number {
+  const tipStatus = String(payment?.tipStatus ?? "").toUpperCase();
+
+  if (tipStatus !== "SUCCEEDED" && tipStatus !== "PENDING") {
+    return 0;
+  }
+
+  return asNonNegativeCents(payment?.tipAmountCents);
+}
+
+function deriveFareAmountCents(args: {
+  latestPayment: any;
+  booking: any;
+  rideEstimateCents: number;
+  tipAmountCents: number;
+}) {
+  const { latestPayment, booking, rideEstimateCents, tipAmountCents } = args;
+
+  const baseMinusDiscount = Math.max(
+    0,
+    asNonNegativeCents(latestPayment?.baseAmountCents ?? booking.baseAmountCents) -
+      asNonNegativeCents(latestPayment?.discountCents)
+  );
+
+  if (baseMinusDiscount > 0) return baseMinusDiscount;
+
+  const paymentFinalMinusTip = Math.max(
+    0,
+    asNonNegativeCents(latestPayment?.finalAmountCents) - tipAmountCents
+  );
+
+  if (paymentFinalMinusTip > 0) return paymentFinalMinusTip;
+
+  const bookingFinalMinusTip = Math.max(
+    0,
+    asNonNegativeCents(booking.finalAmountCents) - tipAmountCents
+  );
+
+  if (bookingFinalMinusTip > 0) return bookingFinalMinusTip;
+
+  return rideEstimateCents;
+}
+
+function computeRefundAdjustedSplit(args: {
+  bookingFinalAmountCents: number;
+  refundAmountCents: number;
+  tipAmountCents: number;
+}) {
+  const adjustedGrossAfterRefundCents = Math.max(
+    0,
+    args.bookingFinalAmountCents - args.refundAmountCents
+  );
+
+  const adjustedTipAmountCents =
+    adjustedGrossAfterRefundCents >= args.tipAmountCents
+      ? args.tipAmountCents
+      : 0;
+
+  const adjustedFareAmountCents = Math.max(
+    0,
+    adjustedGrossAfterRefundCents - adjustedTipAmountCents
+  );
+
+  return computeDriverSplit({
+    fareAmountCents: adjustedFareAmountCents,
+    tipAmountCents: adjustedTipAmountCents,
+  });
+}
+
 function startOfWeekMonday(date: Date) {
   const d = new Date(date);
   d.setHours(0, 0, 0, 0);
+
   const day = d.getDay();
   const diffToMonday = (day + 6) % 7;
+
   d.setDate(d.getDate() - diffToMonday);
   return d;
 }
@@ -276,8 +362,10 @@ function startOfWeekMonday(date: Date) {
 function endOfWeekSunday(date: Date) {
   const start = startOfWeekMonday(date);
   const end = new Date(start);
+
   end.setDate(end.getDate() + 6);
   end.setHours(23, 59, 59, 999);
+
   return end;
 }
 
@@ -285,6 +373,7 @@ function formatWeekKey(start: Date) {
   const y = start.getFullYear();
   const m = String(start.getMonth() + 1).padStart(2, "0");
   const d = String(start.getDate()).padStart(2, "0");
+
   return `${y}-${m}-${d}`;
 }
 
@@ -294,11 +383,13 @@ function formatWeekLabel(start: Date, end: Date) {
     day: "numeric",
     year: "numeric",
   });
+
   const endLabel = end.toLocaleDateString(undefined, {
     month: "short",
     day: "numeric",
     year: "numeric",
   });
+
   return `${startLabel} – ${endLabel}`;
 }
 
@@ -445,7 +536,8 @@ export async function buildDriverPayoutView(
     },
   });
 
-  const latestBookingByRideId = new Map<string, (typeof bookings)[number]>();
+  const latestBookingByRideId = new Map<string, any>();
+
   for (const booking of bookings) {
     if (!latestBookingByRideId.has(booking.rideId)) {
       latestBookingByRideId.set(booking.rideId, booking);
@@ -480,13 +572,13 @@ export async function buildDriverPayoutView(
       })
     : [];
 
-const latestPaymentByRideId = new Map<string, (typeof ridePayments)[number]>();
+  const latestPaymentByRideId = new Map<string, any>();
 
-for (const payment of ridePayments) {
-  if (!latestPaymentByRideId.has(payment.rideId)) {
-    latestPaymentByRideId.set(payment.rideId, payment);
+  for (const payment of ridePayments) {
+    if (!latestPaymentByRideId.has(payment.rideId)) {
+      latestPaymentByRideId.set(payment.rideId, payment);
+    }
   }
-}
 
   const disputes = rideIds.length
     ? await prisma.dispute.findMany({
@@ -529,6 +621,7 @@ for (const payment of ridePayments) {
     : [];
 
   const refundFeeLostByRidePaymentId = new Map<string, number>();
+
   for (const refund of refunds) {
     if (!refundFeeLostByRidePaymentId.has(refund.ridePaymentId)) {
       refundFeeLostByRidePaymentId.set(
@@ -560,7 +653,9 @@ for (const payment of ridePayments) {
         refundIssuedAt: dispute.refundIssuedAt ?? null,
         ridePaymentId,
         processorFeeLostCents: ridePaymentId
-          ? asNonNegativeCents(refundFeeLostByRidePaymentId.get(ridePaymentId) ?? 0)
+          ? asNonNegativeCents(
+              refundFeeLostByRidePaymentId.get(ridePaymentId) ?? 0
+            )
           : 0,
       });
     }
@@ -573,19 +668,26 @@ for (const payment of ridePayments) {
     if (!ride?.departureTime) continue;
 
     const latestPayment = latestPaymentByRideId.get(booking.rideId);
-
     const rideEstimateCents = asNonNegativeCents(ride.totalPriceCents);
 
-    const bookingFinalAmountCents =
-      asNonNegativeCents(latestPayment?.finalAmountCents) ||
-      asNonNegativeCents(booking.finalAmountCents) ||
-      rideEstimateCents;
+    const tipAmountCents = deriveTipAmountCents(latestPayment);
+
+    const fareAmountCents = deriveFareAmountCents({
+      latestPayment,
+      booking,
+      rideEstimateCents,
+      tipAmountCents,
+    });
+
+    const bookingFinalAmountCents = fareAmountCents + tipAmountCents;
 
     const dispute = disputeByRideId.get(booking.rideId);
+
     const refundAmountCents = Math.min(
       asNonNegativeCents(dispute?.refundAmountCents),
       bookingFinalAmountCents
     );
+
     const refundIssued = refundAmountCents > 0;
 
     const cashPreservedRefund = isCashPreservedRefund({
@@ -596,7 +698,10 @@ for (const payment of ridePayments) {
       refundAmountCents,
     });
 
-    const originalSplit = computeDriverSplit(bookingFinalAmountCents);
+    const originalSplit = computeDriverSplit({
+      fareAmountCents,
+      tipAmountCents,
+    });
 
     let displayGrossAmountCents = originalSplit.grossAmountCents;
     let displayServiceFeeCents = originalSplit.serviceFeeCents;
@@ -607,8 +712,12 @@ for (const payment of ridePayments) {
       displayServiceFeeCents = originalSplit.serviceFeeCents;
       displayNetAmountCents = originalSplit.netAmountCents;
     } else if (refundIssued) {
-      const adjustedBase = Math.max(0, bookingFinalAmountCents - refundAmountCents);
-      const adjustedSplit = computeDriverSplit(adjustedBase);
+      const adjustedSplit = computeRefundAdjustedSplit({
+        bookingFinalAmountCents,
+        refundAmountCents,
+        tipAmountCents,
+      });
+
       displayGrossAmountCents = adjustedSplit.grossAmountCents;
       displayServiceFeeCents = adjustedSplit.serviceFeeCents;
       displayNetAmountCents = adjustedSplit.netAmountCents;
@@ -696,6 +805,7 @@ for (const payment of ridePayments) {
   allTransactions.sort((a, b) => {
     const aTime = new Date(a.ride?.departureTime ?? a.createdAt).getTime();
     const bTime = new Date(b.ride?.departureTime ?? b.createdAt).getTime();
+
     return bTime - aTime;
   });
 
@@ -703,18 +813,22 @@ for (const payment of ridePayments) {
     (sum, tx) => sum + tx.grossAmountCents,
     0
   );
+
   const serviceFeeCents = allTransactions.reduce(
     (sum, tx) => sum + tx.serviceFeeCents,
     0
   );
+
   const netAmountCents = allTransactions.reduce(
     (sum, tx) => sum + tx.netAmountCents,
     0
   );
+
   const refundFeeChargedToDriverCents = allTransactions.reduce(
     (sum, tx) => sum + tx.driverDisputeFeeCents,
     0
   );
+
   const netAfterDisputeFeeCents = allTransactions.reduce(
     (sum, tx) => sum + tx.netAfterDisputeFeeCents,
     0
@@ -820,12 +934,13 @@ for (const payment of ridePayments) {
     if (!key || payoutsByWeekKey.has(key)) continue;
 
     const statusUpper = String(payout.status).toUpperCase();
+
     const mappedStatus: "PAID" | "PENDING" | "NONE" =
       statusUpper === "PAID"
         ? "PAID"
         : statusUpper === "PENDING"
-        ? "PENDING"
-        : "NONE";
+          ? "PENDING"
+          : "NONE";
 
     payoutsByWeekKey.set(key, {
       id: payout.id,
@@ -848,6 +963,7 @@ for (const payment of ridePayments) {
       );
 
       const savedPayout = payoutsByWeekKey.get(week.key);
+
       if (savedPayout) {
         week.payoutId = savedPayout.id;
         week.payoutStatus = savedPayout.status;
