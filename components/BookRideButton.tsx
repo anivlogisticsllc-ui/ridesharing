@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { useSession } from "next-auth/react";
 
 type Role = "RIDER" | "DRIVER" | "ADMIN";
+
 function asRole(v: unknown): Role | null {
   return v === "RIDER" || v === "DRIVER" || v === "ADMIN" ? v : null;
 }
@@ -13,6 +14,11 @@ type BookRideResponse =
   | { ok: true; bookingId: string; conversationId: string | null }
   | { ok: false; error: string };
 
+function isMembershipError(message: string) {
+  const m = message.toLowerCase();
+  return m.includes("membership") && (m.includes("expired") || m.includes("active"));
+}
+
 export function BookRideButton({ rideId }: { rideId: string }) {
   const { data: session, status } = useSession();
   const router = useRouter();
@@ -20,9 +26,11 @@ export function BookRideButton({ rideId }: { rideId: string }) {
   const [loading, setLoading] = useState(false);
   const [success, setSuccess] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [membershipBlocked, setMembershipBlocked] = useState(false);
 
   async function handleClick() {
     setError(null);
+    setMembershipBlocked(false);
 
     if (status === "loading") return;
 
@@ -33,7 +41,6 @@ export function BookRideButton({ rideId }: { rideId: string }) {
 
     const role = asRole((session.user as any)?.role);
 
-    // Driver-only (optionally allow ADMIN)
     if (role !== "DRIVER" && role !== "ADMIN") {
       setError("Only drivers can book rides.");
       return;
@@ -56,7 +63,16 @@ export function BookRideButton({ rideId }: { rideId: string }) {
       const data = (await res.json().catch(() => null)) as BookRideResponse | null;
 
       if (!res.ok || !data?.ok) {
-        throw new Error((data as any)?.error || "Booking failed.");
+        const message = (data as any)?.error || "Booking failed.";
+
+        if (isMembershipError(message)) {
+          setMembershipBlocked(true);
+          setError(message);
+          return;
+        }
+
+        setError(message);
+        return;
       }
 
       setSuccess(true);
@@ -79,7 +95,7 @@ export function BookRideButton({ rideId }: { rideId: string }) {
   }
 
   return (
-    <div className="flex flex-col items-end gap-1">
+    <div className="flex flex-col items-end gap-2">
       <button
         type="button"
         onClick={handleClick}
@@ -89,11 +105,25 @@ export function BookRideButton({ rideId }: { rideId: string }) {
         {success ? "Booked" : loading ? "Booking..." : "Book ride"}
       </button>
 
-      {error && (
+      {membershipBlocked ? (
+        <div className="max-w-[300px] rounded-2xl border border-rose-200 bg-rose-50 px-4 py-3 text-right text-xs text-rose-900">
+          <p className="font-semibold">Membership is expired.</p>
+          <p className="mt-1 text-[11px] opacity-90">
+            Renew your membership to book this ride.
+          </p>
+          <button
+            type="button"
+            onClick={() => router.push("/billing/membership")}
+            className="mt-2 rounded-full border border-current/20 bg-white/60 px-3 py-1 text-[11px] font-medium hover:bg-white"
+          >
+            Open Membership & Billing
+          </button>
+        </div>
+      ) : error ? (
         <span className="max-w-[220px] text-right text-[10px] text-rose-600">
           {error}
         </span>
-      )}
+      ) : null}
     </div>
   );
 }

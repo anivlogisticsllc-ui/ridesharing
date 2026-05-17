@@ -740,10 +740,17 @@ export default function DriverPortalInner() {
     }
 
     if (state === "EXPIRED") {
+      const endedLabel =
+        membership.trialEndsAt ? formatDate(membership.trialEndsAt) : formatDate(membership.currentPeriodEnd);
+
+      const isTrialExpired = membership.kind === "TRIAL" || Boolean(membership.trialEndsAt);
+
       return {
         tone: "danger" as const,
-        title: "Free trial has ended.",
-        body: `Trial ended ${trialEndsLabel ?? ""}. You can continue testing, but once billing is enforced you may be blocked from accepting new rides until payment is active.`,
+        title: isTrialExpired ? "Free trial has ended." : "Membership has expired.",
+        body: isTrialExpired
+          ? `Trial ended ${endedLabel ?? ""}. Activate a paid membership to continue booking rides.`
+          : `Membership ended ${endedLabel ?? ""}. Activate your membership to continue booking rides.`,
       };
     }
 

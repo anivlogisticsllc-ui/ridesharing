@@ -1,3 +1,5 @@
+// app/rider/portal/page.tsx
+
 "use client";
 
 import { useRouter } from "next/navigation";
@@ -140,6 +142,28 @@ function getDisplayFareCents(b: Booking): number | null {
   }
 
   return effective ?? base;
+}
+
+function getStoredTipCents(b: Booking): number {
+  const tipStatus = String(b.tipStatus ?? "").toUpperCase();
+  const tipAmountCents = normalizeCents(b.tipAmountCents);
+
+  if (tipAmountCents <= 0) return 0;
+
+  if (tipStatus === "SUCCEEDED" || tipStatus === "PENDING") {
+    return tipAmountCents;
+  }
+
+  return 0;
+}
+
+function getFinalTotalLabel(b: Booking): string {
+  const paymentLabel = getDisplayPaymentLabel(b);
+
+  if (paymentLabel.startsWith("CASH")) return "Total due";
+  if (paymentLabel === "CARD" || paymentLabel === "CARD fallback") return "Total charged";
+
+  return "Total";
 }
 
 function getDisplayPaymentLabel(b: Booking): string {
@@ -1653,6 +1677,10 @@ function RideList(props: {
         const displayFare = getDisplayFareCents(b);
         const displayDollars = typeof displayFare === "number" ? formatMoney(displayFare) : null;
 
+        const baseFareCents = getBaseFareCents(b);
+        const tipCents = getStoredTipCents(b);
+        const finalTotalLabel = getFinalTotalLabel(b);
+
         const distanceLabel =
           typeof b.distanceMiles === "number" && b.distanceMiles > 0 ? `${b.distanceMiles.toFixed(2)} miles` : null;
 
@@ -1965,9 +1993,16 @@ function RideList(props: {
                         </span>
                       )}
 
-                      {typeof getBaseFareCents(b) === "number" && (
+                      {typeof baseFareCents === "number" && (
                         <span>
-                          <strong>Ride fare:</strong> ${formatMoney(getBaseFareCents(b)!)}
+                          <strong>Ride fare:</strong> ${formatMoney(baseFareCents)}
+                        </span>
+                      )}
+
+                      {tipCents > 0 && (
+                        <span>
+                          <strong>Tip:</strong> ${formatMoney(tipCents)}
+                          {typeof b.tipPercent === "number" ? ` (${b.tipPercent}%)` : ""}
                         </span>
                       )}
 
@@ -1982,7 +2017,7 @@ function RideList(props: {
                         </>
                       ) : typeof getEffectiveFareCents(b) === "number" ? (
                         <span>
-                          <strong>Displayed fare:</strong> ${formatMoney(getEffectiveFareCents(b)!)}
+                          <strong>{finalTotalLabel}:</strong> ${formatMoney(getEffectiveFareCents(b)!)}
                         </span>
                       ) : null}
 
