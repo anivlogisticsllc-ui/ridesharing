@@ -1,0 +1,8 @@
+{
+  "crons": [
+    {
+      "path": "/api/jobs/renew-memberships",
+      "schedule": "0 8 * * *"
+    }
+  ]
+}
