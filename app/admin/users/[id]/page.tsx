@@ -26,6 +26,20 @@ type DriverProfile = {
   updatedAt?: string | null;
 };
 
+type ComputedMembership = {
+  source: "membership_table" | "legacy_user_fields";
+  membershipId: string | null;
+  type: string | null;
+  plan: string | null;
+  status: "TRIAL" | "ACTIVE" | "EXPIRED" | "INACTIVE";
+  active: boolean;
+  trialEndsAt: string | null;
+  currentPeriodEnd: string | null;
+  amountPaidCents: number | null;
+  paymentProvider: string | null;
+  paymentRef: string | null;
+};
+
 type UserDetails = {
   id: string;
   email: string;
@@ -57,6 +71,8 @@ type UserDetails = {
   trialEndsAt: string | null;
   freeMembershipEndsAt: string | null;
 
+  computedMembership?: ComputedMembership | null;
+
   createdAt: string | null;
   updatedAt: string | null;
 
@@ -75,6 +91,7 @@ function asRole(v: unknown): Role | null {
 async function readApiError(res: Response) {
   const text = await res.text().catch(() => "");
   if (!text) return `Request failed (HTTP ${res.status}).`;
+
   try {
     const json = JSON.parse(text);
     return json?.error || json?.message || `Request failed (HTTP ${res.status}).`;
@@ -86,7 +103,9 @@ async function readApiError(res: Response) {
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div className="min-w-0">
-      <div className="text-[11px] font-medium uppercase tracking-wide text-slate-500">{label}</div>
+      <div className="text-[11px] font-medium uppercase tracking-wide text-slate-500">
+        {label}
+      </div>
       <div className="mt-1">{children}</div>
     </div>
   );
@@ -96,7 +115,7 @@ function inputClass() {
   return "w-full rounded-lg border border-slate-300 px-3 py-2 text-sm";
 }
 
-function fmt(v: any) {
+function fmt(v: unknown) {
   if (v === null || v === undefined || v === "") return "—";
   return String(v);
 }
@@ -104,16 +123,21 @@ function fmt(v: any) {
 function toNumberOrNull(v: string) {
   const t = v.trim();
   if (!t) return null;
+
   const n = Number(t);
   if (!Number.isFinite(n)) return null;
+
   return Math.trunc(n);
 }
 
 function isoToLocalInput(iso: string | null) {
   if (!iso) return "";
+
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return "";
+
   const pad = (n: number) => String(n).padStart(2, "0");
+
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(
     d.getHours()
   )}:${pad(d.getMinutes())}`;
@@ -122,19 +146,67 @@ function isoToLocalInput(iso: string | null) {
 function localInputToIso(local: string) {
   const t = local.trim();
   if (!t) return null;
+
   const d = new Date(t);
   if (Number.isNaN(d.getTime())) return null;
+
   return d.toISOString();
 }
 
 function formatIsoShort(iso: string | null) {
   if (!iso) return "—";
+
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return "—";
+
   return d.toLocaleString();
 }
 
 function computeMembershipView(user: UserDetails) {
+  const cm = user.computedMembership ?? null;
+
+  if (cm?.source === "membership_table") {
+    const isPaid = (cm.amountPaidCents ?? 0) > 0;
+
+    if (cm.status === "ACTIVE") {
+      return {
+        badge: isPaid ? "PAID" : "TRIAL",
+        summary: isPaid
+          ? `Paid membership active until ${formatIsoShort(cm.currentPeriodEnd)}`
+          : `Trial active until ${formatIsoShort(cm.trialEndsAt || cm.currentPeriodEnd)}`,
+        source: "Membership table",
+        plan: cm.plan ?? user.membershipPlan,
+      };
+    }
+
+    if (cm.status === "TRIAL") {
+      return {
+        badge: "TRIAL",
+        summary: `Trial ends ${formatIsoShort(cm.trialEndsAt || cm.currentPeriodEnd)}`,
+        source: "Membership table",
+        plan: cm.plan ?? user.membershipPlan,
+      };
+    }
+
+    if (cm.status === "EXPIRED") {
+      return {
+        badge: "EXPIRED",
+        summary: `Latest membership expired ${
+          cm.currentPeriodEnd ? `on ${formatIsoShort(cm.currentPeriodEnd)}` : ""
+        }`.trim(),
+        source: "Membership table",
+        plan: cm.plan ?? user.membershipPlan,
+      };
+    }
+
+    return {
+      badge: "INACTIVE",
+      summary: "No active paid membership, trial, or admin grant.",
+      source: "Membership table",
+      plan: cm.plan ?? user.membershipPlan,
+    };
+  }
+
   const now = Date.now();
 
   const trialEndsAtMs = user.trialEndsAt ? Date.parse(user.trialEndsAt) : NaN;
@@ -148,6 +220,7 @@ function computeMembershipView(user: UserDetails) {
       badge: "TRIAL",
       summary: `Trial ends ${formatIsoShort(user.trialEndsAt)}`,
       source: "trialEndsAt",
+      plan: user.membershipPlan,
     };
   }
 
@@ -156,6 +229,7 @@ function computeMembershipView(user: UserDetails) {
       badge: "ADMIN GRANT",
       summary: `Grant ends ${formatIsoShort(user.freeMembershipEndsAt)}`,
       source: "freeMembershipEndsAt",
+      plan: user.membershipPlan,
     };
   }
 
@@ -164,6 +238,7 @@ function computeMembershipView(user: UserDetails) {
       badge: "ACTIVE",
       summary: `Active${user.membershipPlan ? ` • plan ${user.membershipPlan}` : ""}`,
       source: "membershipActive",
+      plan: user.membershipPlan,
     };
   }
 
@@ -171,6 +246,7 @@ function computeMembershipView(user: UserDetails) {
     badge: "INACTIVE",
     summary: "No active trial, grant, or paid membership indicated by current admin fields.",
     source: "none",
+    plan: user.membershipPlan,
   };
 }
 
@@ -180,12 +256,16 @@ function MembershipBadge({ value }: { value: string }) {
       ? "border-amber-200 bg-amber-50 text-amber-700"
       : value === "ADMIN GRANT"
       ? "border-sky-200 bg-sky-50 text-sky-700"
-      : value === "ACTIVE"
+      : value === "ACTIVE" || value === "PAID"
       ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+      : value === "EXPIRED"
+      ? "border-rose-200 bg-rose-50 text-rose-700"
       : "border-slate-200 bg-slate-50 text-slate-700";
 
   return (
-    <span className={`inline-flex items-center rounded-full border px-2.5 py-1 text-xs font-medium ${cls}`}>
+    <span
+      className={`inline-flex items-center rounded-full border px-2.5 py-1 text-xs font-medium ${cls}`}
+    >
       {value}
     </span>
   );
@@ -220,8 +300,10 @@ export default function AdminUserDetailsPage() {
   function setDriver<K extends keyof DriverProfile>(key: K, value: DriverProfile[K]) {
     setDraft((prev) => {
       if (!prev) return prev;
+
       const dp = prev.driverProfile ? { ...prev.driverProfile } : {};
       (dp as any)[key] = value;
+
       return { ...prev, driverProfile: dp as DriverProfile };
     });
   }
@@ -248,6 +330,7 @@ export default function AdminUserDetailsPage() {
       }
 
       const json = (await res.json().catch(() => null)) as ApiOk | ApiErr | null;
+
       if (!res.ok || !json || !("ok" in json) || !json.ok) {
         setError((json as any)?.error || `Failed to load user (HTTP ${res.status})`);
         setUser(null);
@@ -293,8 +376,10 @@ export default function AdminUserDetailsPage() {
     });
 
     if (!res.ok) throw new Error(await readApiError(res));
+
     const json = await res.json().catch(() => null);
     if (!json?.ok) throw new Error(json?.error || "Update failed.");
+
     return json.user as UserDetails;
   }
 
@@ -354,6 +439,7 @@ export default function AdminUserDetailsPage() {
   async function applyGrant() {
     const raw = grantDays.trim();
     const days = Number(raw);
+
     if (!raw) return;
 
     if (!Number.isFinite(days) || days < 1 || days > 3650) {
@@ -451,7 +537,6 @@ export default function AdminUserDetailsPage() {
           </div>
         ) : (
           <>
-            {/* Account */}
             <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
               <h2 className="text-sm font-semibold text-slate-900">Account</h2>
 
@@ -536,13 +621,14 @@ export default function AdminUserDetailsPage() {
               </div>
             </section>
 
-            {/* Computed membership view */}
             <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
               <div className="flex flex-wrap items-start justify-between gap-3">
                 <div>
-                  <h2 className="text-sm font-semibold text-slate-900">Computed membership view</h2>
+                  <h2 className="text-sm font-semibold text-slate-900">
+                    Computed membership view
+                  </h2>
                   <p className="mt-1 text-xs text-slate-500">
-                    Trial is a state, not a plan. This section summarizes how the current admin fields would be interpreted.
+                    This section uses the Membership table first, then falls back to legacy user fields.
                   </p>
                 </div>
 
@@ -564,15 +650,16 @@ export default function AdminUserDetailsPage() {
 
                 <Field label="Plan">
                   <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-800">
-                    {fmt(draft.membershipPlan)}
+                    {fmt(membershipView?.plan ?? draft.membershipPlan)}
                   </div>
                 </Field>
               </div>
             </section>
 
-            {/* Membership + Admin grant */}
             <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
-              <h2 className="text-sm font-semibold text-slate-900">Membership fields & admin grant</h2>
+              <h2 className="text-sm font-semibold text-slate-900">
+                Membership fields & admin grant
+              </h2>
               <p className="mt-1 text-xs text-slate-500">
                 Plan should remain a tier like STANDARD. Trial and grant are time-based states.
               </p>
@@ -661,7 +748,6 @@ export default function AdminUserDetailsPage() {
               </div>
             </section>
 
-            {/* Driver profile */}
             {showDriverProfile ? (
               <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
                 <h2 className="text-sm font-semibold text-slate-900">Driver profile</h2>
@@ -769,7 +855,7 @@ export default function AdminUserDetailsPage() {
                 </div>
 
                 <p className="mt-3 text-xs text-slate-500">
-                  This section is only shown for DRIVER users (or when a driverProfile already exists).
+                  This section is only shown for DRIVER users or when a driverProfile already exists.
                 </p>
               </section>
             ) : (
