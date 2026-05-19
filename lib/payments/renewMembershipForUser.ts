@@ -1,4 +1,4 @@
-// FILE: lib/payments/renewMembershipForUser.ts
+// lib/payments/renewMembershipForUser.ts
 
 import { prisma } from "@/lib/prisma";
 import { stripe } from "@/lib/stripe";
@@ -75,13 +75,88 @@ async function priceForMembershipType(type: MembershipType): Promise<number> {
     },
   });
 
-  if (pricing?.isActive && typeof pricing.amountCents === "number" && pricing.amountCents > 0) {
+  if (
+    pricing?.isActive &&
+    typeof pricing.amountCents === "number" &&
+    pricing.amountCents > 0
+  ) {
     return pricing.amountCents;
   }
 
   return type === MembershipType.DRIVER
     ? PRICING_FALLBACK.DRIVER_MONTHLY_CENTS
     : PRICING_FALLBACK.RIDER_MONTHLY_CENTS;
+}
+
+function getStripeErrorPaymentIntentId(err: unknown): string | null {
+  const anyErr = err as any;
+
+  if (typeof anyErr?.payment_intent === "string") {
+    return anyErr.payment_intent;
+  }
+
+  if (typeof anyErr?.payment_intent?.id === "string") {
+    return anyErr.payment_intent.id;
+  }
+
+  if (typeof anyErr?.raw?.payment_intent === "string") {
+    return anyErr.raw.payment_intent;
+  }
+
+  if (typeof anyErr?.raw?.payment_intent?.id === "string") {
+    return anyErr.raw.payment_intent.id;
+  }
+
+  return null;
+}
+
+async function expireDueMemberships(args: {
+  userId: string;
+  type: MembershipType;
+  now: Date;
+}) {
+  await prisma.membership.updateMany({
+    where: {
+      userId: args.userId,
+      type: args.type,
+      status: MembershipStatus.ACTIVE,
+      expiryDate: { lte: args.now },
+    },
+    data: {
+      status: MembershipStatus.EXPIRED,
+    },
+  });
+
+  await prisma.user.update({
+    where: { id: args.userId },
+    data: {
+      membershipActive: false,
+    },
+  });
+}
+
+async function createFailedMembershipCharge(args: {
+  userId: string;
+  membershipId: string | null;
+  paymentMethodId: string | null;
+  amountCents: number;
+  reason: string;
+}) {
+  return prisma.membershipCharge.create({
+    data: {
+      userId: args.userId,
+      membershipId: args.membershipId,
+      paymentMethodId: args.paymentMethodId,
+      amountCents: args.amountCents,
+      currency: "USD",
+      status: MembershipChargeStatus.FAILED,
+      provider: "STRIPE",
+      failedAt: new Date(),
+    },
+    select: {
+      id: true,
+    },
+  });
 }
 
 export async function renewMembershipForUser(args: {
@@ -125,7 +200,8 @@ export async function renewMembershipForUser(args: {
   }
 
   const adminGrantActive =
-    user.freeMembershipEndsAt instanceof Date && user.freeMembershipEndsAt.getTime() > now.getTime();
+    user.freeMembershipEndsAt instanceof Date &&
+    user.freeMembershipEndsAt.getTime() > now.getTime();
 
   if (adminGrantActive && !args.ignoreAdminGrant) {
     return {
@@ -167,15 +243,7 @@ export async function renewMembershipForUser(args: {
     };
   }
 
-  if (!user.stripeCustomerId) {
-    return {
-      ok: false,
-      charged: false,
-      skipped: false,
-      reason: "NO_STRIPE_CUSTOMER",
-      error: "User does not have a Stripe customer ID.",
-    };
-  }
+  const amountCents = await priceForMembershipType(membershipType);
 
   const paymentMethod = await prisma.paymentMethod.findFirst({
     where: {
@@ -194,19 +262,59 @@ export async function renewMembershipForUser(args: {
   });
 
   const stripePaymentMethodId =
-    paymentMethod?.stripePaymentMethodId || paymentMethod?.providerPaymentMethodId || null;
+    paymentMethod?.stripePaymentMethodId ||
+    paymentMethod?.providerPaymentMethodId ||
+    null;
+
+  if (!user.stripeCustomerId) {
+    await expireDueMemberships({
+      userId: user.id,
+      type: membershipType,
+      now,
+    });
+
+    const failedCharge = await createFailedMembershipCharge({
+      userId: user.id,
+      membershipId: latestMembership?.id ?? null,
+      paymentMethodId: paymentMethod?.id ?? null,
+      amountCents,
+      reason: "NO_STRIPE_CUSTOMER",
+    });
+
+    return {
+      ok: false,
+      charged: false,
+      skipped: false,
+      reason: "NO_STRIPE_CUSTOMER",
+      error: "User does not have a Stripe customer ID.",
+      membershipChargeId: failedCharge.id,
+    };
+  }
 
   if (!paymentMethod || !stripePaymentMethodId) {
+    await expireDueMemberships({
+      userId: user.id,
+      type: membershipType,
+      now,
+    });
+
+    const failedCharge = await createFailedMembershipCharge({
+      userId: user.id,
+      membershipId: latestMembership?.id ?? null,
+      paymentMethodId: paymentMethod?.id ?? null,
+      amountCents,
+      reason: "NO_DEFAULT_PAYMENT_METHOD",
+    });
+
     return {
       ok: false,
       charged: false,
       skipped: false,
       reason: "NO_DEFAULT_PAYMENT_METHOD",
       error: "No default Stripe payment method found.",
+      membershipChargeId: failedCharge.id,
     };
   }
-
-  const amountCents = await priceForMembershipType(membershipType);
 
   const periodStart =
     latestMembership?.expiryDate && latestMembership.expiryDate.getTime() > now.getTime()
@@ -218,6 +326,7 @@ export async function renewMembershipForUser(args: {
   const membershipCharge = await prisma.membershipCharge.create({
     data: {
       userId: user.id,
+      membershipId: latestMembership?.id ?? null,
       paymentMethodId: paymentMethod.id,
       amountCents,
       currency: "USD",
@@ -237,6 +346,7 @@ export async function renewMembershipForUser(args: {
       payment_method: stripePaymentMethodId,
       confirm: true,
       off_session: true,
+      description: `${membershipType} membership ${args.reason}`,
       metadata: {
         userId: user.id,
         membershipChargeId: membershipCharge.id,
@@ -246,6 +356,12 @@ export async function renewMembershipForUser(args: {
     });
 
     if (paymentIntent.status !== "succeeded") {
+      await expireDueMemberships({
+        userId: user.id,
+        type: membershipType,
+        now,
+      });
+
       await prisma.membershipCharge.update({
         where: { id: membershipCharge.id },
         data: {
@@ -266,6 +382,12 @@ export async function renewMembershipForUser(args: {
       };
     }
 
+    await expireDueMemberships({
+      userId: user.id,
+      type: membershipType,
+      now,
+    });
+
     const membership = await prisma.membership.create({
       data: {
         userId: user.id,
@@ -276,7 +398,7 @@ export async function renewMembershipForUser(args: {
         amountPaidCents: amountCents,
         paymentProvider: "STRIPE",
         paymentRef: paymentIntent.id,
-        plan: MembershipPlan.STANDARD,
+        plan: latestMembership?.plan || MembershipPlan.STANDARD,
       },
       select: {
         id: true,
@@ -290,7 +412,9 @@ export async function renewMembershipForUser(args: {
         status: MembershipChargeStatus.SUCCEEDED,
         stripePaymentIntentId: paymentIntent.id,
         stripeChargeId:
-          typeof paymentIntent.latest_charge === "string" ? paymentIntent.latest_charge : null,
+          typeof paymentIntent.latest_charge === "string"
+            ? paymentIntent.latest_charge
+            : null,
         providerRef: paymentIntent.id,
         paidAt: new Date(),
       },
@@ -317,11 +441,20 @@ export async function renewMembershipForUser(args: {
     };
   } catch (err) {
     const message = err instanceof Error ? err.message : "Stripe payment failed.";
+    const paymentIntentId = getStripeErrorPaymentIntentId(err);
+
+    await expireDueMemberships({
+      userId: user.id,
+      type: membershipType,
+      now,
+    });
 
     await prisma.membershipCharge.update({
       where: { id: membershipCharge.id },
       data: {
         status: MembershipChargeStatus.FAILED,
+        stripePaymentIntentId: paymentIntentId,
+        providerRef: paymentIntentId,
         failedAt: new Date(),
       },
     });
