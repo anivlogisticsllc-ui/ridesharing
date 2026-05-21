@@ -235,11 +235,11 @@ export async function GET() {
         prisma.membershipCharge.findFirst({
           where: {
             userId: user.id,
-            status: MembershipChargeStatus.FAILED,
           },
-          orderBy: [{ failedAt: "desc" }, { createdAt: "desc" }],
+          orderBy: [{ createdAt: "desc" }],
           select: {
             amountCents: true,
+            status: true,
             failedAt: true,
             stripePaymentIntentId: true,
             providerRef: true,
@@ -264,17 +264,18 @@ export async function GET() {
             expYear: defaultPaymentMethod.expYear || 0,
           }
         : null,
-      failedRenewal: failedRenewalCharge
-        ? {
-            amountCents: failedRenewalCharge.amountCents,
-            failedAt: toIso(failedRenewalCharge.failedAt),
-            reason: "Payment failed",
-            stripePaymentIntentId:
-              failedRenewalCharge.stripePaymentIntentId ??
-              failedRenewalCharge.providerRef ??
-              null,
-          }
-        : null,
+        failedRenewal:
+          failedRenewalCharge?.status === MembershipChargeStatus.FAILED
+            ? {
+                amountCents: failedRenewalCharge.amountCents,
+                failedAt: toIso(failedRenewalCharge.failedAt),
+                reason: "Payment failed",
+                stripePaymentIntentId:
+                  failedRenewalCharge.stripePaymentIntentId ??
+                  failedRenewalCharge.providerRef ??
+                  null,
+              }
+            : null,
     };
 
     const payload: ApiOk = {

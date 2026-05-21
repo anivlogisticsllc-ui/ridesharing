@@ -1,5 +1,6 @@
 // app/api/billing/payment-method/route.ts
-import { NextResponse } from "next/server";
+
+import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/pages/api/auth/[...nextauth]";
 import { prisma } from "@/lib/prisma";
@@ -42,6 +43,7 @@ type PMShape = {
   expMonth: number | null;
   expYear: number | null;
   stripePaymentMethodId: string | null;
+  isDefault: boolean;
   updatedAt: string;
 };
 
@@ -53,6 +55,7 @@ function shapeFromDb(row: {
   expMonth: number | null;
   expYear: number | null;
   stripePaymentMethodId: string | null;
+  isDefault: boolean;
   updatedAt: Date;
 }): PMShape {
   return {
@@ -63,8 +66,71 @@ function shapeFromDb(row: {
     expMonth: row.expMonth ?? null,
     expYear: row.expYear ?? null,
     stripePaymentMethodId: row.stripePaymentMethodId ?? null,
+    isDefault: row.isDefault,
     updatedAt: row.updatedAt.toISOString(),
   };
+}
+
+async function saveDefaultCard(params: {
+  userId: string;
+  stripePmId: string;
+  card: Stripe.PaymentMethod.Card;
+}) {
+  const { userId, stripePmId, card } = params;
+
+  return prisma.$transaction(async (tx) => {
+    await tx.paymentMethod.updateMany({
+      where: { userId, isDefault: true },
+      data: { isDefault: false },
+    });
+
+    const row = await tx.paymentMethod.upsert({
+      where: {
+        userId_stripePaymentMethodId: {
+          userId,
+          stripePaymentMethodId: stripePmId,
+        },
+      },
+      create: {
+        userId,
+        provider: "STRIPE",
+        providerPaymentMethodId: stripePmId,
+        stripePaymentMethodId: stripePmId,
+        brand: card.brand ?? null,
+        last4: card.last4 ?? null,
+        expMonth: card.exp_month ?? null,
+        expYear: card.exp_year ?? null,
+        isDefault: true,
+      },
+      update: {
+        provider: "STRIPE",
+        providerPaymentMethodId: stripePmId,
+        brand: card.brand ?? null,
+        last4: card.last4 ?? null,
+        expMonth: card.exp_month ?? null,
+        expYear: card.exp_year ?? null,
+        isDefault: true,
+      },
+      select: {
+        id: true,
+        provider: true,
+        brand: true,
+        last4: true,
+        expMonth: true,
+        expYear: true,
+        stripePaymentMethodId: true,
+        isDefault: true,
+        updatedAt: true,
+      },
+    });
+
+    await tx.user.update({
+      where: { id: userId },
+      data: { stripeDefaultPaymentId: stripePmId },
+    });
+
+    return row;
+  });
 }
 
 async function getStripeDefaultCard(
@@ -85,7 +151,7 @@ async function getStripeDefaultCard(
 
   if (defaultPmId) {
     const pm = await stripe.paymentMethods.retrieve(defaultPmId);
-    if (pm && pm.type === "card" && pm.card) {
+    if (pm?.type === "card" && pm.card) {
       return { paymentMethodId: defaultPmId, card: pm.card };
     }
   }
@@ -96,81 +162,12 @@ async function getStripeDefaultCard(
     limit: 1,
   });
 
-  const first = list.data?.[0];
-  if (first && first.type === "card" && first.card) {
+  const first = list.data[0];
+  if (first?.type === "card" && first.card) {
     return { paymentMethodId: first.id, card: first.card };
   }
 
   return null;
-}
-
-/**
- * Saves/updates a PaymentMethod row and makes it default for the user.
- * Requires Prisma schema to have: @@unique([userId, stripePaymentMethodId])
- */
-async function saveDefaultCard(params: {
-  userId: string;
-  stripePmId: string;
-  card: Stripe.PaymentMethod.Card;
-}) {
-  const { userId, stripePmId, card } = params;
-
-  const provider = "STRIPE";
-  const brand = card.brand ?? null;
-  const last4 = card.last4 ?? null;
-  const expMonth = card.exp_month ?? null;
-  const expYear = card.exp_year ?? null;
-
-  return prisma.$transaction(async (tx) => {
-    await tx.paymentMethod.updateMany({
-      where: { userId, isDefault: true },
-      data: { isDefault: false },
-    });
-
-    const row = await tx.paymentMethod.upsert({
-      where: {
-        userId_stripePaymentMethodId: {
-          userId,
-          stripePaymentMethodId: stripePmId,
-        },
-      },
-      create: {
-        userId,
-        provider,
-        stripePaymentMethodId: stripePmId,
-        brand,
-        last4,
-        expMonth,
-        expYear,
-        isDefault: true,
-      },
-      update: {
-        provider,
-        brand,
-        last4,
-        expMonth,
-        expYear,
-        isDefault: true,
-      },
-      select: {
-        id: true,
-        provider: true,
-        brand: true,
-        last4: true,
-        expMonth: true,
-        expYear: true,
-        stripePaymentMethodId: true,
-        updatedAt: true,
-      },
-    });
-
-    await tx.user.update({
-      where: { id: userId },
-      data: { stripeDefaultPaymentId: stripePmId },
-    });
-
-    return row;
-  });
 }
 
 export async function GET() {
@@ -181,12 +178,12 @@ export async function GET() {
     where: { id: userId },
     select: { id: true, stripeCustomerId: true, stripeDefaultPaymentId: true },
   });
+
   if (!user) return jsonError(404, "User not found");
 
-  // DB-first: look for default row
-  const dbDefault = await prisma.paymentMethod.findFirst({
-    where: { userId: user.id, isDefault: true },
-    orderBy: { updatedAt: "desc" },
+  let cards = await prisma.paymentMethod.findMany({
+    where: { userId: user.id, provider: "STRIPE" },
+    orderBy: [{ isDefault: "desc" }, { updatedAt: "desc" }],
     select: {
       id: true,
       provider: true,
@@ -195,83 +192,58 @@ export async function GET() {
       expMonth: true,
       expYear: true,
       stripePaymentMethodId: true,
+      isDefault: true,
       updatedAt: true,
     },
   });
 
-  // DB fallback: row matching user.stripeDefaultPaymentId
-  const dbFallback =
-    !dbDefault && user.stripeDefaultPaymentId
-      ? await prisma.paymentMethod.findFirst({
-          where: {
-            userId: user.id,
-            stripePaymentMethodId: user.stripeDefaultPaymentId,
-          },
-          select: {
-            id: true,
-            provider: true,
-            brand: true,
-            last4: true,
-            expMonth: true,
-            expYear: true,
-            stripePaymentMethodId: true,
-            updatedAt: true,
-          },
-        })
-      : null;
+  if (cards.length === 0 && user.stripeCustomerId) {
+    const stripeCard = await getStripeDefaultCard(user.stripeCustomerId);
 
-  const activeDb = dbDefault ?? dbFallback;
+    if (stripeCard) {
+      await saveDefaultCard({
+        userId: user.id,
+        stripePmId: stripeCard.paymentMethodId,
+        card: stripeCard.card,
+      });
 
-  if (activeDb?.stripePaymentMethodId) {
-    return noStoreJson({
-      ok: true,
-      hasPaymentMethod: true,
-      customerId: user.stripeCustomerId ?? null,
-      defaultPaymentMethod: shapeFromDb(activeDb),
-    });
+      cards = await prisma.paymentMethod.findMany({
+        where: { userId: user.id, provider: "STRIPE" },
+        orderBy: [{ isDefault: "desc" }, { updatedAt: "desc" }],
+        select: {
+          id: true,
+          provider: true,
+          brand: true,
+          last4: true,
+          expMonth: true,
+          expYear: true,
+          stripePaymentMethodId: true,
+          isDefault: true,
+          updatedAt: true,
+        },
+      });
+    }
   }
 
-  // Stripe fallback
-  if (!user.stripeCustomerId) {
-    return noStoreJson({
-      ok: true,
-      hasPaymentMethod: false,
-      customerId: null,
-      defaultPaymentMethod: null,
-    });
-  }
-
-  const stripeCard = await getStripeDefaultCard(user.stripeCustomerId);
-  if (!stripeCard) {
-    return noStoreJson({
-      ok: true,
-      hasPaymentMethod: false,
-      customerId: user.stripeCustomerId,
-      defaultPaymentMethod: null,
-    });
-  }
-
-  // Self-heal DB
-  const saved = await saveDefaultCard({
-    userId: user.id,
-    stripePmId: stripeCard.paymentMethodId,
-    card: stripeCard.card,
-  });
+  const shapedCards = cards.map(shapeFromDb);
+  const defaultPaymentMethod =
+    shapedCards.find((card) => card.isDefault) ?? shapedCards[0] ?? null;
 
   return noStoreJson({
     ok: true,
-    hasPaymentMethod: true,
-    customerId: user.stripeCustomerId,
-    defaultPaymentMethod: shapeFromDb(saved),
+    hasPaymentMethod: shapedCards.length > 0,
+    customerId: user.stripeCustomerId ?? null,
+    cards: shapedCards,
+    defaultPaymentMethod,
   });
 }
 
 type PostBody = {
   setupIntentId?: string;
-  paymentMethodId?: string; // pm_...
+  paymentMethodId?: string;
 };
 
-export async function POST(req: Request) {
+export async function POST(req: NextRequest) {
   const userId = await requireUserId();
   if (!userId) return jsonError(401, "Not authenticated");
 
@@ -279,6 +251,7 @@ export async function POST(req: Request) {
     where: { id: userId },
     select: { id: true, stripeCustomerId: true },
   });
+
   if (!user) return jsonError(404, "User not found");
   if (!user.stripeCustomerId) {
     return jsonError(400, "Missing Stripe customer. Create setup-intent first.");
@@ -302,27 +275,28 @@ export async function POST(req: Request) {
   }
 
   const pm = await stripe.paymentMethods.retrieve(stripePmId);
+
   if (!pm || pm.type !== "card" || !pm.card) {
-    return jsonError(400, "Invalid payment method (card required).");
+    return jsonError(400, "Invalid payment method. Card required.");
   }
 
-  // Ensure attached to this customer
   if (pm.customer && pm.customer !== user.stripeCustomerId) {
     return jsonError(400, "Payment method belongs to a different customer.");
   }
+
   if (!pm.customer) {
-    await stripe.paymentMethods.attach(stripePmId, { customer: user.stripeCustomerId });
+    await stripe.paymentMethods.attach(stripePmId, {
+      customer: user.stripeCustomerId,
+    });
   }
 
-  // Set default on Stripe customer
   await stripe.customers.update(user.stripeCustomerId, {
     invoice_settings: { default_payment_method: stripePmId },
   });
 
-  // Save locally + set as default
   const saved = await saveDefaultCard({
     userId: user.id,
-    stripePmId: stripePmId,
+    stripePmId,
     card: pm.card,
   });
 
@@ -330,6 +304,63 @@ export async function POST(req: Request) {
     ok: true,
     hasPaymentMethod: true,
     customerId: user.stripeCustomerId,
+    cards: [shapeFromDb(saved)],
     defaultPaymentMethod: shapeFromDb(saved),
   });
+}
+
+export async function DELETE(req: NextRequest) {
+  const userId = await requireUserId();
+  if (!userId) return jsonError(401, "Not authenticated");
+
+  const body = await req.json().catch(() => null);
+  const paymentMethodId = toStr(body?.paymentMethodId);
+
+  if (!paymentMethodId) return jsonError(400, "Missing paymentMethodId");
+
+  const card = await prisma.paymentMethod.findFirst({
+    where: { id: paymentMethodId, userId },
+  });
+
+  if (!card) return jsonError(404, "Payment method not found");
+
+  if (card.stripePaymentMethodId) {
+    try {
+      await stripe.paymentMethods.detach(card.stripePaymentMethodId);
+    } catch {
+      // non-fatal
+    }
+  }
+
+  await prisma.paymentMethod.delete({
+    where: { id: card.id },
+  });
+
+  const nextDefault = await prisma.paymentMethod.findFirst({
+    where: { userId, provider: "STRIPE" },
+    orderBy: { updatedAt: "desc" },
+  });
+
+  await prisma.$transaction(async (tx) => {
+    await tx.paymentMethod.updateMany({
+      where: { userId },
+      data: { isDefault: false },
+    });
+
+    if (nextDefault) {
+      await tx.paymentMethod.update({
+        where: { id: nextDefault.id },
+        data: { isDefault: true },
+      });
+    }
+
+    await tx.user.update({
+      where: { id: userId },
+      data: {
+        stripeDefaultPaymentId: nextDefault?.stripePaymentMethodId ?? null,
+      },
+    });
+  });
+
+  return noStoreJson({ ok: true });
 }
