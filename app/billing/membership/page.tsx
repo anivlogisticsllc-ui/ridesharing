@@ -19,6 +19,13 @@ type UserSummary = {
   onboardingCompleted: boolean;
 };
 
+type FailedRenewalInfo = {
+  amountCents: number;
+  failedAt: string | null;
+  reason: string | null;
+  stripePaymentIntentId: string | null;
+};
+
 type BillingInfo = {
   currency: "USD";
   priceCentsPerMonth: number;
@@ -29,13 +36,15 @@ type BillingInfo = {
     expMonth: number;
     expYear: number;
   } | null;
+  failedRenewal: FailedRenewalInfo | null;
 };
 
 type MembershipStatus = "ACTIVE" | "EXPIRED" | "TRIAL" | "CANCELLED" | "NONE";
 
 type MembershipSummary = {
   plan: string | null;
-  kind?: "TRIAL" | "PAID" | "NONE";
+  kind?: "TRIAL" | "PAID" | "ADMIN_GRANT" | "NONE";
+  source?: "membership" | "freeMembershipEndsAt" | "none";
   active: boolean;
   status?: MembershipStatus | null;
   trialEndsAt: string | null;
@@ -167,9 +176,7 @@ export default function MembershipPage() {
       }
 
       setActionSuccess(
-        `Membership activated successfully. Charged ${formatUsdFromCents(
-          json.charge.amountCents
-        )}.`
+        `Membership activated successfully. Charged ${formatUsdFromCents(json.charge.amountCents)}.`
       );
 
       await load();
@@ -235,7 +242,7 @@ export default function MembershipPage() {
         return "During trial, CASH requests require a backup card on file. After trial ends, you’ll need a paid membership to continue.";
       }
       if (state === "EXPIRED") {
-        return "Your trial ended. Activate a paid membership to continue requesting rides.";
+        return "Your membership has expired. Activate a paid membership to continue.";
       }
       return "Activate a membership to access member-only features.";
     })();
@@ -295,6 +302,8 @@ export default function MembershipPage() {
   const activateLabel =
     ui.state === "TRIAL" ? "Activate paid membership" : "Activate membership";
 
+  const failedRenewal = ui.billing.failedRenewal;
+
   return (
     <main style={pageStyle}>
       <Card>
@@ -314,6 +323,55 @@ export default function MembershipPage() {
           <LabelRow label="Payment method" value={ui.paymentMethodLine} />
 
           <p style={{ ...muted, marginTop: 6 }}>{ui.helpLine}</p>
+
+          {failedRenewal ? (
+            <div
+              style={{
+                marginTop: 8,
+                border: "1px solid #fecaca",
+                background: "#fef2f2",
+                color: "#991b1b",
+                padding: 14,
+                borderRadius: 12,
+              }}
+            >
+              <div style={{ fontWeight: 800, fontSize: 13 }}>Membership renewal failed</div>
+
+              <div style={{ fontSize: 13, marginTop: 5, lineHeight: 1.5 }}>
+                We could not process your last membership renewal payment. Please update your card
+                or retry activation.
+              </div>
+
+              <div style={{ marginTop: 8, fontSize: 12, color: "#7f1d1d", lineHeight: 1.6 }}>
+                <div>Amount: {formatUsdFromCents(failedRenewal.amountCents)}</div>
+
+                {failedRenewal.failedAt ? (
+                  <div>Failed at: {new Date(failedRenewal.failedAt).toLocaleString()}</div>
+                ) : null}
+
+                {failedRenewal.reason ? <div>Reason: {failedRenewal.reason}</div> : null}
+              </div>
+
+              <div style={{ marginTop: 12, display: "flex", gap: 10, flexWrap: "wrap" }}>
+                <Link href="/account/billing/payment-method" style={dangerLinkBtn}>
+                  Update card
+                </Link>
+
+                <button
+                  type="button"
+                  onClick={activateMembership}
+                  disabled={activating}
+                  style={{
+                    ...dangerPrimaryBtn,
+                    cursor: activating ? "not-allowed" : "pointer",
+                    opacity: activating ? 0.7 : 1,
+                  }}
+                >
+                  {activating ? "Retrying…" : "Retry payment"}
+                </button>
+              </div>
+            </div>
+          ) : null}
 
           {ui.membership.cancelAtPeriodEnd ? (
             <p style={{ ...muted, marginTop: 0 }}>
@@ -442,4 +500,25 @@ const linkBtn: React.CSSProperties = {
   textDecoration: "none",
   fontSize: 14,
   fontWeight: 600,
+};
+
+const dangerLinkBtn: React.CSSProperties = {
+  padding: "9px 13px",
+  borderRadius: 10,
+  border: "1px solid #fca5a5",
+  background: "#fff",
+  color: "#991b1b",
+  textDecoration: "none",
+  fontSize: 13,
+  fontWeight: 700,
+};
+
+const dangerPrimaryBtn: React.CSSProperties = {
+  padding: "9px 13px",
+  borderRadius: 10,
+  border: "1px solid #dc2626",
+  background: "#dc2626",
+  color: "#fff",
+  fontSize: 13,
+  fontWeight: 700,
 };

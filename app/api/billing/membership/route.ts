@@ -5,6 +5,7 @@ import { getServerSession } from "next-auth";
 import { authOptions } from "@/pages/api/auth/[...nextauth]";
 import { prisma } from "@/lib/prisma";
 import {
+  MembershipChargeStatus,
   MembershipPlan,
   MembershipStatus,
   MembershipType,
@@ -16,6 +17,13 @@ const PRICING_FALLBACK = {
   DRIVER_MONTHLY_CENTS: 999,
 } as const;
 
+type FailedRenewalInfo = {
+  amountCents: number;
+  failedAt: string | null;
+  reason: string | null;
+  stripePaymentIntentId: string | null;
+};
+
 type BillingInfo = {
   currency: "USD";
   priceCentsPerMonth: number;
@@ -26,6 +34,7 @@ type BillingInfo = {
     expMonth: number;
     expYear: number;
   } | null;
+  failedRenewal: FailedRenewalInfo | null;
 };
 
 type MeMembership = {
@@ -45,63 +54,44 @@ type ApiOk = {
     id: string;
     name: string | null;
     email: string;
-    role: UserRole;
+    role: "RIDER" | "DRIVER";
     onboardingCompleted: boolean;
-    emailVerified: boolean;
   };
   membership: MeMembership;
   billing: BillingInfo;
 };
 
-type ApiErr = { ok: false; error: string };
+type ApiError = { ok: false; error: string };
 
-function roleToMembershipType(role: UserRole): MembershipType | null {
-  if (role === UserRole.DRIVER) return MembershipType.DRIVER;
-  if (role === UserRole.RIDER) return MembershipType.RIDER;
-  return null;
-}
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
 
 function toIso(d: Date | null | undefined) {
   return d ? d.toISOString() : null;
 }
 
-async function ensureTrialMembership(params: {
-  userId: string;
-  role: UserRole;
-  emailVerified: boolean;
-  onboardingCompleted: boolean;
-}) {
-  const { userId, role, emailVerified } = params;
+function membershipTypeForRole(role: UserRole): MembershipType | null {
+  if (role === UserRole.RIDER) return MembershipType.RIDER;
+  if (role === UserRole.DRIVER) return MembershipType.DRIVER;
+  return null;
+}
 
-  const type = roleToMembershipType(role);
-  if (!type) return null;
-
-  if (!emailVerified) return null;
-
-  const existing = await prisma.membership.findFirst({
-    where: { userId, type },
-    orderBy: { startDate: "desc" },
-    select: { id: true },
-  });
-
-  if (existing) return null;
-
-  const startDate = new Date();
-  const expiryDate = new Date(startDate.getTime() + 30 * 24 * 60 * 60 * 1000);
-
-  await prisma.membership.create({
-    data: {
-      userId,
-      type,
-      startDate,
-      expiryDate,
-      status: MembershipStatus.ACTIVE,
-      amountPaidCents: 0,
-      plan: MembershipPlan.STANDARD,
+async function getPriceCents(type: MembershipType) {
+  const pricing = await prisma.membershipPricing.findUnique({
+    where: { membershipType: type },
+    select: {
+      amountCents: true,
+      isActive: true,
     },
   });
 
-  return true;
+  if (pricing?.isActive && pricing.amountCents > 0) {
+    return pricing.amountCents;
+  }
+
+  return type === MembershipType.DRIVER
+    ? PRICING_FALLBACK.DRIVER_MONTHLY_CENTS
+    : PRICING_FALLBACK.RIDER_MONTHLY_CENTS;
 }
 
 function buildMembershipSummary(args: {
@@ -162,112 +152,129 @@ function buildMembershipSummary(args: {
   };
 }
 
-async function priceForRole(role: UserRole): Promise<number> {
-  const membershipType = roleToMembershipType(role);
-  if (!membershipType) return 0;
-
-  const pricing = await prisma.membershipPricing.findUnique({
-    where: { membershipType },
-    select: {
-      amountCents: true,
-      currency: true,
-      isActive: true,
-    },
-  });
-
-  if (pricing?.isActive && typeof pricing.amountCents === "number" && pricing.amountCents > 0) {
-    return pricing.amountCents;
-  }
-
-  return role === UserRole.DRIVER
-    ? PRICING_FALLBACK.DRIVER_MONTHLY_CENTS
-    : PRICING_FALLBACK.RIDER_MONTHLY_CENTS;
-}
-
-async function getDefaultPaymentMethod(userId: string): Promise<BillingInfo["defaultPaymentMethod"]> {
-  const row = await prisma.paymentMethod.findFirst({
-    where: { userId, isDefault: true },
-    orderBy: { updatedAt: "desc" },
-    select: {
-      brand: true,
-      last4: true,
-      expMonth: true,
-      expYear: true,
-    },
-  });
-
-  if (!row) return null;
-
-  return {
-    brand: row.brand ?? "",
-    last4: row.last4 ?? "",
-    expMonth: row.expMonth ?? 0,
-    expYear: row.expYear ?? 0,
-  };
-}
-
 export async function GET() {
   try {
     const session = await getServerSession(authOptions);
-    const userId = (session?.user as any)?.id as string | undefined;
+    const sessionUser = session?.user as any;
 
-    if (!userId) {
-      return NextResponse.json<ApiErr>(
+    if (!sessionUser?.id) {
+      return NextResponse.json<ApiError>(
         { ok: false, error: "Not authenticated" },
         { status: 401 }
       );
     }
 
     const user = await prisma.user.findUnique({
-      where: { id: userId },
+      where: { id: sessionUser.id },
       select: {
         id: true,
         name: true,
         email: true,
         role: true,
         onboardingCompleted: true,
-        emailVerified: true,
         freeMembershipEndsAt: true,
       },
     });
 
     if (!user) {
-      return NextResponse.json<ApiErr>(
+      return NextResponse.json<ApiError>(
         { ok: false, error: "User not found" },
         { status: 404 }
       );
     }
 
-    await ensureTrialMembership({
-      userId: user.id,
-      role: user.role,
-      emailVerified: user.emailVerified,
-      onboardingCompleted: user.onboardingCompleted,
-    });
+    if (user.role !== UserRole.RIDER && user.role !== UserRole.DRIVER) {
+      return NextResponse.json<ApiError>(
+        { ok: false, error: "Membership is only available for riders and drivers." },
+        { status: 400 }
+      );
+    }
 
-    const expectedType = roleToMembershipType(user.role);
+    const membershipType = membershipTypeForRole(user.role);
 
-    const latest = expectedType
-      ? await prisma.membership.findFirst({
-          where: { userId: user.id, type: expectedType },
-          orderBy: { startDate: "desc" },
+    if (!membershipType) {
+      return NextResponse.json<ApiError>(
+        { ok: false, error: "Unsupported membership type." },
+        { status: 400 }
+      );
+    }
+
+    const [latest, priceCentsPerMonth, defaultPaymentMethod, failedRenewalCharge] =
+      await Promise.all([
+        prisma.membership.findFirst({
+          where: {
+            userId: user.id,
+            type: membershipType,
+          },
+          orderBy: [{ expiryDate: "desc" }, { createdAt: "desc" }],
           select: {
             plan: true,
-            expiryDate: true,
             amountPaidCents: true,
+            expiryDate: true,
             status: true,
           },
-        })
-      : null;
+        }),
 
-    const defaultPaymentMethod = await getDefaultPaymentMethod(user.id);
-    const priceCentsPerMonth = await priceForRole(user.role);
+        getPriceCents(membershipType),
+
+        prisma.paymentMethod.findFirst({
+          where: {
+            userId: user.id,
+            isDefault: true,
+            provider: "STRIPE",
+          },
+          orderBy: { updatedAt: "desc" },
+          select: {
+            brand: true,
+            last4: true,
+            expMonth: true,
+            expYear: true,
+          },
+        }),
+
+        prisma.membershipCharge.findFirst({
+          where: {
+            userId: user.id,
+            status: MembershipChargeStatus.FAILED,
+          },
+          orderBy: [{ failedAt: "desc" }, { createdAt: "desc" }],
+          select: {
+            amountCents: true,
+            failedAt: true,
+            stripePaymentIntentId: true,
+            providerRef: true,
+          },
+        }),
+      ]);
+
+    const membership = buildMembershipSummary({
+      latest,
+      freeMembershipEndsAt: user.freeMembershipEndsAt ?? null,
+    });
 
     const billing: BillingInfo = {
       currency: "USD",
       priceCentsPerMonth,
       hasPaymentMethod: Boolean(defaultPaymentMethod),
-      defaultPaymentMethod,
+      defaultPaymentMethod: defaultPaymentMethod
+        ? {
+            brand: defaultPaymentMethod.brand || "Card",
+            last4: defaultPaymentMethod.last4 || "",
+            expMonth: defaultPaymentMethod.expMonth || 0,
+            expYear: defaultPaymentMethod.expYear || 0,
+          }
+        : null,
+      failedRenewal: failedRenewalCharge
+        ? {
+            amountCents: failedRenewalCharge.amountCents,
+            failedAt: toIso(failedRenewalCharge.failedAt),
+            reason: "Payment failed",
+            stripePaymentIntentId:
+              failedRenewalCharge.stripePaymentIntentId ??
+              failedRenewalCharge.providerRef ??
+              null,
+          }
+        : null,
     };
 
     const payload: ApiOk = {
@@ -278,20 +285,15 @@ export async function GET() {
         email: user.email,
         role: user.role,
         onboardingCompleted: Boolean(user.onboardingCompleted),
-        emailVerified: Boolean(user.emailVerified),
       },
-      membership: buildMembershipSummary({
-        latest,
-        freeMembershipEndsAt: user.freeMembershipEndsAt ?? null,
-      }),
+      membership,
       billing,
     };
 
     return NextResponse.json(payload);
-
   } catch (err) {
     console.error("GET /api/billing/membership error:", err);
-    return NextResponse.json<ApiErr>(
+    return NextResponse.json<ApiError>(
       { ok: false, error: "Internal server error" },
       { status: 500 }
     );
