@@ -293,6 +293,12 @@ export default function AdminUserDetailsPage() {
 
   const [grantDays, setGrantDays] = useState<string>("");
 
+  const [resettingPassword, setResettingPassword] = useState(false);
+  const [success, setSuccess] = useState<string | null>(null);
+
+  const [tempPassword, setTempPassword] = useState("");
+  const [settingPassword, setSettingPassword] = useState(false);
+
   function set<K extends keyof UserDetails>(key: K, value: UserDetails[K]) {
     setDraft((prev) => (prev ? { ...prev, [key]: value } : prev));
   }
@@ -436,6 +442,91 @@ export default function AdminUserDetailsPage() {
     }
   }
 
+  async function sendPasswordReset() {
+    if (!draft) return;
+
+    const confirmed = window.confirm(
+      `Send a password reset email to ${draft.email}?`
+    );
+
+    if (!confirmed) return;
+
+    setResettingPassword(true);
+    setError(null);
+    setSuccess(null);
+
+    try {
+      const res = await fetch(
+        `/api/admin/users/${encodeURIComponent(id)}/send-password-reset`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+
+      if (!res.ok) throw new Error(await readApiError(res));
+
+      const json = await res.json().catch(() => null);
+
+      if (!json?.ok) {
+        throw new Error(json?.error || "Could not send password reset email.");
+      }
+
+      setSuccess(`Password reset email sent to ${json.sentTo || draft.email}.`);
+    } catch (e: any) {
+      setError(e?.message || "Could not send password reset email.");
+    } finally {
+      setResettingPassword(false);
+    }
+  }  
+
+  async function setTemporaryPassword() {
+    if (!draft) return;
+
+    const password = tempPassword.trim();
+
+    if (password.length < 6) {
+      setError("Password must be at least 6 characters.");
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `Set a new password for ${draft.email}?`
+    );
+
+    if (!confirmed) return;
+
+    setSettingPassword(true);
+    setError(null);
+    setSuccess(null);
+
+    try {
+      const res = await fetch(
+        `/api/admin/users/${encodeURIComponent(id)}/set-password`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ password }),
+        }
+      );
+
+      if (!res.ok) throw new Error(await readApiError(res));
+
+      const json = await res.json().catch(() => null);
+
+      if (!json?.ok) {
+        throw new Error(json?.error || "Could not update password.");
+      }
+
+      setSuccess("Password updated successfully.");
+      setTempPassword("");
+    } catch (e: any) {
+      setError(e?.message || "Could not update password.");
+    } finally {
+      setSettingPassword(false);
+    }
+  }
+
   async function applyGrant() {
     const raw = grantDays.trim();
     const days = Number(raw);
@@ -512,6 +603,15 @@ export default function AdminUserDetailsPage() {
 
             <button
               type="button"
+              onClick={sendPasswordReset}
+              disabled={resettingPassword || saving || loading || !draft}
+              className="rounded-full border border-indigo-300 bg-white px-4 py-2 text-sm font-medium text-indigo-700 hover:bg-indigo-50 disabled:opacity-60"
+            >
+              {resettingPassword ? "Sending reset…" : "Send password reset"}
+            </button>
+
+            <button
+              type="button"
               onClick={saveAll}
               disabled={saving || loading || !draft}
               className="rounded-full border border-slate-900 bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-60"
@@ -524,6 +624,12 @@ export default function AdminUserDetailsPage() {
         {error ? (
           <div className="rounded-2xl border border-rose-200 bg-rose-50 p-4 text-rose-700 shadow-sm">
             <p className="text-sm font-medium">{error}</p>
+          </div>
+        ) : null}
+
+        {success ? (
+          <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-4 text-emerald-700 shadow-sm">
+            <p className="text-sm font-medium">{success}</p>
           </div>
         ) : null}
 
@@ -618,6 +724,38 @@ export default function AdminUserDetailsPage() {
                     {fmt(draft.updatedAt)}
                   </div>
                 </Field>
+              </div>
+            </section>
+
+            <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+              <h2 className="text-sm font-semibold text-slate-900">Password tools</h2>
+
+              <p className="mt-1 text-xs text-slate-500">
+                Send a reset link or directly set a new password for this user.
+              </p>
+
+              <div className="mt-4 grid gap-3 md:grid-cols-[1fr_auto]">
+                <Field label="New password">
+                  <input
+                    type="text"
+                    className={inputClass()}
+                    value={tempPassword}
+                    onChange={(e) => setTempPassword(e.target.value)}
+                    placeholder="Minimum 6 characters"
+                    autoComplete="new-password"
+                  />
+                </Field>
+
+                <div className="flex items-end">
+                  <button
+                    type="button"
+                    onClick={setTemporaryPassword}
+                    disabled={settingPassword || saving || loading || !draft}
+                    className="rounded-lg border border-indigo-300 bg-white px-4 py-2 text-sm font-medium text-indigo-700 hover:bg-indigo-50 disabled:opacity-60"
+                  >
+                    {settingPassword ? "Updating..." : "Set password"}
+                  </button>
+                </div>
               </div>
             </section>
 
