@@ -33,7 +33,6 @@ async function requireAdmin() {
     return { ok: true as const };
   }
 
-  // Temporary DB grant: freeMembershipEndsAt in the future
   try {
     const u = await prisma.user.findUnique({
       where: { id: userId },
@@ -54,6 +53,7 @@ function isMissingColumnError(e: unknown) {
   if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2022") {
     return true;
   }
+
   const msg = String((e as any)?.message || "").toLowerCase();
   return msg.includes("does not exist") && msg.includes("column");
 }
@@ -61,8 +61,10 @@ function isMissingColumnError(e: unknown) {
 function toDateOrNull(v: unknown) {
   if (v === null) return null;
   if (typeof v !== "string" || !v.trim()) return undefined;
+
   const d = new Date(v);
   if (Number.isNaN(d.getTime())) return undefined;
+
   return d;
 }
 
@@ -73,7 +75,6 @@ function pickUserUpdate(body: any) {
   if (typeof body.accountStatus === "string") data.accountStatus = body.accountStatus;
   if (typeof body.isAdmin === "boolean") data.isAdmin = body.isAdmin;
 
-  // Address (optional)
   if (body.addressLine1 !== undefined) data.addressLine1 = body.addressLine1;
   if (body.addressLine2 !== undefined) data.addressLine2 = body.addressLine2;
   if (body.city !== undefined) data.city = body.city;
@@ -81,23 +82,22 @@ function pickUserUpdate(body: any) {
   if (body.postalCode !== undefined) data.postalCode = body.postalCode;
   if (body.country !== undefined) data.country = body.country;
 
-  // Legacy membership fields still supported for now
   if (typeof body.membershipActive === "boolean") data.membershipActive = body.membershipActive;
   if (body.membershipPlan !== undefined) data.membershipPlan = body.membershipPlan;
+
   if (body.trialEndsAt !== undefined) {
     const d = toDateOrNull(body.trialEndsAt);
     if (d !== undefined) data.trialEndsAt = d;
   }
 
-  // Direct set/clear grant
   if (body.freeMembershipEndsAt !== undefined) {
     const d = toDateOrNull(body.freeMembershipEndsAt);
     if (d !== undefined) data.freeMembershipEndsAt = d;
   }
 
-  // Grant days helper
   if (body.grantDays !== undefined) {
     const days = Number(body.grantDays);
+
     if (Number.isFinite(days) && days >= 1 && days <= 3650) {
       const ends = new Date();
       ends.setDate(ends.getDate() + Math.floor(days));
@@ -114,10 +114,8 @@ function pickDriverProfileUpdate(dp: any) {
   const data: any = {};
 
   if (dp.verificationStatus !== undefined) data.verificationStatus = dp.verificationStatus;
-
   if (dp.plateNumber !== undefined) data.plateNumber = dp.plateNumber;
   if (dp.plateState !== undefined) data.plateState = dp.plateState;
-
   if (dp.vehicleColor !== undefined) data.vehicleColor = dp.vehicleColor;
   if (dp.vehicleMake !== undefined) data.vehicleMake = dp.vehicleMake;
   if (dp.vehicleModel !== undefined) data.vehicleModel = dp.vehicleModel;
@@ -166,6 +164,40 @@ const SELECT_WITH_GRANT = {
   trialEndsAt: true,
   isAdmin: true,
   freeMembershipEndsAt: true,
+
+  stripeCustomerId: true,
+  stripeDefaultPaymentId: true,
+
+  paymentMethods: {
+    orderBy: { updatedAt: "desc" as const },
+    select: {
+      id: true,
+      provider: true,
+      brand: true,
+      last4: true,
+      expMonth: true,
+      expYear: true,
+      stripePaymentMethodId: true,
+      isDefault: true,
+      updatedAt: true,
+    },
+  },
+
+  membershipCharges: {
+    orderBy: { createdAt: "desc" as const },
+    take: 5,
+    select: {
+      id: true,
+      status: true,
+      amountCents: true,
+      currency: true,
+      providerRef: true,
+      stripePaymentIntentId: true,
+      failedAt: true,
+      createdAt: true,
+    },
+  },
+
   driverProfile: {
     select: {
       id: true,
@@ -183,6 +215,7 @@ const SELECT_WITH_GRANT = {
       updatedAt: true,
     },
   },
+
   memberships: {
     select: {
       id: true,
@@ -237,11 +270,7 @@ function hydrateUserForAdmin(rawUser: any) {
         membershipId: latestMembership.id,
         type: latestMembership.type,
         plan: latestMembership.plan ?? null,
-        status: latestIsTrial
-          ? "TRIAL"
-          : latestActive
-          ? "ACTIVE"
-          : "EXPIRED",
+        status: latestIsTrial ? "TRIAL" : latestActive ? "ACTIVE" : "EXPIRED",
         active: Boolean(latestActive),
         trialEndsAt: latestIsTrial
           ? new Date(latestMembership.expiryDate).toISOString()
@@ -262,8 +291,8 @@ function hydrateUserForAdmin(rawUser: any) {
           rawUser.trialEndsAt && new Date(rawUser.trialEndsAt).getTime() > now.getTime()
             ? "TRIAL"
             : rawUser.membershipActive
-            ? "ACTIVE"
-            : "INACTIVE",
+              ? "ACTIVE"
+              : "INACTIVE",
         active: Boolean(rawUser.membershipActive),
         trialEndsAt: rawUser.trialEndsAt
           ? new Date(rawUser.trialEndsAt).toISOString()
@@ -276,7 +305,6 @@ function hydrateUserForAdmin(rawUser: any) {
 
   return {
     ...rawUser,
-    // hydrate legacy fields from latest membership row when present
     membershipActive: computedMembership.active,
     membershipPlan: computedMembership.plan ?? rawUser.membershipPlan ?? null,
     trialEndsAt: computedMembership.trialEndsAt,
@@ -290,6 +318,7 @@ export async function GET(_req: Request, ctx: { params: Promise<{ id: string }> 
 
   const { id } = await ctx.params;
   const userId = String(id || "").trim();
+
   if (!userId) return jsonError(400, "Missing user id");
 
   try {
@@ -333,9 +362,11 @@ export async function PATCH(req: Request, ctx: { params: Promise<{ id: string }>
 
   const { id } = await ctx.params;
   const userId = String(id || "").trim();
+
   if (!userId) return jsonError(400, "Missing user id");
 
   let body: any = null;
+
   try {
     body = await req.json();
   } catch {
