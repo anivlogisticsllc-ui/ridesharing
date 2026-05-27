@@ -1,8 +1,15 @@
+import { useRouter } from "expo-router";
 import { useEffect, useState } from "react";
-import { ActivityIndicator, ScrollView, Text, View } from "react-native";
+import {
+  ActivityIndicator,
+  Pressable,
+  ScrollView,
+  Text,
+  View,
+} from "react-native";
 import { apiRequest } from "../../services/api";
-import type { RiderBooking, RiderBookingsResponse } from "../../types/rider";
 import { getAuthToken } from "../../services/auth";
+import type { RiderBooking, RiderBookingsResponse } from "../../types/rider";
 
 function formatDate(value: string) {
   const d = new Date(value);
@@ -16,6 +23,8 @@ function formatMoney(cents?: number | null) {
 }
 
 export default function RiderBookingsScreen() {
+  const router = useRouter();
+
   const [bookings, setBookings] = useState<RiderBooking[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -65,14 +74,7 @@ export default function RiderBookingsScreen() {
           Rider Bookings
         </Text>
 
-        <Text style={{ color: "#b91c1c", marginBottom: 12 }}>
-          {error}
-        </Text>
-
-        <Text style={{ color: "#6b7280" }}>
-          If this says “Not authenticated”, that is expected for now. The web
-          backend uses NextAuth cookies, and mobile needs bearer-token auth.
-        </Text>
+        <Text style={{ color: "#b91c1c", marginBottom: 12 }}>{error}</Text>
       </View>
     );
   }
@@ -93,8 +95,9 @@ export default function RiderBookingsScreen() {
             formatMoney(booking.baseTotalPriceCents);
 
           return (
-            <View
+            <Pressable
               key={`${booking.rideId}-${booking.bookingId ?? booking.id}`}
+              onPress={() => router.push(`/rider/trip/${booking.rideId}`)}
               style={{
                 borderWidth: 1,
                 borderColor: "#e5e7eb",
@@ -127,7 +130,11 @@ export default function RiderBookingsScreen() {
                   Fare: {fare}
                 </Text>
               ) : null}
-            </View>
+
+              <Text style={{ marginTop: 8, color: "#2563eb", fontWeight: "700" }}>
+                View trip details →
+              </Text>
+            </Pressable>
           );
         })
       )}
