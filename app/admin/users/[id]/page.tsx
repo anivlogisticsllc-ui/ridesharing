@@ -40,6 +40,31 @@ type ComputedMembership = {
   paymentRef: string | null;
 };
 
+
+type AdminPaymentMethod = {
+  id: string;
+  provider?: string | null;
+  brand?: string | null;
+  last4?: string | null;
+  expMonth?: number | null;
+  expYear?: number | null;
+  isDefault?: boolean | null;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+};
+
+type AdminMembershipCharge = {
+  id: string;
+  amountCents?: number | null;
+  currency?: string | null;
+  status?: string | null;
+  failureReason?: string | null;
+  provider?: string | null;
+  providerRef?: string | null;
+  createdAt?: string | null;
+  updatedAt?: string | null;
+};
+
 type UserDetails = {
   id: string;
   email: string;
@@ -77,6 +102,9 @@ type UserDetails = {
   updatedAt: string | null;
 
   driverProfile: DriverProfile | null;
+
+  paymentMethods?: AdminPaymentMethod[];
+  membershipCharges?: AdminMembershipCharge[];
 };
 
 type ApiOk = { ok: true; user: UserDetails };
@@ -267,6 +295,61 @@ function MembershipBadge({ value }: { value: string }) {
       className={`inline-flex items-center rounded-full border px-2.5 py-1 text-xs font-medium ${cls}`}
     >
       {value}
+    </span>
+  );
+}
+
+function formatMoneyCents(amountCents?: number | null, currency?: string | null) {
+  if (amountCents === null || amountCents === undefined || !Number.isFinite(amountCents)) {
+    return "—";
+  }
+
+  const code = (currency || "USD").toUpperCase();
+
+  try {
+    return new Intl.NumberFormat(undefined, {
+      style: "currency",
+      currency: code,
+    }).format(amountCents / 100);
+  } catch {
+    return `${(amountCents / 100).toFixed(2)} ${code}`;
+  }
+}
+
+function formatCardBrand(brand?: string | null) {
+  const value = (brand || "").trim();
+  if (!value) return "Card";
+
+  return value
+    .split(/[\s_-]+/)
+    .map((part) => (part ? part[0].toUpperCase() + part.slice(1).toLowerCase() : part))
+    .join(" ");
+}
+
+function formatCardExpiry(expMonth?: number | null, expYear?: number | null) {
+  if (!expMonth || !expYear) return "—";
+
+  const mm = String(expMonth).padStart(2, "0");
+  const yyyy = String(expYear);
+
+  return `${mm}/${yyyy}`;
+}
+
+function StatusBadge({ value }: { value?: string | null }) {
+  const normalized = (value || "UNKNOWN").toUpperCase();
+
+  const cls =
+    normalized === "SUCCEEDED" || normalized === "PAID" || normalized === "ACTIVE"
+      ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+      : normalized === "FAILED" || normalized === "CANCELED" || normalized === "EXPIRED"
+      ? "border-rose-200 bg-rose-50 text-rose-700"
+      : normalized === "PENDING" || normalized === "PROCESSING"
+      ? "border-amber-200 bg-amber-50 text-amber-700"
+      : "border-slate-200 bg-slate-50 text-slate-700";
+
+  return (
+    <span className={`inline-flex items-center rounded-full border px-2.5 py-1 text-xs font-medium ${cls}`}>
+      {normalized}
     </span>
   );
 }
@@ -755,6 +838,129 @@ export default function AdminUserDetailsPage() {
                   >
                     {settingPassword ? "Updating..." : "Set password"}
                   </button>
+                </div>
+              </div>
+            </section>
+
+            <section className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <h2 className="text-sm font-semibold text-slate-900">Billing visibility</h2>
+                  <p className="mt-1 text-xs text-slate-500">
+                    Read-only Stripe/payment data returned by the admin user details API.
+                  </p>
+                </div>
+              </div>
+
+              <div className="mt-5 grid gap-5 lg:grid-cols-2">
+                <div>
+                  <div className="flex items-center justify-between gap-3">
+                    <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-600">
+                      Saved cards
+                    </h3>
+                    <span className="rounded-full bg-slate-100 px-2.5 py-1 text-xs text-slate-600">
+                      {draft.paymentMethods?.length ?? 0}
+                    </span>
+                  </div>
+
+                  <div className="mt-3 space-y-3">
+                    {draft.paymentMethods && draft.paymentMethods.length > 0 ? (
+                      draft.paymentMethods.map((pm) => (
+                        <div
+                          key={pm.id}
+                          className="rounded-xl border border-slate-200 bg-slate-50 p-3"
+                        >
+                          <div className="flex flex-wrap items-start justify-between gap-2">
+                            <div>
+                              <div className="text-sm font-semibold text-slate-900">
+                                {formatCardBrand(pm.brand)}
+                                {pm.last4 ? ` •••• ${pm.last4}` : ""}
+                              </div>
+                              <div className="mt-1 text-xs text-slate-500">
+                                Exp {formatCardExpiry(pm.expMonth, pm.expYear)}
+                                {pm.provider ? ` • ${pm.provider}` : ""}
+                              </div>
+                            </div>
+
+                            {pm.isDefault ? (
+                              <span className="inline-flex items-center rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-xs font-medium text-emerald-700">
+                                Default
+                              </span>
+                            ) : null}
+                          </div>
+
+                          <div className="mt-3 grid gap-2 text-xs text-slate-600 sm:grid-cols-2">
+                            <div>
+                              <span className="font-medium text-slate-500">Created:</span>{" "}
+                              {formatIsoShort(pm.createdAt ?? null)}
+                            </div>
+                            <div>
+                              <span className="font-medium text-slate-500">Updated:</span>{" "}
+                              {formatIsoShort(pm.updatedAt ?? null)}
+                            </div>
+                          </div>
+                        </div>
+                      ))
+                    ) : (
+                      <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50 p-4 text-sm text-slate-500">
+                        No saved cards returned by the API.
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <div>
+                  <div className="flex items-center justify-between gap-3">
+                    <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-600">
+                      Membership charges
+                    </h3>
+                    <span className="rounded-full bg-slate-100 px-2.5 py-1 text-xs text-slate-600">
+                      {draft.membershipCharges?.length ?? 0}
+                    </span>
+                  </div>
+
+                  <div className="mt-3 space-y-3">
+                    {draft.membershipCharges && draft.membershipCharges.length > 0 ? (
+                      draft.membershipCharges.map((charge) => (
+                        <div
+                          key={charge.id}
+                          className="rounded-xl border border-slate-200 bg-slate-50 p-3"
+                        >
+                          <div className="flex flex-wrap items-start justify-between gap-2">
+                            <div>
+                              <div className="text-sm font-semibold text-slate-900">
+                                {formatMoneyCents(charge.amountCents, charge.currency)}
+                              </div>
+                              <div className="mt-1 text-xs text-slate-500">
+                                {formatIsoShort(charge.createdAt ?? null)}
+                              </div>
+                            </div>
+
+                            <StatusBadge value={charge.status} />
+                          </div>
+
+                          <div className="mt-3 grid gap-2 text-xs text-slate-600">
+                            <div>
+                              <span className="font-medium text-slate-500">Provider:</span>{" "}
+                              {fmt(charge.provider)}
+                            </div>
+                            <div className="break-words">
+                              <span className="font-medium text-slate-500">Provider ref:</span>{" "}
+                              {fmt(charge.providerRef)}
+                            </div>
+                            <div>
+                              <span className="font-medium text-slate-500">Failure reason:</span>{" "}
+                              {fmt(charge.failureReason)}
+                            </div>
+                          </div>
+                        </div>
+                      ))
+                    ) : (
+                      <div className="rounded-xl border border-dashed border-slate-300 bg-slate-50 p-4 text-sm text-slate-500">
+                        No membership charges returned by the API.
+                      </div>
+                    )}
+                  </div>
                 </div>
               </div>
             </section>

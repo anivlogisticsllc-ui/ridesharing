@@ -1,11 +1,22 @@
+// mobile/types/rider.ts
+
 export type BookingStatus =
   | "PENDING"
   | "CONFIRMED"
+  | "ACCEPTED"
   | "COMPLETED"
   | "CANCELLED"
   | "EXPIRED";
 
 export type PaymentType = "CARD" | "CASH";
+
+export type TipStatus =
+  | "NOT_OFFERED"
+  | "ELIGIBLE"
+  | "PENDING"
+  | "SUCCEEDED"
+  | "SKIPPED"
+  | "FAILED";
 
 export type RiderBooking = {
   id: string;
@@ -32,6 +43,26 @@ export type RiderBooking = {
   baseTotalPriceCents?: number | null;
   effectiveTotalPriceCents?: number | null;
   totalPriceCents?: number | null;
+
+  originalPaymentType?: PaymentType | null;
+  originalCashDiscountBps?: number | null;
+  cashNotPaidAt?: string | null;
+  cashDiscountRevokedAt?: string | null;
+  cashDiscountRevokedReason?: string | null;
+  fallbackCardChargedAt?: string | null;
+
+  refundIssued?: boolean | null;
+  refundAmountCents?: number | null;
+  refundIssuedAt?: string | null;
+  disputeResolvedAt?: string | null;
+
+  tipStatus?: TipStatus | string | null;
+  tipAmountCents?: number | null;
+  tipPercent?: number | null;
+  tipEligibleUntil?: string | null;
+  tipSelectedAt?: string | null;
+  tipChargedAt?: string | null;
+  tipSkippedAt?: string | null;
 };
 
 export type RiderBookingsResponse =

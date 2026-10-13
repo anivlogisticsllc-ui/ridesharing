@@ -123,6 +123,14 @@ export default async function handler(
   req: NextApiRequest,
   res: NextApiResponse<ApiResponse>
 ) {
+  res.setHeader("Access-Control-Allow-Origin", "http://localhost:8081");
+  res.setHeader("Access-Control-Allow-Credentials", "true");
+  res.setHeader("Access-Control-Allow-Methods", "GET,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
   if (req.method !== "GET") {
     return res.status(405).json({ ok: false, error: "Method not allowed" });
   }
@@ -141,7 +149,6 @@ export default async function handler(
     const bookings = await prisma.booking.findMany({
       where: { riderId: userId },
       orderBy: { createdAt: "desc" },
-      take: 50,
       include: {
         ride: {
           select: {

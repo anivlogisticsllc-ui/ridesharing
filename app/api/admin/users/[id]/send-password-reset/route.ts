@@ -1,13 +1,16 @@
-// app/api/admin/users/[id]/set-password/route.ts
+// app/api/admin/users/[id]/send-password-reset/route.ts
 
 import { NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
-import bcrypt from "bcrypt";
+import crypto from "crypto";
 
 import { authOptions } from "@/pages/api/auth/[...nextauth]";
 import { prisma } from "@/lib/prisma";
+import { sendPasswordResetEmail } from "@/lib/email";
 
 export const dynamic = "force-dynamic";
+
+const APP_URL = process.env.NEXTAUTH_URL || "http://localhost:3000";
 
 function jsonError(status: number, error: string) {
   return NextResponse.json({ ok: false, error }, { status });
@@ -32,7 +35,7 @@ async function requireAdmin() {
 }
 
 export async function POST(
-  req: Request,
+  _req: Request,
   ctx: { params: Promise<{ id: string }> }
 ) {
   const guard = await requireAdmin();
@@ -43,14 +46,6 @@ export async function POST(
 
   if (!userId) return jsonError(400, "Missing user id");
 
-  const body = await req.json().catch(() => null);
-  const password =
-    typeof body?.password === "string" ? body.password.trim() : "";
-
-  if (password.length < 8) {
-    return jsonError(400, "Password must be at least 8 characters.");
-  }
-
   const user = await prisma.user.findUnique({
     where: { id: userId },
     select: {
@@ -60,25 +55,28 @@ export async function POST(
   });
 
   if (!user) return jsonError(404, "User not found");
-
-  const passwordHash = await bcrypt.hash(password, 10);
-
-  await prisma.user.update({
-    where: { id: user.id },
-    data: {
-      passwordHash,
-      emailVerified: true,
-    },
-  });
+  if (!user.email) return jsonError(400, "User has no email address");
 
   await prisma.passwordResetToken.deleteMany({
     where: { userId: user.id },
   });
 
+  const token = crypto.randomBytes(40).toString("hex");
+  const expiresAt = new Date(Date.now() + 1000 * 60 * 30);
+
+  await prisma.passwordResetToken.create({
+    data: {
+      token,
+      userId: user.id,
+      expiresAt,
+    },
+  });
+
+  const resetUrl = `${APP_URL}/auth/reset-password?token=${token}`;
+  await sendPasswordResetEmail(user.email, resetUrl);
+
   return NextResponse.json({
     ok: true,
-    userId: user.id,
-    email: user.email,
+    sentTo: user.email,
   });
 }
-``
